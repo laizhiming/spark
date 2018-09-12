@@ -69,11 +69,13 @@ package object config {
     .bytesConf(ByteUnit.KiB)
     .createWithDefaultString("100k")
 
+  private[spark] val EVENT_LOG_STAGE_EXECUTOR_METRICS =
+    ConfigBuilder("spark.eventLog.logStageExecutorMetrics.enabled")
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val EVENT_LOG_OVERWRITE =
     ConfigBuilder("spark.eventLog.overwrite").booleanConf.createWithDefault(false)
-
-  private[spark] val EVENT_LOG_CALLSITE_FORM =
-    ConfigBuilder("spark.eventLog.callsite").stringConf.createWithDefault("short")
 
   private[spark] val EXECUTOR_CLASS_PATH =
     ConfigBuilder(SparkLauncher.EXECUTOR_EXTRA_CLASSPATH).stringConf.createOptional
@@ -114,6 +116,10 @@ package object config {
     .checkValue(_ >= 0, "The off-heap memory size must not be negative")
     .createWithDefault(0)
 
+  private[spark] val PYSPARK_EXECUTOR_MEMORY = ConfigBuilder("spark.executor.pyspark.memory")
+    .bytesConf(ByteUnit.MiB)
+    .createOptional
+
   private[spark] val IS_PYTHON_APP = ConfigBuilder("spark.yarn.isPython").internal()
     .booleanConf.createWithDefault(false)
 
@@ -139,6 +145,9 @@ package object config {
 
   private[spark] val SHUFFLE_SERVICE_ENABLED =
     ConfigBuilder("spark.shuffle.service.enabled").booleanConf.createWithDefault(false)
+
+  private[spark] val SHUFFLE_SERVICE_PORT =
+    ConfigBuilder("spark.shuffle.service.port").intConf.createWithDefault(7337)
 
   private[spark] val KEYTAB = ConfigBuilder("spark.yarn.keytab")
     .doc("Location of user's keytab.")
