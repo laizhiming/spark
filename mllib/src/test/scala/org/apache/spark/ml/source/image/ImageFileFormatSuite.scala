@@ -17,6 +17,7 @@
 
 package org.apache.spark.ml.source.image
 
+import java.net.URI
 import java.nio.file.Paths
 
 import org.apache.spark.SparkFunSuite
@@ -29,6 +30,25 @@ class ImageFileFormatSuite extends SparkFunSuite with MLlibTestSparkContext {
 
   // Single column of images named "image"
   private lazy val imagePath = "../data/mllib/images/partitioned"
+  private lazy val recursiveImagePath = "../data/mllib/images"
+
+  test("Smoke test: create basic ImageSchema dataframe") {
+    val origin = "path"
+    val width = 1
+    val height = 1
+    val nChannels = 3
+    val data = Array[Byte](0, 0, 0)
+    val mode = ocvTypes("CV_8UC3")
+
+    // Internal Row corresponds to image StructType
+    val rows = Seq(Row(Row(origin, height, width, nChannels, mode, data)),
+      Row(Row(null, height, width, nChannels, mode, data)))
+    val rdd = sc.makeRDD(rows)
+    val df = spark.createDataFrame(rdd, imageSchema)
+
+    assert(df.count === 2, "incorrect image count")
+    assert(df.schema("image").dataType == columnSchema, "data do not fit ImageSchema")
+  }
 
   test("image datasource count test") {
     val df1 = spark.read.format("image").load(imagePath)
@@ -58,8 +78,14 @@ class ImageFileFormatSuite extends SparkFunSuite with MLlibTestSparkContext {
       .load(filePath)
     assert(df2.count() === 1)
     val result = df2.head()
-    assert(result === invalidImageRow(
-      Paths.get(filePath).toAbsolutePath().normalize().toUri().toString))
+
+    val resultOrigin = result.getStruct(0).getString(0)
+    // covert `origin` to `java.net.URI` object and then compare.
+    // because `file:/path` and `file:///path` are both valid URI-ifications
+    assert(new URI(resultOrigin) === Paths.get(filePath).toAbsolutePath().normalize().toUri())
+
+    // Compare other columns in the row to be the same with the `invalidImageRow`
+    assert(result === invalidImageRow(resultOrigin))
   }
 
   test("image datasource partition test") {

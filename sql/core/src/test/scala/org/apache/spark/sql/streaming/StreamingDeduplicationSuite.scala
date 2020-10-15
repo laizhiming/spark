@@ -26,14 +26,9 @@ import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 
-class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAfterAll {
+class StreamingDeduplicationSuite extends StateStoreMetricsTest {
 
   import testImplicits._
-
-  override def afterAll(): Unit = {
-    super.afterAll()
-    StateStore.stop()
-  }
 
   test("deduplicate with all columns") {
     val inputData = MemoryStream[String]
@@ -59,13 +54,13 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
     testStream(result, Append)(
       AddData(inputData, "a" -> 1),
       CheckLastBatch("a" -> 1),
-      assertNumStateRows(total = 1, updated = 1),
+      assertNumStateRows(total = 1, updated = 1, droppedByWatermark = 0),
       AddData(inputData, "a" -> 2), // Dropped
       CheckLastBatch(),
-      assertNumStateRows(total = 1, updated = 0),
+      assertNumStateRows(total = 1, updated = 0, droppedByWatermark = 0),
       AddData(inputData, "b" -> 1),
       CheckLastBatch("b" -> 1),
-      assertNumStateRows(total = 2, updated = 1)
+      assertNumStateRows(total = 2, updated = 1, droppedByWatermark = 0)
     )
   }
 
@@ -91,7 +86,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
   test("deduplicate with watermark") {
     val inputData = MemoryStream[Int]
     val result = inputData.toDS()
-      .withColumn("eventTime", $"value".cast("timestamp"))
+      .withColumn("eventTime", timestamp_seconds($"value"))
       .withWatermark("eventTime", "10 seconds")
       .dropDuplicates()
       .select($"eventTime".cast("long").as[Long])
@@ -107,7 +102,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
 
       AddData(inputData, 10), // Should not emit anything as data less than watermark
       CheckNewAnswer(),
-      assertNumStateRows(total = 1, updated = 0),
+      assertNumStateRows(total = 1, updated = 0, droppedByWatermark = 1),
 
       AddData(inputData, 45), // Advance watermark to 35 seconds, no-data-batch drops row 25
       CheckNewAnswer(45),
@@ -118,7 +113,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
   test("deduplicate with aggregate - append mode") {
     val inputData = MemoryStream[Int]
     val windowedaggregate = inputData.toDS()
-      .withColumn("eventTime", $"value".cast("timestamp"))
+      .withColumn("eventTime", timestamp_seconds($"value"))
       .withWatermark("eventTime", "10 seconds")
       .dropDuplicates()
       .withWatermark("eventTime", "10 seconds")
@@ -141,7 +136,8 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
 
       AddData(inputData, 10), // Should not emit anything as data less than watermark
       CheckLastBatch(),
-      assertNumStateRows(total = Seq(2L, 1L), updated = Seq(0L, 0L)),
+      assertNumStateRows(total = Seq(2L, 1L), updated = Seq(0L, 0L),
+        droppedByWatermark = Seq(0L, 1L)),
 
       AddData(inputData, 40), // Advance watermark to 30 seconds
       CheckLastBatch((15 -> 1), (25 -> 1)),
@@ -234,7 +230,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
   test("SPARK-19841: watermarkPredicate should filter based on keys") {
     val input = MemoryStream[(Int, Int)]
     val df = input.toDS.toDF("time", "id")
-      .withColumn("time", $"time".cast("timestamp"))
+      .withColumn("time", timestamp_seconds($"time"))
       .withWatermark("time", "1 second")
       .dropDuplicates("id", "time") // Change the column positions
       .select($"id")
@@ -253,7 +249,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
   test("SPARK-21546: dropDuplicates should ignore watermark when it's not a key") {
     val input = MemoryStream[(Int, Int)]
     val df = input.toDS.toDF("id", "time")
-      .withColumn("time", $"time".cast("timestamp"))
+      .withColumn("time", timestamp_seconds($"time"))
       .withWatermark("time", "1 second")
       .dropDuplicates("id")
       .select($"id", $"time".cast("long"))
@@ -269,7 +265,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
     def testWithFlag(flag: Boolean): Unit = withClue(s"with $flagKey = $flag") {
       val inputData = MemoryStream[Int]
       val result = inputData.toDS()
-        .withColumn("eventTime", $"value".cast("timestamp"))
+        .withColumn("eventTime", timestamp_seconds($"value"))
         .withWatermark("eventTime", "10 seconds")
         .dropDuplicates()
         .select($"eventTime".cast("long").as[Long])
@@ -285,6 +281,12 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest with BeforeAndAf
         { // State should have been cleaned if flag is set, otherwise should not have been cleaned
           if (flag) assertNumStateRows(total = 1, updated = 1)
           else assertNumStateRows(total = 7, updated = 1)
+        },
+        AssertOnQuery { q =>
+          eventually(timeout(streamingTimeout)) {
+            q.lastProgress.sink.numOutputRows == 0L
+            true
+          }
         }
       )
     }

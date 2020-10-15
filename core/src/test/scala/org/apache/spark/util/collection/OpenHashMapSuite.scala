@@ -19,7 +19,8 @@ package org.apache.spark.util.collection
 
 import scala.collection.mutable.HashSet
 
-import org.scalatest.Matchers
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.util.SizeEstimator
@@ -183,16 +184,6 @@ class OpenHashMapSuite extends SparkFunSuite with Matchers {
     assert(!map.contains(null))
     map(null) = 0
     assert(map.contains(null))
-  }
-
-  test("support for more than 12M items") {
-    val cnt = 12000000 // 12M
-    val map = new OpenHashMap[Int, Int](cnt)
-    for (i <- 0 until cnt) {
-      map(i) = 1
-    }
-    val numInvalidValues = map.iterator.count(_._2 == 0)
-    assertResult(0)(numInvalidValues)
   }
 
   test("distinguish between the 0/0.0/0L and null") {
