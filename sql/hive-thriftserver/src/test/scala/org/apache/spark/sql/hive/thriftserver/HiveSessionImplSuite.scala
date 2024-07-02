@@ -18,8 +18,8 @@ package org.apache.spark.sql.hive.thriftserver
 
 import java.lang.reflect.InvocationTargetException
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hive.service.cli.OperationHandle
@@ -33,7 +33,7 @@ class HiveSessionImplSuite extends SparkFunSuite {
   private var session: HiveSessionImpl = _
   private var operationManager: OperationManagerMock = _
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     super.beforeAll()
 
     val sessionManager = new SessionManager(null)

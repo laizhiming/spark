@@ -20,13 +20,13 @@ package org.apache.spark.mllib.clustering
 import java.util.{ArrayList => JArrayList}
 
 import breeze.linalg.{argmax, argtopk, max, DenseMatrix => BDM}
-import org.scalatest.Assertions
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.graphx.Edge
 import org.apache.spark.mllib.linalg.{DenseMatrix, Matrix, Vector, Vectors}
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
@@ -74,7 +74,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       .setTopicConcentration(termSmoothing)
       .setMaxIterations(5)
       .setSeed(12345)
-    val corpus = sc.parallelize(tinyCorpus, 2)
+    val corpus = sc.parallelize(tinyCorpus.toImmutableArraySeq, 2)
 
     val model: DistributedLDAModel = lda.run(corpus).asInstanceOf[DistributedLDAModel]
 
@@ -190,7 +190,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   test("initializing with alpha length != k or 1 fails") {
     intercept[IllegalArgumentException] {
       val lda = new LDA().setK(2).setAlpha(Vectors.dense(1, 2, 3, 4))
-      val corpus = sc.parallelize(tinyCorpus, 2)
+      val corpus = sc.parallelize(tinyCorpus.toImmutableArraySeq, 2)
       lda.run(corpus)
     }
   }
@@ -198,14 +198,14 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   test("initializing with elements in alpha < 0 fails") {
     intercept[IllegalArgumentException] {
       val lda = new LDA().setK(4).setAlpha(Vectors.dense(-1, 2, 3, 4))
-      val corpus = sc.parallelize(tinyCorpus, 2)
+      val corpus = sc.parallelize(tinyCorpus.toImmutableArraySeq, 2)
       lda.run(corpus)
     }
   }
 
   test("OnlineLDAOptimizer initialization") {
     val lda = new LDA().setK(2)
-    val corpus = sc.parallelize(tinyCorpus, 2)
+    val corpus = sc.parallelize(tinyCorpus.toImmutableArraySeq, 2)
     val op = new OnlineLDAOptimizer().initialize(corpus, lda)
     op.setKappa(0.9876).setMiniBatchFraction(0.123).setTau0(567)
     assert(op.getAlpha.toArray.forall(_ === 0.5)) // default 1.0 / k
@@ -225,7 +225,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       Vectors.sparse(vocabSize, Array(0, 1, 2), Array(1, 1, 1)), // apple, orange, banana
       Vectors.sparse(vocabSize, Array(3, 4, 5), Array(1, 1, 1)) // tiger, cat, dog
     ).zipWithIndex.map { case (wordCounts, docId) => (docId.toLong, wordCounts) }
-    val corpus = sc.parallelize(docs, 2)
+    val corpus = sc.parallelize(docs.toImmutableArraySeq, 2)
 
     // Set GammaShape large to avoid the stochastic impact.
     val op = new OnlineLDAOptimizer().setTau0(1024).setKappa(0.51).setGammaShape(1e40)
@@ -253,7 +253,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("OnlineLDAOptimizer with toy data") {
-    val docs = sc.parallelize(toyData)
+    val docs = sc.parallelize(toyData.toImmutableArraySeq)
     val op = new OnlineLDAOptimizer().setMiniBatchFraction(1).setTau0(1024).setKappa(0.51)
       .setGammaShape(1e10)
     val lda = new LDA().setK(2)
@@ -313,7 +313,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("LocalLDAModel logPerplexity") {
-    val docs = sc.parallelize(toyData)
+    val docs = sc.parallelize(toyData.toImmutableArraySeq)
     val ldaModel: LocalLDAModel = toyModel
 
     /* Verify results using gensim:
@@ -339,7 +339,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("LocalLDAModel predict") {
-    val docs = sc.parallelize(toyData)
+    val docs = sc.parallelize(toyData.toImmutableArraySeq)
     val ldaModel: LocalLDAModel = toyModel
 
     /* Verify results using gensim:
@@ -390,7 +390,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("OnlineLDAOptimizer with asymmetric prior") {
-    val docs = sc.parallelize(toyData)
+    val docs = sc.parallelize(toyData.toImmutableArraySeq)
     val op = new OnlineLDAOptimizer().setMiniBatchFraction(1).setTau0(1024).setKappa(0.51)
       .setGammaShape(1e10)
     val lda = new LDA().setK(2)
@@ -432,7 +432,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
 
   test("OnlineLDAOptimizer alpha hyperparameter optimization") {
     val k = 2
-    val docs = sc.parallelize(toyData)
+    val docs = sc.parallelize(toyData.toImmutableArraySeq)
     val op = new OnlineLDAOptimizer().setMiniBatchFraction(1).setTau0(1024).setKappa(0.51)
       .setGammaShape(100).setOptimizeDocConcentration(true).setSampleWithReplacement(false)
     val lda = new LDA().setK(k)
@@ -481,7 +481,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       .setTopicConcentration(topicConcentration)
       .setMaxIterations(5)
       .setSeed(12345)
-    val corpus = sc.parallelize(tinyCorpus, 2)
+    val corpus = sc.parallelize(tinyCorpus.toImmutableArraySeq, 2)
     val distributedModel: DistributedLDAModel = lda.run(corpus).asInstanceOf[DistributedLDAModel]
     val tempDir2 = Utils.createTempDir()
     val path2 = tempDir2.toURI.toString
@@ -532,7 +532,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       .zipWithIndex.map { case (wordCounts, docId) =>
         (docId.toLong, wordCounts)
     }
-    val distributedEmptyDocs = sc.parallelize(emptyDocs, 2)
+    val distributedEmptyDocs = sc.parallelize(emptyDocs.toImmutableArraySeq, 2)
 
     val op = new EMLDAOptimizer()
     val lda = new LDA()
@@ -552,7 +552,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       .zipWithIndex.map { case (wordCounts, docId) =>
         (docId.toLong, wordCounts)
     }
-    val distributedEmptyDocs = sc.parallelize(emptyDocs, 2)
+    val distributedEmptyDocs = sc.parallelize(emptyDocs.toImmutableArraySeq, 2)
 
     val op = new OnlineLDAOptimizer()
     val lda = new LDA()

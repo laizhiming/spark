@@ -20,7 +20,7 @@ package org.apache.spark.sql.connector.expressions;
 import java.util.Arrays;
 
 import org.apache.spark.annotation.Evolving;
-import scala.collection.JavaConverters;
+import scala.jdk.javaapi.CollectionConverters;
 
 import org.apache.spark.sql.types.DataType;
 
@@ -45,7 +45,7 @@ public class Expressions {
    */
   public static Transform apply(String name, Expression... args) {
     return LogicalExpressions.apply(name,
-        JavaConverters.asScalaBuffer(Arrays.asList(args)).toSeq());
+        CollectionConverters.asScala(Arrays.asList(args)).toSeq());
   }
 
   /**
@@ -164,4 +164,30 @@ public class Expressions {
     return LogicalExpressions.hours(Expressions.column(column));
   }
 
+  /**
+   * Create a sort expression.
+   *
+   * @param expr an expression to produce values to sort
+   * @param direction direction of the sort
+   * @param nullOrder null order of the sort
+   * @return a SortOrder
+   *
+   * @since 3.2.0
+   */
+  public static SortOrder sort(Expression expr, SortDirection direction, NullOrdering nullOrder) {
+    return LogicalExpressions.sort(expr, direction, nullOrder);
+  }
+
+  /**
+   * Create a sort expression.
+   *
+   * @param expr an expression to produce values to sort
+   * @param direction direction of the sort
+   * @return a SortOrder
+   *
+   * @since 3.2.0
+   */
+  public static SortOrder sort(Expression expr, SortDirection direction) {
+    return LogicalExpressions.sort(expr, direction, direction.defaultNullOrdering());
+  }
 }

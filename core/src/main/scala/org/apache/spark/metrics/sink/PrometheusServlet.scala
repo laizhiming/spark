@@ -18,29 +18,23 @@
 package org.apache.spark.metrics.sink
 
 import java.util.Properties
-import javax.servlet.http.HttpServletRequest
 
 import com.codahale.metrics.MetricRegistry
+import jakarta.servlet.http.HttpServletRequest
 import org.eclipse.jetty.servlet.ServletContextHandler
 
-import org.apache.spark.{SecurityManager, SparkConf}
-import org.apache.spark.annotation.Experimental
+import org.apache.spark.SparkConf
 import org.apache.spark.ui.JettyUtils._
 
 /**
- * :: Experimental ::
  * This exposes the metrics of the given registry with Prometheus format.
  *
  * The output is consistent with /metrics/json result in terms of item ordering
  * and with the previous result of Spark JMX Sink + Prometheus JMX Converter combination
  * in terms of key string format.
  */
-@Experimental
 private[spark] class PrometheusServlet(
-    val property: Properties,
-    val registry: MetricRegistry,
-    securityMgr: SecurityManager)
-  extends Sink {
+    val property: Properties, val registry: MetricRegistry) extends Sink {
 
   val SERVLET_KEY_PATH = "path"
 
@@ -54,9 +48,9 @@ private[spark] class PrometheusServlet(
   }
 
   def getMetricsSnapshot(request: HttpServletRequest): String = {
-    import scala.collection.JavaConverters._
+    import scala.jdk.CollectionConverters._
 
-    val guagesLabel = """{type="gauges"}"""
+    val gaugesLabel = """{type="gauges"}"""
     val countersLabel = """{type="counters"}"""
     val metersLabel = countersLabel
     val histogramslabels = """{type="histograms"}"""
@@ -65,8 +59,8 @@ private[spark] class PrometheusServlet(
     val sb = new StringBuilder()
     registry.getGauges.asScala.foreach { case (k, v) =>
       if (!v.getValue.isInstanceOf[String]) {
-        sb.append(s"${normalizeKey(k)}Number$guagesLabel ${v.getValue}\n")
-        sb.append(s"${normalizeKey(k)}Value$guagesLabel ${v.getValue}\n")
+        sb.append(s"${normalizeKey(k)}Number$gaugesLabel ${v.getValue}\n")
+        sb.append(s"${normalizeKey(k)}Value$gaugesLabel ${v.getValue}\n")
       }
     }
     registry.getCounters.asScala.foreach { case (k, v) =>
@@ -102,7 +96,7 @@ private[spark] class PrometheusServlet(
       val snapshot = timer.getSnapshot
       sb.append(s"${prefix}Count$timersLabels ${timer.getCount}\n")
       sb.append(s"${prefix}Max$timersLabels ${snapshot.getMax}\n")
-      sb.append(s"${prefix}Mean$timersLabels ${snapshot.getMax}\n")
+      sb.append(s"${prefix}Mean$timersLabels ${snapshot.getMean}\n")
       sb.append(s"${prefix}Min$timersLabels ${snapshot.getMin}\n")
       sb.append(s"${prefix}50thPercentile$timersLabels ${snapshot.getMedian}\n")
       sb.append(s"${prefix}75thPercentile$timersLabels ${snapshot.get75thPercentile}\n")

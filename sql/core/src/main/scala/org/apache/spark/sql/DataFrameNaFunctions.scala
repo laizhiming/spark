@@ -20,12 +20,14 @@ package org.apache.spark.sql
 import java.{lang => jl}
 import java.util.Locale
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.annotation.Stable
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Functionality for working with missing data in `DataFrame`s.
@@ -58,7 +60,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def drop(cols: Array[String]): DataFrame = drop(cols.toSeq)
+  def drop(cols: Array[String]): DataFrame = drop(cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that drops rows containing any null or NaN values
@@ -77,7 +79,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def drop(how: String, cols: Array[String]): DataFrame = drop(how, cols.toSeq)
+  def drop(how: String, cols: Array[String]): DataFrame = drop(how, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that drops rows containing null or NaN values
@@ -106,7 +108,8 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def drop(minNonNulls: Int, cols: Array[String]): DataFrame = drop(minNonNulls, cols.toSeq)
+  def drop(minNonNulls: Int, cols: Array[String]): DataFrame =
+    drop(minNonNulls, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that drops rows containing less than
@@ -144,7 +147,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 2.2.0
    */
-  def fill(value: Long, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: Long, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
   /**
    * Returns a new `DataFrame` that replaces null or NaN values in specified numeric columns.
@@ -152,7 +155,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def fill(value: Double, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: Double, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that replaces null or NaN values in specified
@@ -177,7 +180,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def fill(value: String, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: String, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that replaces null values in
@@ -208,7 +211,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 2.3.0
    */
-  def fill(value: Boolean, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: Boolean, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
 
   /**
@@ -300,7 +303,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    * @since 1.3.1
    */
   def replace[T](cols: Array[String], replacement: java.util.Map[T, T]): DataFrame = {
-    replace(cols.toSeq, replacement.asScala.toMap)
+    replace(cols.toImmutableArraySeq, replacement.asScala.toMap)
   }
 
   /**
@@ -327,9 +330,9 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    */
   def replace[T](col: String, replacement: Map[T, T]): DataFrame = {
     if (col == "*") {
-      replace0(df.columns, replacement)
+      replace0(df.logicalPlan.output, replacement)
     } else {
-      replace0(Seq(col), replacement)
+      replace(Seq(col), replacement)
     }
   }
 
@@ -352,10 +355,20 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def replace[T](cols: Seq[String], replacement: Map[T, T]): DataFrame = replace0(cols, replacement)
+  def replace[T](cols: Seq[String], replacement: Map[T, T]): DataFrame = {
+    val attrs = cols.map { colName =>
+      // Check column name exists
+      val attr = df.resolve(colName) match {
+        case a: Attribute => a
+        case _ => throw QueryExecutionErrors.nestedFieldUnsupportedError(colName)
+      }
+      attr
+    }
+    replace0(attrs, replacement)
+  }
 
-  private def replace0[T](cols: Seq[String], replacement: Map[T, T]): DataFrame = {
-    if (replacement.isEmpty || cols.isEmpty) {
+  private def replace0[T](attrs: Seq[Attribute], replacement: Map[T, T]): DataFrame = {
+    if (replacement.isEmpty || attrs.isEmpty) {
       return df
     }
 
@@ -379,15 +392,13 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
       case _: String => StringType
     }
 
-    val columnEquals = df.sparkSession.sessionState.analyzer.resolver
-    val projections = df.schema.fields.map { f =>
-      val shouldReplace = cols.exists(colName => columnEquals(colName, f.name))
-      if (f.dataType.isInstanceOf[NumericType] && targetColumnType == DoubleType && shouldReplace) {
-        replaceCol(f, replacementMap)
-      } else if (f.dataType == targetColumnType && shouldReplace) {
-        replaceCol(f, replacementMap)
+    val output = df.queryExecution.analyzed.output
+    val projections = output.map { attr =>
+      if (attrs.contains(attr) && (attr.dataType == targetColumnType ||
+        (attr.dataType.isInstanceOf[NumericType] && targetColumnType == DoubleType))) {
+        replaceCol(attr, replacementMap)
       } else {
-        df.col(f.name)
+        Column(attr)
       }
     }
     df.select(projections : _*)
@@ -395,10 +406,12 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
 
   private def fillMap(values: Seq[(String, Any)]): DataFrame = {
     // Error handling
-    values.foreach { case (colName, replaceValue) =>
+    val attrToValue = AttributeMap(values.map { case (colName, replaceValue) =>
       // Check column name exists
-      df.resolve(colName)
-
+      val attr = df.resolve(colName) match {
+        case a: Attribute => a
+        case _ => throw QueryExecutionErrors.nestedFieldUnsupportedError(colName)
+      }
       // Check data type
       replaceValue match {
         case _: jl.Double | _: jl.Float | _: jl.Integer | _: jl.Long | _: jl.Boolean | _: String =>
@@ -406,31 +419,29 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
         case _ => throw new IllegalArgumentException(
           s"Unsupported value type ${replaceValue.getClass.getName} ($replaceValue).")
       }
-    }
+      attr -> replaceValue
+    })
 
-    val columnEquals = df.sparkSession.sessionState.analyzer.resolver
-    val projections = df.schema.fields.map { f =>
-      values.find { case (k, _) => columnEquals(k, f.name) }.map { case (_, v) =>
-        v match {
-          case v: jl.Float => fillCol[Float](f, v)
-          case v: jl.Double => fillCol[Double](f, v)
-          case v: jl.Long => fillCol[Long](f, v)
-          case v: jl.Integer => fillCol[Integer](f, v)
-          case v: jl.Boolean => fillCol[Boolean](f, v.booleanValue())
-          case v: String => fillCol[String](f, v)
-        }
-      }.getOrElse(df.col(f.name))
+    val output = df.queryExecution.analyzed.output
+    val projections = output.map {
+      attr => attrToValue.get(attr).map {
+        case v: jl.Float => fillCol[Float](attr, v)
+        case v: jl.Double => fillCol[Double](attr, v)
+        case v: jl.Long => fillCol[Long](attr, v)
+        case v: jl.Integer => fillCol[Integer](attr, v)
+        case v: jl.Boolean => fillCol[Boolean](attr, v.booleanValue())
+        case v: String => fillCol[String](attr, v)
+      }.getOrElse(Column(attr))
     }
     df.select(projections : _*)
   }
 
   /**
-   * Returns a [[Column]] expression that replaces null value in `col` with `replacement`.
-   * It selects a column based on its name.
+   * Returns a [[Column]] expression that replaces null value in column defined by `attr`
+   * with `replacement`.
    */
-  private def fillCol[T](col: StructField, replacement: T): Column = {
-    val quotedColName = "`" + col.name + "`"
-    fillCol(col.dataType, col.name, df.col(quotedColName), replacement)
+  private def fillCol[T](attr: Attribute, replacement: T): Column = {
+    fillCol(attr.dataType, attr.name, Column(attr), replacement)
   }
 
   /**
@@ -452,13 +463,12 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * TODO: This can be optimized to use broadcast join when replacementMap is large.
    */
-  private def replaceCol[K, V](col: StructField, replacementMap: Map[K, V]): Column = {
-    val keyExpr = df.col(col.name).expr
-    def buildExpr(v: Any) = Cast(Literal(v), keyExpr.dataType)
+  private def replaceCol[K, V](attr: Attribute, replacementMap: Map[K, V]): Column = {
+    def buildExpr(v: Any) = Cast(Literal(v), attr.dataType)
     val branches = replacementMap.flatMap { case (source, target) =>
       Seq(Literal(source), buildExpr(target))
     }.toSeq
-    new Column(CaseKeyWhen(keyExpr, branches :+ keyExpr)).as(col.name)
+    new Column(CaseKeyWhen(attr, branches :+ attr)).as(attr.name)
   }
 
   private def convertToDouble(v: Any): Double = v match {
@@ -493,6 +503,10 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
     // only keep the row if it has at least `minNonNulls` non-null and non-NaN values.
     val predicate = AtLeastNNonNulls(minNonNulls, cols)
     df.filter(Column(predicate))
+  }
+
+  private[sql] def fillValue(value: Any, cols: Option[Seq[String]]): DataFrame = {
+    fillValue(value, cols.map(toAttributes).getOrElse(outputAttributes))
   }
 
   /**

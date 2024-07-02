@@ -38,13 +38,13 @@ class HostLocalShuffleReadingSuite extends SparkFunSuite with Matchers with Loca
 
   override def afterEach(): Unit = {
     Option(rpcHandler).foreach { handler =>
-      Utils.tryLogNonFatalError{
+      Utils.tryLogNonFatalError {
         server.close()
       }
-      Utils.tryLogNonFatalError{
+      Utils.tryLogNonFatalError {
         handler.close()
       }
-      Utils.tryLogNonFatalError{
+      Utils.tryLogNonFatalError {
         transportContext.close()
       }
       server = null
@@ -58,6 +58,7 @@ class HostLocalShuffleReadingSuite extends SparkFunSuite with Matchers with Loca
     val conf = new SparkConf()
       .set(SHUFFLE_HOST_LOCAL_DISK_READING_ENABLED, true)
 
+    import scala.language.existentials
     val (essStatus, blockStoreClientClass) = if (isESSEnabled) {
       // LocalSparkCluster will disable the ExternalShuffleService by default. Therefore,
       // we have to manually setup an server which embedded with ExternalBlockHandler to
@@ -131,5 +132,15 @@ class HostLocalShuffleReadingSuite extends SparkFunSuite with Matchers with Loca
       assert(localBytesRead.sum > 0 && localBlocksFetched.sum > 0)
       assert(remoteBytesRead.sum === 0 && remoteBlocksFetched.sum === 0)
     }
+  }
+
+  test("Enable host local shuffle reading when push based shuffle is enabled") {
+    val conf = new SparkConf()
+      .set(SHUFFLE_SERVICE_ENABLED, true)
+      .set("spark.yarn.maxAttempts", "1")
+      .set(PUSH_BASED_SHUFFLE_ENABLED, true)
+      .set(SERIALIZER, "org.apache.spark.serializer.KryoSerializer")
+    sc = new SparkContext("local-cluster[2, 1, 1024]", "test-host-local-shuffle-reading", conf)
+    sc.env.blockManager.hostLocalDirManager.isDefined should equal(true)
   }
 }

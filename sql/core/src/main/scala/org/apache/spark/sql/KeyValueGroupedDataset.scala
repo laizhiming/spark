@@ -17,16 +17,17 @@
 
 package org.apache.spark.sql
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.api.java.function._
+import org.apache.spark.sql.catalyst.analysis.{EliminateEventTimeWatermark, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, CreateStruct}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, Expression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.expressions.ReduceAggregator
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.streaming.{GroupState, GroupStateTimeout, OutputMode}
+import org.apache.spark.sql.internal.TypedAggUtils
+import org.apache.spark.sql.streaming.{GroupState, GroupStateTimeout, OutputMode, StatefulProcessor, StatefulProcessorWithInitialState, TimeMode}
 
 /**
  * A [[Dataset]] has been logically grouped by a user specified grouping key.  Users should not
@@ -43,8 +44,8 @@ class KeyValueGroupedDataset[K, V] private[sql](
     private val groupingAttributes: Seq[Attribute]) extends Serializable {
 
   // Similar to [[Dataset]], we turn the passed in encoder to `ExpressionEncoder` explicitly.
-  private implicit val kExprEnc = encoderFor(kEncoder)
-  private implicit val vExprEnc = encoderFor(vEncoder)
+  private implicit val kExprEnc: ExpressionEncoder[K] = encoderFor(kEncoder)
+  private implicit val vExprEnc: ExpressionEncoder[V] = encoderFor(vEncoder)
 
   private def logicalPlan = queryExecution.analyzed
   private def sparkSession = queryExecution.sparkSession
@@ -138,13 +139,14 @@ class KeyValueGroupedDataset[K, V] private[sql](
    *
    * @since 1.6.0
    */
-  def flatMapGroups[U : Encoder](f: (K, Iterator[V]) => TraversableOnce[U]): Dataset[U] = {
+  def flatMapGroups[U : Encoder](f: (K, Iterator[V]) => IterableOnce[U]): Dataset[U] = {
     Dataset[U](
       sparkSession,
       MapGroups(
         f,
         groupingAttributes,
         dataAttributes,
+        Seq.empty,
         logicalPlan))
   }
 
@@ -169,6 +171,80 @@ class KeyValueGroupedDataset[K, V] private[sql](
    */
   def flatMapGroups[U](f: FlatMapGroupsFunction[K, V, U], encoder: Encoder[U]): Dataset[U] = {
     flatMapGroups((key, data) => f.call(key, data.asJava).asScala)(encoder)
+  }
+
+  /**
+   * (Scala-specific)
+   * Applies the given function to each group of data.  For each unique group, the function will
+   * be passed the group key and a sorted iterator that contains all of the elements in the group.
+   * The function can return an iterator containing elements of an arbitrary type which will be
+   * returned as a new [[Dataset]].
+   *
+   * This function does not support partial aggregation, and as a result requires shuffling all
+   * the data in the [[Dataset]]. If an application intends to perform an aggregation over each
+   * key, it is best to use the reduce function or an
+   * `org.apache.spark.sql.expressions#Aggregator`.
+   *
+   * Internally, the implementation will spill to disk if any given group is too large to fit into
+   * memory.  However, users must take care to avoid materializing the whole iterator for a group
+   * (for example, by calling `toList`) unless they are sure that this is possible given the memory
+   * constraints of their cluster.
+   *
+   * This is equivalent to [[KeyValueGroupedDataset#flatMapGroups]], except for the iterator
+   * to be sorted according to the given sort expressions. That sorting does not add
+   * computational complexity.
+   *
+   * @see [[org.apache.spark.sql.KeyValueGroupedDataset#flatMapGroups]]
+   * @since 3.4.0
+   */
+  def flatMapSortedGroups[U : Encoder](
+      sortExprs: Column*)(
+      f: (K, Iterator[V]) => IterableOnce[U]): Dataset[U] = {
+    val sortOrder: Seq[SortOrder] = MapGroups.sortOrder(sortExprs.map(_.expr))
+
+    Dataset[U](
+      sparkSession,
+      MapGroups(
+        f,
+        groupingAttributes,
+        dataAttributes,
+        sortOrder,
+        logicalPlan
+      )
+    )
+  }
+
+  /**
+   * (Java-specific)
+   * Applies the given function to each group of data.  For each unique group, the function will
+   * be passed the group key and a sorted iterator that contains all of the elements in the group.
+   * The function can return an iterator containing elements of an arbitrary type which will be
+   * returned as a new [[Dataset]].
+   *
+   * This function does not support partial aggregation, and as a result requires shuffling all
+   * the data in the [[Dataset]]. If an application intends to perform an aggregation over each
+   * key, it is best to use the reduce function or an
+   * `org.apache.spark.sql.expressions#Aggregator`.
+   *
+   * Internally, the implementation will spill to disk if any given group is too large to fit into
+   * memory.  However, users must take care to avoid materializing the whole iterator for a group
+   * (for example, by calling `toList`) unless they are sure that this is possible given the memory
+   * constraints of their cluster.
+   *
+   * This is equivalent to [[KeyValueGroupedDataset#flatMapGroups]], except for the iterator
+   * to be sorted according to the given sort expressions. That sorting does not add
+   * computational complexity.
+   *
+   * @see [[org.apache.spark.sql.KeyValueGroupedDataset#flatMapGroups]]
+   * @since 3.4.0
+   */
+  def flatMapSortedGroups[U](
+      SortExprs: Array[Column],
+      f: FlatMapGroupsFunction[K, V, U],
+      encoder: Encoder[U]): Dataset[U] = {
+    import org.apache.spark.util.ArrayImplicits._
+    flatMapSortedGroups(
+      SortExprs.toImmutableArraySeq: _*)((key, data) => f.call(key, data.asJava).asScala)(encoder)
   }
 
   /**
@@ -281,6 +357,51 @@ class KeyValueGroupedDataset[K, V] private[sql](
   }
 
   /**
+   * (Scala-specific)
+   * Applies the given function to each group of data, while maintaining a user-defined per-group
+   * state. The result Dataset will represent the objects returned by the function.
+   * For a static batch Dataset, the function will be invoked once per group. For a streaming
+   * Dataset, the function will be invoked for each group repeatedly in every trigger, and
+   * updates to each group's state will be saved across invocations.
+   * See [[org.apache.spark.sql.streaming.GroupState]] for more details.
+   *
+   * @tparam S The type of the user-defined state. Must be encodable to Spark SQL types.
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param func Function to be called on every group.
+   * @param timeoutConf Timeout Conf, see GroupStateTimeout for more details
+   * @param initialState The user provided state that will be initialized when the first batch
+   *                     of data is processed in the streaming query. The user defined function
+   *                     will be called on the state data even if there are no other values in
+   *                     the group. To convert a Dataset ds of type Dataset[(K, S)] to a
+   *                     KeyValueGroupedDataset[K, S]
+   *                     do {{{ ds.groupByKey(x => x._1).mapValues(_._2) }}}
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   * @since 3.2.0
+   */
+  def mapGroupsWithState[S: Encoder, U: Encoder](
+      timeoutConf: GroupStateTimeout,
+      initialState: KeyValueGroupedDataset[K, S])(
+      func: (K, Iterator[V], GroupState[S]) => U): Dataset[U] = {
+    val flatMapFunc = (key: K, it: Iterator[V], s: GroupState[S]) => Iterator(func(key, it, s))
+
+    Dataset[U](
+      sparkSession,
+      FlatMapGroupsWithState[K, V, S, U](
+        flatMapFunc.asInstanceOf[(Any, Iterator[Any], LogicalGroupState[Any]) => Iterator[Any]],
+        groupingAttributes,
+        dataAttributes,
+        OutputMode.Update,
+        isMapGroupsWithState = true,
+        timeoutConf,
+        child = logicalPlan,
+        initialState.groupingAttributes,
+        initialState.dataAttributes,
+        initialState.queryExecution.analyzed
+      ))
+  }
+
+  /**
    * (Java-specific)
    * Applies the given function to each group of data, while maintaining a user-defined per-group
    * state. The result Dataset will represent the objects returned by the function.
@@ -337,6 +458,40 @@ class KeyValueGroupedDataset[K, V] private[sql](
   }
 
   /**
+   * (Java-specific)
+   * Applies the given function to each group of data, while maintaining a user-defined per-group
+   * state. The result Dataset will represent the objects returned by the function.
+   * For a static batch Dataset, the function will be invoked once per group. For a streaming
+   * Dataset, the function will be invoked for each group repeatedly in every trigger, and
+   * updates to each group's state will be saved across invocations.
+   * See `GroupState` for more details.
+   *
+   * @tparam S The type of the user-defined state. Must be encodable to Spark SQL types.
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param func          Function to be called on every group.
+   * @param stateEncoder  Encoder for the state type.
+   * @param outputEncoder Encoder for the output type.
+   * @param timeoutConf   Timeout configuration for groups that do not receive data for a while.
+   * @param initialState The user provided state that will be initialized when the first batch
+   *                     of data is processed in the streaming query. The user defined function
+   *                     will be called on the state data even if there are no other values in
+   *                     the group.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   * @since 3.2.0
+   */
+  def mapGroupsWithState[S, U](
+      func: MapGroupsWithStateFunction[K, V, S, U],
+      stateEncoder: Encoder[S],
+      outputEncoder: Encoder[U],
+      timeoutConf: GroupStateTimeout,
+      initialState: KeyValueGroupedDataset[K, S]): Dataset[U] = {
+    mapGroupsWithState[S, U](timeoutConf, initialState)(
+      (key: K, it: Iterator[V], s: GroupState[S]) => func.call(key, it.asJava, s)
+    )(stateEncoder, outputEncoder)
+  }
+
+  /**
    * (Scala-specific)
    * Applies the given function to each group of data, while maintaining a user-defined per-group
    * state. The result Dataset will represent the objects returned by the function.
@@ -374,6 +529,53 @@ class KeyValueGroupedDataset[K, V] private[sql](
   }
 
   /**
+   * (Scala-specific)
+   * Applies the given function to each group of data, while maintaining a user-defined per-group
+   * state. The result Dataset will represent the objects returned by the function.
+   * For a static batch Dataset, the function will be invoked once per group. For a streaming
+   * Dataset, the function will be invoked for each group repeatedly in every trigger, and
+   * updates to each group's state will be saved across invocations.
+   * See `GroupState` for more details.
+   *
+   * @tparam S The type of the user-defined state. Must be encodable to Spark SQL types.
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param func Function to be called on every group.
+   * @param outputMode The output mode of the function.
+   * @param timeoutConf Timeout configuration for groups that do not receive data for a while.
+   * @param initialState The user provided state that will be initialized when the first batch
+   *                     of data is processed in the streaming query. The user defined function
+   *                     will be called on the state data even if there are no other values in
+   *                     the group. To covert a Dataset `ds` of type  of type `Dataset[(K, S)]`
+   *                     to a `KeyValueGroupedDataset[K, S]`, use
+   *                     {{{ ds.groupByKey(x => x._1).mapValues(_._2) }}}
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   * @since 3.2.0
+   */
+  def flatMapGroupsWithState[S: Encoder, U: Encoder](
+      outputMode: OutputMode,
+      timeoutConf: GroupStateTimeout,
+      initialState: KeyValueGroupedDataset[K, S])(
+      func: (K, Iterator[V], GroupState[S]) => Iterator[U]): Dataset[U] = {
+    if (outputMode != OutputMode.Append && outputMode != OutputMode.Update) {
+      throw new IllegalArgumentException("The output mode of function should be append or update")
+    }
+    Dataset[U](
+      sparkSession,
+      FlatMapGroupsWithState[K, V, S, U](
+        func.asInstanceOf[(Any, Iterator[Any], LogicalGroupState[Any]) => Iterator[Any]],
+        groupingAttributes,
+        dataAttributes,
+        outputMode,
+        isMapGroupsWithState = false,
+        timeoutConf,
+        child = logicalPlan,
+        initialState.groupingAttributes,
+        initialState.dataAttributes,
+        initialState.queryExecution.analyzed
+      ))
+  }
+
+  /**
    * (Java-specific)
    * Applies the given function to each group of data, while maintaining a user-defined per-group
    * state. The result Dataset will represent the objects returned by the function.
@@ -401,6 +603,339 @@ class KeyValueGroupedDataset[K, V] private[sql](
       timeoutConf: GroupStateTimeout): Dataset[U] = {
     val f = (key: K, it: Iterator[V], s: GroupState[S]) => func.call(key, it.asJava, s).asScala
     flatMapGroupsWithState[S, U](outputMode, timeoutConf)(f)(stateEncoder, outputEncoder)
+  }
+
+  /**
+   * (Java-specific)
+   * Applies the given function to each group of data, while maintaining a user-defined per-group
+   * state. The result Dataset will represent the objects returned by the function.
+   * For a static batch Dataset, the function will be invoked once per group. For a streaming
+   * Dataset, the function will be invoked for each group repeatedly in every trigger, and
+   * updates to each group's state will be saved across invocations.
+   * See `GroupState` for more details.
+   *
+   * @tparam S The type of the user-defined state. Must be encodable to Spark SQL types.
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param func          Function to be called on every group.
+   * @param outputMode    The output mode of the function.
+   * @param stateEncoder  Encoder for the state type.
+   * @param outputEncoder Encoder for the output type.
+   * @param timeoutConf   Timeout configuration for groups that do not receive data for a while.
+   * @param initialState The user provided state that will be initialized when the first batch
+   *                     of data is processed in the streaming query. The user defined function
+   *                     will be called on the state data even if there are no other values in
+   *                     the group. To covert a Dataset `ds` of type  of type `Dataset[(K, S)]`
+   *                     to a `KeyValueGroupedDataset[K, S]`, use
+   *                     {{{ ds.groupByKey(x => x._1).mapValues(_._2) }}}
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   * @since 3.2.0
+   */
+  def flatMapGroupsWithState[S, U](
+      func: FlatMapGroupsWithStateFunction[K, V, S, U],
+      outputMode: OutputMode,
+      stateEncoder: Encoder[S],
+      outputEncoder: Encoder[U],
+      timeoutConf: GroupStateTimeout,
+      initialState: KeyValueGroupedDataset[K, S]): Dataset[U] = {
+    val f = (key: K, it: Iterator[V], s: GroupState[S]) => func.call(key, it.asJava, s).asScala
+    flatMapGroupsWithState[S, U](
+      outputMode, timeoutConf, initialState)(f)(stateEncoder, outputEncoder)
+  }
+
+  /**
+   * (Scala-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * We allow the user to act on per-group set of input rows along with keyed state and the
+   * user can choose to output/return 0 or more rows.
+   * For a streaming dataframe, we will repeatedly invoke the interface methods for new rows
+   * in each trigger and the user's state/state variables will be stored persistently across
+   * invocations.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor Instance of statefulProcessor whose functions will be invoked
+   *                          by the operator.
+   * @param timeMode          The time mode semantics of the stateful processor for timers and TTL.
+   * @param outputMode        The output mode of the stateful processor.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder](
+      statefulProcessor: StatefulProcessor[K, V, U],
+      timeMode: TimeMode,
+      outputMode: OutputMode): Dataset[U] = {
+    Dataset[U](
+      sparkSession,
+      TransformWithState[K, V, U](
+        groupingAttributes,
+        dataAttributes,
+        statefulProcessor,
+        timeMode,
+        outputMode,
+        child = logicalPlan
+      )
+    )
+  }
+
+  /**
+   * (Scala-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * We allow the user to act on per-group set of input rows along with keyed state and the
+   * user can choose to output/return 0 or more rows.
+   * For a streaming dataframe, we will repeatedly invoke the interface methods for new rows
+   * in each trigger and the user's state/state variables will be stored persistently across
+   * invocations.
+   *
+   * Downstream operators would use specified eventTimeColumnName to calculate watermark.
+   * Note that TimeMode is set to EventTime to ensure correct flow of watermark.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor   Instance of statefulProcessor whose functions will
+   *                            be invoked by the operator.
+   * @param eventTimeColumnName eventTime column in the output dataset. Any operations after
+   *                            transformWithState will use the new eventTimeColumn. The user
+   *                            needs to ensure that the eventTime for emitted output adheres to
+   *                            the watermark boundary, otherwise streaming query will fail.
+   * @param outputMode          The output mode of the stateful processor.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder](
+      statefulProcessor: StatefulProcessor[K, V, U],
+      eventTimeColumnName: String,
+      outputMode: OutputMode): Dataset[U] = {
+    val transformWithState = TransformWithState[K, V, U](
+      groupingAttributes,
+      dataAttributes,
+      statefulProcessor,
+      TimeMode.EventTime(),
+      outputMode,
+      child = logicalPlan
+    )
+    updateEventTimeColumnAfterTransformWithState(transformWithState, eventTimeColumnName)
+  }
+
+  /**
+   * (Java-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * We allow the user to act on per-group set of input rows along with keyed state and the
+   * user can choose to output/return 0 or more rows.
+   * For a streaming dataframe, we will repeatedly invoke the interface methods for new rows
+   * in each trigger and the user's state/state variables will be stored persistently across
+   * invocations.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor Instance of statefulProcessor whose functions will be invoked by the
+   *                          operator.
+   * @param timeMode The time mode semantics of the stateful processor for timers and TTL.
+   * @param outputMode The output mode of the stateful processor.
+   * @param outputEncoder Encoder for the output type.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder](
+      statefulProcessor: StatefulProcessor[K, V, U],
+      timeMode: TimeMode,
+      outputMode: OutputMode,
+      outputEncoder: Encoder[U]): Dataset[U] = {
+    transformWithState(statefulProcessor, timeMode, outputMode)(outputEncoder)
+  }
+
+  /**
+   * (Java-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * We allow the user to act on per-group set of input rows along with keyed state and the
+   * user can choose to output/return 0 or more rows.
+   *
+   * For a streaming dataframe, we will repeatedly invoke the interface methods for new rows
+   * in each trigger and the user's state/state variables will be stored persistently across
+   * invocations.
+   *
+   * Downstream operators would use specified eventTimeColumnName to calculate watermark.
+   * Note that TimeMode is set to EventTime to ensure correct flow of watermark.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor Instance of statefulProcessor whose functions will be invoked by the
+   *                          operator.
+   * @param eventTimeColumnName eventTime column in the output dataset. Any operations after
+   *                            transformWithState will use the new eventTimeColumn. The user
+   *                            needs to ensure that the eventTime for emitted output adheres to
+   *                            the watermark boundary, otherwise streaming query will fail.
+   * @param outputMode        The output mode of the stateful processor.
+   * @param outputEncoder     Encoder for the output type.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder](
+      statefulProcessor: StatefulProcessor[K, V, U],
+      eventTimeColumnName: String,
+      outputMode: OutputMode,
+      outputEncoder: Encoder[U]): Dataset[U] = {
+    transformWithState(statefulProcessor, eventTimeColumnName, outputMode)(outputEncoder)
+  }
+
+  /**
+   * (Scala-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * Functions as the function above, but with additional initial state.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @tparam S The type of initial state objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor Instance of statefulProcessor whose functions will
+   *                          be invoked by the operator.
+   * @param timeMode          The time mode semantics of the stateful processor for timers and TTL.
+   * @param outputMode        The output mode of the stateful processor.
+   * @param initialState      User provided initial state that will be used to initiate state for
+   *                          the query in the first batch.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder, S: Encoder](
+      statefulProcessor: StatefulProcessorWithInitialState[K, V, U, S],
+      timeMode: TimeMode,
+      outputMode: OutputMode,
+      initialState: KeyValueGroupedDataset[K, S]): Dataset[U] = {
+    Dataset[U](
+      sparkSession,
+      TransformWithState[K, V, U, S](
+        groupingAttributes,
+        dataAttributes,
+        statefulProcessor,
+        timeMode,
+        outputMode,
+        child = logicalPlan,
+        initialState.groupingAttributes,
+        initialState.dataAttributes,
+        initialState.queryExecution.analyzed
+      )
+    )
+  }
+
+  /**
+   * (Scala-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * Functions as the function above, but with additional eventTimeColumnName for output.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @tparam S The type of initial state objects. Must be encodable to Spark SQL types.
+   *
+   * Downstream operators would use specified eventTimeColumnName to calculate watermark.
+   * Note that TimeMode is set to EventTime to ensure correct flow of watermark.
+   *
+   * @param statefulProcessor   Instance of statefulProcessor whose functions will
+   *                            be invoked by the operator.
+   * @param eventTimeColumnName eventTime column in the output dataset. Any operations after
+   *                            transformWithState will use the new eventTimeColumn. The user
+   *                            needs to ensure that the eventTime for emitted output adheres to
+   *                            the watermark boundary, otherwise streaming query will fail.
+   * @param outputMode          The output mode of the stateful processor.
+   * @param initialState        User provided initial state that will be used to initiate state for
+   *                            the query in the first batch.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder, S: Encoder](
+      statefulProcessor: StatefulProcessorWithInitialState[K, V, U, S],
+      eventTimeColumnName: String,
+      outputMode: OutputMode,
+      initialState: KeyValueGroupedDataset[K, S]): Dataset[U] = {
+    val transformWithState = TransformWithState[K, V, U, S](
+      groupingAttributes,
+      dataAttributes,
+      statefulProcessor,
+      TimeMode.EventTime(),
+      outputMode,
+      child = logicalPlan,
+      initialState.groupingAttributes,
+      initialState.dataAttributes,
+      initialState.queryExecution.analyzed
+    )
+
+    updateEventTimeColumnAfterTransformWithState(transformWithState, eventTimeColumnName)
+  }
+
+  /**
+   * (Java-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * Functions as the function above, but with additional initialStateEncoder for state encoding.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @tparam S The type of initial state objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor   Instance of statefulProcessor whose functions will
+   *                            be invoked by the operator.
+   * @param timeMode            The time mode semantics of the stateful processor for
+   *                            timers and TTL.
+   * @param outputMode          The output mode of the stateful processor.
+   * @param initialState        User provided initial state that will be used to initiate state for
+   *                            the query in the first batch.
+   * @param outputEncoder       Encoder for the output type.
+   * @param initialStateEncoder Encoder for the initial state type.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder, S: Encoder](
+      statefulProcessor: StatefulProcessorWithInitialState[K, V, U, S],
+      timeMode: TimeMode,
+      outputMode: OutputMode,
+      initialState: KeyValueGroupedDataset[K, S],
+      outputEncoder: Encoder[U],
+      initialStateEncoder: Encoder[S]): Dataset[U] = {
+    transformWithState(statefulProcessor, timeMode,
+      outputMode, initialState)(outputEncoder, initialStateEncoder)
+  }
+
+  /**
+   * (Java-specific)
+   * Invokes methods defined in the stateful processor used in arbitrary state API v2.
+   * Functions as the function above, but with additional eventTimeColumnName for output.
+   *
+   * Downstream operators would use specified eventTimeColumnName to calculate watermark.
+   * Note that TimeMode is set to EventTime to ensure correct flow of watermark.
+   *
+   * @tparam U The type of the output objects. Must be encodable to Spark SQL types.
+   * @tparam S The type of initial state objects. Must be encodable to Spark SQL types.
+   * @param statefulProcessor Instance of statefulProcessor whose functions will
+   *                          be invoked by the operator.
+   * @param outputMode        The output mode of the stateful processor.
+   * @param initialState      User provided initial state that will be used to initiate state for
+   *                          the query in the first batch.
+   * @param eventTimeColumnName event column in the output dataset. Any operations after
+   *                            transformWithState will use the new eventTimeColumn. The user
+   *                            needs to ensure that the eventTime for emitted output adheres to
+   *                            the watermark boundary, otherwise streaming query will fail.
+   * @param outputEncoder     Encoder for the output type.
+   * @param initialStateEncoder Encoder for the initial state type.
+   *
+   * See [[Encoder]] for more details on what types are encodable to Spark SQL.
+   */
+  private[sql] def transformWithState[U: Encoder, S: Encoder](
+      statefulProcessor: StatefulProcessorWithInitialState[K, V, U, S],
+      outputMode: OutputMode,
+      initialState: KeyValueGroupedDataset[K, S],
+      eventTimeColumnName: String,
+      outputEncoder: Encoder[U],
+      initialStateEncoder: Encoder[S]): Dataset[U] = {
+    transformWithState(statefulProcessor, eventTimeColumnName,
+      outputMode, initialState)(outputEncoder, initialStateEncoder)
+  }
+
+  /**
+   * Creates a new dataset with updated eventTimeColumn after the transformWithState
+   * logical node.
+   */
+  private def updateEventTimeColumnAfterTransformWithState[U: Encoder](
+      transformWithState: LogicalPlan,
+      eventTimeColumnName: String): Dataset[U] = {
+    val transformWithStateDataset = Dataset[U](
+      sparkSession,
+      transformWithState
+    )
+
+    Dataset[U](sparkSession, EliminateEventTimeWatermark(
+      UpdateEventTimeWatermarkColumn(
+        UnresolvedAttribute(eventTimeColumnName),
+        None,
+        transformWithStateDataset.logicalPlan)))
   }
 
   /**
@@ -436,16 +971,7 @@ class KeyValueGroupedDataset[K, V] private[sql](
     val encoders = columns.map(_.encoder)
     val namedColumns =
       columns.map(_.withInputType(vExprEnc, dataAttributes).named)
-    val keyColumn = if (!kExprEnc.isSerializedAsStructForTopLevel) {
-      assert(groupingAttributes.length == 1)
-      if (SQLConf.get.nameNonStructGroupingKeyAsValue) {
-        groupingAttributes.head
-      } else {
-        Alias(groupingAttributes.head, "key")()
-      }
-    } else {
-      Alias(CreateStruct(groupingAttributes), "key")()
-    }
+    val keyColumn = TypedAggUtils.aggKeyColumn(kExprEnc, groupingAttributes)
     val aggregate = Aggregate(groupingAttributes, keyColumn +: namedColumns, logicalPlan)
     val execution = new QueryExecution(sparkSession, aggregate)
 
@@ -579,7 +1105,7 @@ class KeyValueGroupedDataset[K, V] private[sql](
    */
   def cogroup[U, R : Encoder](
       other: KeyValueGroupedDataset[K, U])(
-      f: (K, Iterator[V], Iterator[U]) => TraversableOnce[R]): Dataset[R] = {
+      f: (K, Iterator[V], Iterator[U]) => IterableOnce[R]): Dataset[R] = {
     implicit val uEncoder = other.vExprEnc
     Dataset[R](
       sparkSession,
@@ -589,6 +1115,8 @@ class KeyValueGroupedDataset[K, V] private[sql](
         other.groupingAttributes,
         this.dataAttributes,
         other.dataAttributes,
+        Seq.empty,
+        Seq.empty,
         this.logicalPlan,
         other.logicalPlan))
   }
@@ -607,6 +1135,74 @@ class KeyValueGroupedDataset[K, V] private[sql](
       f: CoGroupFunction[K, V, U, R],
       encoder: Encoder[R]): Dataset[R] = {
     cogroup(other)((key, left, right) => f.call(key, left.asJava, right.asJava).asScala)(encoder)
+  }
+
+  /**
+   * (Scala-specific)
+   * Applies the given function to each sorted cogrouped data.  For each unique group, the function
+   * will be passed the grouping key and 2 sorted iterators containing all elements in the group
+   * from [[Dataset]] `this` and `other`.  The function can return an iterator containing elements
+   * of an arbitrary type which will be returned as a new [[Dataset]].
+   *
+   * This is equivalent to [[KeyValueGroupedDataset#cogroup]], except for the iterators
+   * to be sorted according to the given sort expressions. That sorting does not add
+   * computational complexity.
+   *
+   * @see [[org.apache.spark.sql.KeyValueGroupedDataset#cogroup]]
+   * @since 3.4.0
+   */
+  def cogroupSorted[U, R : Encoder](
+      other: KeyValueGroupedDataset[K, U])(
+      thisSortExprs: Column*)(
+      otherSortExprs: Column*)(
+      f: (K, Iterator[V], Iterator[U]) => IterableOnce[R]): Dataset[R] = {
+    def toSortOrder(col: Column): SortOrder = col.expr match {
+      case expr: SortOrder => expr
+      case expr: Expression => SortOrder(expr, Ascending)
+    }
+
+    val thisSortOrder: Seq[SortOrder] = thisSortExprs.map(toSortOrder)
+    val otherSortOrder: Seq[SortOrder] = otherSortExprs.map(toSortOrder)
+
+    implicit val uEncoder = other.vExprEnc
+    Dataset[R](
+      sparkSession,
+      CoGroup(
+        f,
+        this.groupingAttributes,
+        other.groupingAttributes,
+        this.dataAttributes,
+        other.dataAttributes,
+        thisSortOrder,
+        otherSortOrder,
+        this.logicalPlan,
+        other.logicalPlan))
+  }
+
+  /**
+   * (Java-specific)
+   * Applies the given function to each sorted cogrouped data.  For each unique group, the function
+   * will be passed the grouping key and 2 sorted iterators containing all elements in the group
+   * from [[Dataset]] `this` and `other`.  The function can return an iterator containing elements
+   * of an arbitrary type which will be returned as a new [[Dataset]].
+   *
+   * This is equivalent to [[KeyValueGroupedDataset#cogroup]], except for the iterators
+   * to be sorted according to the given sort expressions. That sorting does not add
+   * computational complexity.
+   *
+   * @see [[org.apache.spark.sql.KeyValueGroupedDataset#cogroup]]
+   * @since 3.4.0
+   */
+  def cogroupSorted[U, R](
+      other: KeyValueGroupedDataset[K, U],
+      thisSortExprs: Array[Column],
+      otherSortExprs: Array[Column],
+      f: CoGroupFunction[K, V, U, R],
+      encoder: Encoder[R]): Dataset[R] = {
+    import org.apache.spark.util.ArrayImplicits._
+    cogroupSorted(other)(
+      thisSortExprs.toImmutableArraySeq: _*)(otherSortExprs.toImmutableArraySeq: _*)(
+      (key, left, right) => f.call(key, left.asJava, right.asJava).asScala)(encoder)
   }
 
   override def toString: String = {

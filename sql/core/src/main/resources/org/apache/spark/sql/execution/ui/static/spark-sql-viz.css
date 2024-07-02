@@ -52,3 +52,26 @@
 .tooltip-inner {
   word-wrap:break-word;
 }
+
+/* Breaks the long job url list when showing Details for Query in SQL */
+.job-url {
+  word-wrap: break-word;
+}
+
+#plan-viz-graph svg g.node rect.selected {
+  fill: #E25A1CFF;
+  stroke: #317EACFF;
+  stroke-width: 2px;
+}
+
+#plan-viz-graph svg g.node rect.linked {
+  fill: #FFC106FF;
+  stroke: #317EACFF;
+  stroke-width: 2px;
+}
+
+#plan-viz-graph svg path.linked {
+  fill: #317EACFF;
+  stroke: #317EACFF;
+  stroke-width: 2px;
+}

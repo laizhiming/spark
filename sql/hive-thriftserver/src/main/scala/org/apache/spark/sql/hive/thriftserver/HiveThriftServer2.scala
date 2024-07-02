@@ -27,7 +27,7 @@ import org.apache.hive.service.cli.thrift.{ThriftBinaryCLIService, ThriftHttpCLI
 import org.apache.hive.service.server.HiveServer2
 
 import org.apache.spark.SparkContext
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.{DeveloperApi, Since}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.UI.UI_ENABLED
 import org.apache.spark.sql.SQLContext
@@ -45,13 +45,22 @@ object HiveThriftServer2 extends Logging {
   var uiTab: Option[ThriftServerTab] = None
   var listener: HiveThriftServer2Listener = _
   var eventManager: HiveThriftServer2EventManager = _
+  val systemExitOnError = new AtomicBoolean(true)
 
   /**
    * :: DeveloperApi ::
    * Starts a new thrift server with the given context.
+   *
+   * @param sqlContext SQLContext to use for the server
+   * @param exitOnError Whether to exit the JVM if HiveThriftServer2 fails to initialize. When true,
+   *                    the call logs the error and exits the JVM with exit code -1. When false, the
+   *                    call throws an exception instead.
    */
+  @Since("4.0.0")
   @DeveloperApi
-  def startWithContext(sqlContext: SQLContext): HiveThriftServer2 = {
+  def startWithContext(sqlContext: SQLContext, exitOnError: Boolean): HiveThriftServer2 = {
+    systemExitOnError.set(exitOnError)
+
     val executionHive = HiveUtils.newClientForExecution(
       sqlContext.sparkContext.conf,
       sqlContext.sessionState.newHadoopConf())
@@ -67,13 +76,25 @@ object HiveThriftServer2 extends Logging {
     server
   }
 
+  /**
+   * :: DeveloperApi ::
+   * Starts a new thrift server with the given context.
+   *
+   * @param sqlContext SQLContext to use for the server
+   */
+  @Since("2.0.0")
+  @DeveloperApi
+  def startWithContext(sqlContext: SQLContext): HiveThriftServer2 = {
+    startWithContext(sqlContext, exitOnError = true)
+  }
+
   private def createListenerAndUI(server: HiveThriftServer2, sc: SparkContext): Unit = {
     val kvStore = sc.statusStore.store.asInstanceOf[ElementTrackingStore]
     eventManager = new HiveThriftServer2EventManager(sc)
     listener = new HiveThriftServer2Listener(kvStore, sc.conf, Some(server))
     sc.listenerBus.addToStatusQueue(listener)
     uiTab = if (sc.getConf.get(UI_ENABLED)) {
-      Some(new ThriftServerTab(new HiveThriftServer2AppStatusStore(kvStore, Some(listener)),
+      Some(new ThriftServerTab(new HiveThriftServer2AppStatusStore(kvStore),
         ThriftServerTab.getSparkUI(sc)))
     } else {
       None
@@ -116,7 +137,7 @@ object HiveThriftServer2 extends Logging {
   }
 
   private[thriftserver] object ExecutionState extends Enumeration {
-    val STARTED, COMPILED, CANCELED, FAILED, FINISHED, CLOSED = Value
+    val STARTED, COMPILED, CANCELED, TIMEDOUT, FAILED, FINISHED, CLOSED = Value
     type ExecutionState = Value
   }
 }

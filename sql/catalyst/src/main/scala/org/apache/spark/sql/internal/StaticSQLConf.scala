@@ -20,6 +20,7 @@ package org.apache.spark.sql.internal
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.util.Utils
 
 
@@ -36,6 +37,13 @@ object StaticSQLConf {
     .version("2.0.0")
     .stringConf
     .createWithDefault(Utils.resolveURI("spark-warehouse").toString)
+
+  val CATALOG_DEFAULT_DATABASE =
+    buildStaticConf(s"spark.sql.catalog.$SESSION_CATALOG_NAME.defaultDatabase")
+    .doc("The default database for session catalog.")
+    .version("3.4.0")
+    .stringConf
+    .createWithDefault("default")
 
   val CATALOG_IMPLEMENTATION = buildStaticConf("spark.sql.catalogImplementation")
     .internal()
@@ -195,6 +203,7 @@ object StaticSQLConf {
 
   val SQL_LEGACY_SESSION_INIT_WITH_DEFAULTS =
     buildStaticConf("spark.sql.legacy.sessionInitWithConfigDefaults")
+      .internal()
       .doc("Flag to revert to legacy behavior where a cloned SparkSession receives SparkConf " +
         "defaults, dropping any overrides in its parent SparkSession.")
       .version("3.0.0")
@@ -249,4 +258,24 @@ object StaticSQLConf {
     .version("3.1.0")
     .timeConf(TimeUnit.SECONDS)
     .createWithDefault(-1)
+
+  val ENABLED_STREAMING_UI_CUSTOM_METRIC_LIST =
+    buildStaticConf("spark.sql.streaming.ui.enabledCustomMetricList")
+      .internal()
+      .doc("Configures a list of custom metrics on Structured Streaming UI, which are enabled. " +
+        "The list contains the name of the custom metrics separated by comma. In aggregation" +
+        "only sum used. The list of supported custom metrics is state store provider specific " +
+        "and it can be found out for example from query progress log entry.")
+      .version("3.1.0")
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
+
+  val DISABLED_JDBC_CONN_PROVIDER_LIST =
+    buildStaticConf("spark.sql.sources.disabledJdbcConnProviderList")
+      .doc("Configures a list of JDBC connection providers, which are disabled. " +
+        "The list contains the name of the JDBC connection providers separated by comma.")
+      .version("3.1.0")
+      .stringConf
+      .createWithDefault("")
 }

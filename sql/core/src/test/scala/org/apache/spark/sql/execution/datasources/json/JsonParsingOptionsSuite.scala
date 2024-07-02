@@ -18,12 +18,11 @@
 package org.apache.spark.sql.execution.datasources.json
 
 import org.apache.spark.sql.{QueryTest, Row}
-import org.apache.spark.sql.catalyst.json.JSONOptions
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{DoubleType, StringType, StructType}
+import org.apache.spark.sql.types.{StringType, StructType}
 
 /**
- * Test cases for various [[JSONOptions]].
+ * Test cases for various [[org.apache.spark.sql.catalyst.json.JSONOptions]].
  */
 class JsonParsingOptionsSuite extends QueryTest with SharedSparkSession {
   import testImplicits._
@@ -74,14 +73,14 @@ class JsonParsingOptionsSuite extends QueryTest with SharedSparkSession {
   }
 
   test("allowUnquotedControlChars off") {
-    val str = """{"name": "a\u0001b"}"""
+    val str = "{\"name\": \"a\u0001b\"}"
     val df = spark.read.json(Seq(str).toDS())
 
     assert(df.schema.head.name == "_corrupt_record")
   }
 
   test("allowUnquotedControlChars on") {
-    val str = """{"name": "a\u0001b"}"""
+    val str = "{\"name\": \"a\u0001b\"}"
     val df = spark.read.option("allowUnquotedControlChars", "true").json(Seq(str).toDS())
 
     assert(df.schema.head.name == "name")
@@ -129,6 +128,45 @@ class JsonParsingOptionsSuite extends QueryTest with SharedSparkSession {
         Double.NaN,
         Double.PositiveInfinity, Double.PositiveInfinity, Double.PositiveInfinity,
         Double.NegativeInfinity, Double.NegativeInfinity))
+  }
+
+  test("allowNonNumericNumbers on - quoted") {
+    val str =
+      """{"c0":"NaN", "c1":"+INF", "c2":"+Infinity", "c3":"Infinity", "c4":"-INF",
+        |"c5":"-Infinity"}""".stripMargin
+    val df = spark.read
+      .schema(new StructType()
+        .add("c0", "double")
+        .add("c1", "double")
+        .add("c2", "double")
+        .add("c3", "double")
+        .add("c4", "double")
+        .add("c5", "double"))
+      .option("allowNonNumericNumbers", true).json(Seq(str).toDS())
+    checkAnswer(
+      df,
+      Row(
+        Double.NaN,
+        Double.PositiveInfinity, Double.PositiveInfinity, Double.PositiveInfinity,
+        Double.NegativeInfinity, Double.NegativeInfinity))
+  }
+
+  test("allowNonNumericNumbers off - quoted") {
+    val str =
+      """{"c0":"NaN", "c1":"+INF", "c2":"+Infinity", "c3":"Infinity", "c4":"-INF",
+        |"c5":"-Infinity"}""".stripMargin
+    val df = spark.read
+      .schema(new StructType()
+        .add("c0", "double")
+        .add("c1", "double")
+        .add("c2", "double")
+        .add("c3", "double")
+        .add("c4", "double")
+        .add("c5", "double"))
+      .option("allowNonNumericNumbers", false).json(Seq(str).toDS())
+    checkAnswer(
+      df,
+      Row(null, null, null, null, null, null))
   }
 
   test("allowBackslashEscapingAnyCharacter off") {

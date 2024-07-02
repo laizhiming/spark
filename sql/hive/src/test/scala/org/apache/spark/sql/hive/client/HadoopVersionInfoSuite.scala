@@ -21,6 +21,7 @@ import java.io.File
 import java.net.URLClassLoader
 
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.util.VersionInfo
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.sql.hive.{HiveExternalCatalog, HiveUtils}
@@ -45,12 +46,12 @@ class HadoopVersionInfoSuite extends SparkFunSuite {
       // Download jars for Hive 2.0
       val client = IsolatedClientLoader.forVersion(
         hiveMetastoreVersion = "2.0",
-        hadoopVersion = "2.7.4",
+        // 3.0.x is chosen because that HADOOP-14067 got fixed in 3.1.0
+        hadoopVersion = "3.0.3",
         sparkConf = new SparkConf(),
         hadoopConf = hadoopConf,
         config = HiveClientBuilder.buildConf(Map.empty),
-        ivyPath = Some(ivyPath.getCanonicalPath),
-        sharesHadoopClasses = true)
+        ivyPath = Some(ivyPath.getCanonicalPath))
       val jars = client.classLoader.getParent.asInstanceOf[URLClassLoader].getURLs
         .map(u => new File(u.toURI))
         // Drop all Hadoop jars to use the existing Hadoop jars on the classpath
@@ -68,5 +69,21 @@ class HadoopVersionInfoSuite extends SparkFunSuite {
     } finally {
       Utils.deleteRecursively(ivyPath)
     }
+  }
+
+  test("SPARK-32212: test supportHadoopShadedClient()") {
+    Seq("4", "3.2.2", "3.2.3", "3.2.2.1", "3.2.2-XYZ", "3.2.2.4-SNAPSHOT").foreach { version =>
+      assert(IsolatedClientLoader.supportsHadoopShadedClient(version), s"version $version")
+    }
+
+    // negative cases
+    Seq("3.1.3", "3.2", "3.2.1").foreach { version =>
+      assert(!IsolatedClientLoader.supportsHadoopShadedClient(version), s"version $version")
+    }
+  }
+
+  test("SPARK-32212: built-in Hadoop version should support shaded client") {
+    val hadoopVersion = VersionInfo.getVersion
+    assert(IsolatedClientLoader.supportsHadoopShadedClient(hadoopVersion))
   }
 }

@@ -67,8 +67,12 @@ operators <- list(
   # we can not override `&&` and `||`, so use `&` and `|` instead
   "&" = "and", "|" = "or", "^" = "pow"
 )
-column_functions1 <- c("asc", "desc", "isNaN", "isNull", "isNotNull")
-column_functions2 <- c("like", "rlike", "getField", "getItem", "contains")
+column_functions1 <- c(
+  "asc", "asc_nulls_first", "asc_nulls_last",
+  "desc", "desc_nulls_first", "desc_nulls_last",
+  "isNaN", "isNull", "isNotNull"
+)
+column_functions2 <- c("like", "rlike", "ilike", "getField", "getItem", "contains")
 
 createOperator <- function(op) {
   setMethod(op,
@@ -81,7 +85,7 @@ createOperator <- function(op) {
                   callJMethod(e1@jc, operators[[op]])
                 }
               } else {
-                if (class(e2) == "Column") {
+                if (inherits(e2, "Column")) {
                   e2 <- e2@jc
                 }
                 if (op == "^") {
@@ -106,7 +110,7 @@ createColumnFunction2 <- function(name) {
   setMethod(name,
             signature(x = "Column"),
             function(x, data) {
-              if (class(data) == "Column") {
+              if (inherits(data, "Column")) {
                 data <- data@jc
               }
               jc <- callJMethod(x@jc, name, data)
@@ -131,7 +135,7 @@ createMethods()
 #' @rdname alias
 #' @name alias
 #' @aliases alias,Column-method
-#' @family colum_func
+#' @family column_func
 #' @examples
 #' \dontrun{
 #' df <- createDataFrame(iris)
@@ -157,7 +161,7 @@ setMethod("alias",
 #'
 #' @rdname substr
 #' @name substr
-#' @family colum_func
+#' @family column_func
 #' @aliases substr,Column-method
 #'
 #' @param x a Column.
@@ -183,7 +187,7 @@ setMethod("substr", signature(x = "Column"),
 #'
 #' @rdname startsWith
 #' @name startsWith
-#' @family colum_func
+#' @family column_func
 #' @aliases startsWith,Column-method
 #'
 #' @param x vector of character string whose "starts" are considered
@@ -202,7 +206,7 @@ setMethod("startsWith", signature(x = "Column"),
 #'
 #' @rdname endsWith
 #' @name endsWith
-#' @family colum_func
+#' @family column_func
 #' @aliases endsWith,Column-method
 #'
 #' @param x vector of character string whose "ends" are considered
@@ -220,7 +224,7 @@ setMethod("endsWith", signature(x = "Column"),
 #'
 #' @rdname between
 #' @name between
-#' @family colum_func
+#' @family column_func
 #' @aliases between,Column-method
 #'
 #' @param x a Column
@@ -247,7 +251,7 @@ setMethod("between", signature(x = "Column"),
 # nolint end
 #' @rdname cast
 #' @name cast
-#' @family colum_func
+#' @family column_func
 #' @aliases cast,Column-method
 #'
 #' @examples
@@ -296,13 +300,13 @@ setMethod("%in%",
 #'              Can be a single value or a Column.
 #' @rdname otherwise
 #' @name otherwise
-#' @family colum_func
+#' @family column_func
 #' @aliases otherwise,Column-method
 #' @note otherwise since 1.5.0
 setMethod("otherwise",
           signature(x = "Column", value = "ANY"),
           function(x, value) {
-            value <- if (class(value) == "Column") { value@jc } else { value }
+            value <- if (inherits(value, "Column")) { value@jc } else { value }
             jc <- callJMethod(x@jc, "otherwise", value)
             column(jc)
           })
@@ -436,7 +440,7 @@ setMethod("withField",
 #' )
 #'
 #' # However, if you are going to add/replace multiple nested fields,
-#' # it is preffered to extract out the nested struct before
+#' # it is preferred to extract out the nested struct before
 #' # adding/replacing multiple fields e.g.
 #' head(
 #'   withColumn(

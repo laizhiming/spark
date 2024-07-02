@@ -58,7 +58,7 @@ INSERT INTO person VALUES
     (400, 'Dan', 50, 4, 'Street 4');
 
 SELECT * FROM person
-    LATERAL VIEW EXPLODE(ARRAY(30, 60)) tabelName AS c_age
+    LATERAL VIEW EXPLODE(ARRAY(30, 60)) tableName AS c_age
     LATERAL VIEW EXPLODE(ARRAY(40, 80)) AS d_age;
 +------+-------+-------+--------+-----------+--------+--------+
 |  id  | name  |  age  | class  |  address  | c_age  | d_age  |
@@ -93,14 +93,14 @@ GROUP BY c_age;
 +--------+-----------+
 
 SELECT * FROM person
-    LATERAL VIEW EXPLODE(ARRAY()) tabelName AS c_age;
+    LATERAL VIEW EXPLODE(ARRAY()) tableName AS c_age;
 +-----+-------+------+--------+----------+--------+
 | id  | name  | age  | class  | address  | c_age  |
 +-----+-------+------+--------+----------+--------+
 +-----+-------+------+--------+----------+--------+
 
 SELECT * FROM person
-    LATERAL VIEW OUTER EXPLODE(ARRAY()) tabelName AS c_age;
+    LATERAL VIEW OUTER EXPLODE(ARRAY()) tableName AS c_age;
 +------+-------+-------+--------+-----------+--------+
 |  id  | name  |  age  | class  |  address  | c_age  |
 +------+-------+-------+--------+-----------+--------+
@@ -121,5 +121,7 @@ SELECT * FROM person
 * [SORT BY Clause](sql-ref-syntax-qry-select-sortby.html)
 * [DISTRIBUTE BY Clause](sql-ref-syntax-qry-select-distribute-by.html)
 * [LIMIT Clause](sql-ref-syntax-qry-select-limit.html)
+* [OFFSET Clause](sql-ref-syntax-qry-select-offset.html)
 * [CASE Clause](sql-ref-syntax-qry-select-case.html)
 * [PIVOT Clause](sql-ref-syntax-qry-select-pivot.html)
+* [UNPIVOT Clause](sql-ref-syntax-qry-select-unpivot.html)

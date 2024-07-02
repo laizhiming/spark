@@ -18,13 +18,14 @@ package org.apache.spark.sql.execution.streaming
 
 import java.util.concurrent.TimeUnit.NANOSECONDS
 
+import org.apache.hadoop.conf.Configuration
+
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow, SortOrder, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, Distribution, Partitioning}
-import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
 import org.apache.spark.sql.execution.{LimitExec, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.streaming.state.StateStoreOps
+import org.apache.spark.sql.execution.streaming.state.{NoPrefixKeyStateEncoderSpec, StateSchemaCompatibilityChecker, StateStoreOps}
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.{LongType, NullType, StructField, StructType}
 import org.apache.spark.util.{CompletionIterator, NextIterator}
@@ -46,6 +47,11 @@ case class StreamingGlobalLimitExec(
   private val keySchema = StructType(Array(StructField("key", NullType)))
   private val valueSchema = StructType(Array(StructField("value", LongType)))
 
+  override def validateAndMaybeEvolveStateSchema(hadoopConf: Configuration): Unit = {
+    StateSchemaCompatibilityChecker.validateAndMaybeEvolveStateSchema(getStateInfo, hadoopConf,
+      keySchema, valueSchema, session.sessionState)
+  }
+
   override protected def doExecute(): RDD[InternalRow] = {
     metrics // force lazy init at driver
 
@@ -53,9 +59,9 @@ case class StreamingGlobalLimitExec(
         getStateInfo,
         keySchema,
         valueSchema,
-        indexOrdinal = None,
-        sqlContext.sessionState,
-        Some(sqlContext.streams.stateStoreCoordinator)) { (store, iter) =>
+        NoPrefixKeyStateEncoderSpec(keySchema),
+        session.sessionState,
+        Some(session.streams.stateStoreCoordinator)) { (store, iter) =>
       val key = UnsafeProjection.create(keySchema)(new GenericInternalRow(Array[Any](null)))
       val numOutputRows = longMetric("numOutputRows")
       val numUpdatedStateRows = longMetric("numUpdatedStateRows")
@@ -83,6 +89,7 @@ case class StreamingGlobalLimitExec(
         allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
         commitTimeMs += timeTakenMs { store.commit() }
         setStoreMetrics(store)
+        setOperatorMetrics()
       })
     }
   }
@@ -96,6 +103,11 @@ case class StreamingGlobalLimitExec(
   private def getValueRow(value: Long): UnsafeRow = {
     UnsafeProjection.create(valueSchema)(new GenericInternalRow(Array[Any](value)))
   }
+
+  override def shortName: String = "globalLimit"
+
+  override protected def withNewChildInternal(newChild: SparkPlan): StreamingGlobalLimitExec =
+    copy(child = newChild)
 }
 
 
@@ -134,4 +146,7 @@ case class StreamingLocalLimitExec(limit: Int, child: SparkPlan)
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
   override def output: Seq[Attribute] = child.output
+
+  override protected def withNewChildInternal(newChild: SparkPlan): StreamingLocalLimitExec =
+    copy(child = newChild)
 }

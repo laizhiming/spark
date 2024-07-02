@@ -21,7 +21,9 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Expand, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern.AGGREGATE
 import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.util.collection.Utils
 
 /**
  * This rule rewrites an aggregate query with distinct aggregations into an expanded double
@@ -39,8 +41,8 @@ import org.apache.spark.sql.types.IntegerType
  *
  *   val agg = data.groupBy($"key")
  *     .agg(
- *       countDistinct($"cat1").as("cat1_cnt"),
- *       countDistinct($"cat2").as("cat2_cnt"),
+ *       count_distinct($"cat1").as("cat1_cnt"),
+ *       count_distinct($"cat2").as("cat2_cnt"),
  *       sum($"value").as("total"))
  * }}}
  *
@@ -59,9 +61,9 @@ import org.apache.spark.sql.types.IntegerType
  * {{{
  * Aggregate(
  *    key = ['key]
- *    functions = [count(if (('gid = 1)) 'cat1 else null),
- *                 count(if (('gid = 2)) 'cat2 else null),
- *                 first(if (('gid = 0)) 'total else null) ignore nulls]
+ *    functions = [count('cat1) FILTER (WHERE 'gid = 1),
+ *                 count('cat2) FILTER (WHERE 'gid = 2),
+ *                 first('total) ignore nulls FILTER (WHERE 'gid = 0)]
  *    output = ['key, 'cat1_cnt, 'cat2_cnt, 'total])
  *   Aggregate(
  *      key = ['key, 'cat1, 'cat2, 'gid]
@@ -102,9 +104,9 @@ import org.apache.spark.sql.types.IntegerType
  * {{{
  * Aggregate(
  *    key = ['key]
- *    functions = [count(if (('gid = 1)) 'cat1 else null),
- *                 count(if (('gid = 2)) 'cat2 else null),
- *                 first(if (('gid = 0)) 'total else null) ignore nulls]
+ *    functions = [count('cat1) FILTER (WHERE 'gid = 1),
+ *                 count('cat2) FILTER (WHERE 'gid = 2),
+ *                 first('total) ignore nulls FILTER (WHERE 'gid = 0)]
  *    output = ['key, 'cat1_cnt, 'cat2_cnt, 'total])
  *   Aggregate(
  *      key = ['key, 'cat1, 'cat2, 'gid]
@@ -145,9 +147,9 @@ import org.apache.spark.sql.types.IntegerType
  * {{{
  * Aggregate(
  *    key = ['key]
- *    functions = [count(if (('gid = 1) and 'max_cond1) 'cat1 else null),
- *                 count(if (('gid = 2) and 'max_cond2) 'cat2 else null),
- *                 first(if (('gid = 0)) 'total else null) ignore nulls]
+ *    functions = [count('cat1) FILTER (WHERE 'gid = 1 and 'max_cond1),
+ *                 count('cat2) FILTER (WHERE 'gid = 2 and 'max_cond2),
+ *                 first('total) ignore nulls FILTER (WHERE 'gid = 0)]
  *    output = ['key, 'cat1_cnt, 'cat2_cnt, 'total])
  *   Aggregate(
  *      key = ['key, 'cat1, 'cat2, 'gid]
@@ -206,7 +208,8 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
     distinctAggs.size > 1 || distinctAggs.exists(_.filter.isDefined)
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
+    _.containsPattern(AGGREGATE)) {
     case a: Aggregate if mayNeedtoRewrite(a) => rewrite(a)
   }
 
@@ -217,7 +220,7 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
 
     // Extract distinct aggregate expressions.
     val distinctAggGroups = aggExpressions.filter(_.isDistinct).groupBy { e =>
-        val unfoldableChildren = e.aggregateFunction.children.filter(!_.foldable).toSet
+        val unfoldableChildren = ExpressionSet(e.aggregateFunction.children.filter(!_.foldable))
         if (unfoldableChildren.nonEmpty) {
           // Only expand the unfoldable children
           unfoldableChildren
@@ -228,7 +231,7 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
           // count(distinct 1) will be explained to count(1) after the rewrite function.
           // Generally, the distinct aggregateFunction should not run
           // foldable TypeCheck for the first child.
-          e.aggregateFunction.children.take(1).toSet
+          ExpressionSet(e.aggregateFunction.children.take(1))
         }
     }
 
@@ -242,14 +245,6 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
       }
       val groupByAttrs = groupByMap.map(_._2)
 
-      // Functions used to modify aggregate functions and their inputs.
-      def evalWithinGroup(id: Literal, e: Expression, condition: Option[Expression]) =
-        if (condition.isDefined) {
-          If(And(EqualTo(gid, id), condition.get), e, nullify(e))
-        } else {
-          If(EqualTo(gid, id), e, nullify(e))
-        }
-
       def patchAggregateFunctionChildren(
           af: AggregateFunction)(
           attrs: Expression => Option[Expression]): AggregateFunction = {
@@ -259,7 +254,9 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
 
       // Setup unique distinct aggregate children.
       val distinctAggChildren = distinctAggGroups.keySet.flatten.toSeq.distinct
-      val distinctAggChildAttrMap = distinctAggChildren.map(expressionAttributePair)
+      val distinctAggChildAttrMap = distinctAggChildren.map { e =>
+        e.canonicalized -> AttributeReference(e.sql, e.dataType, nullable = true)()
+      }
       val distinctAggChildAttrs = distinctAggChildAttrMap.map(_._2)
       // Setup all the filters in distinct aggregate.
       val (distinctAggFilters, distinctAggFilterAttrs, maxConds) = distinctAggs.collect {
@@ -270,8 +267,8 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
       }.unzip3
 
       // Setup expand & aggregate operators for distinct aggregate expressions.
-      val distinctAggChildAttrLookup = distinctAggChildAttrMap.toMap
-      val distinctAggFilterAttrLookup = distinctAggFilters.zip(maxConds.map(_.toAttribute)).toMap
+      val distinctAggChildAttrLookup = distinctAggChildAttrMap.filter(!_._1.foldable).toMap
+      val distinctAggFilterAttrLookup = Utils.toMap(distinctAggFilters, maxConds.map(_.toAttribute))
       val distinctAggOperatorMap = distinctAggGroups.toSeq.zipWithIndex.map {
         case ((group, expressions), i) =>
           val id = Literal(i + 1)
@@ -292,19 +289,21 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
           // Final aggregate
           val operators = expressions.map { e =>
             val af = e.aggregateFunction
-            val condition = e.filter.map(distinctAggFilterAttrLookup.get(_)).flatten
+            val condition = e.filter.flatMap(distinctAggFilterAttrLookup.get)
             val naf = if (af.children.forall(_.foldable)) {
-              // If aggregateFunction's children are all foldable, we only put the first child in
-              // distinctAggGroups. So here we only need to rewrite the first child to
-              // `if (gid = ...) ...` or `if (gid = ... and condition) ...`.
-              val firstChild = evalWithinGroup(id, af.children.head, condition)
-              af.withNewChildren(firstChild +: af.children.drop(1)).asInstanceOf[AggregateFunction]
+              af
             } else {
               patchAggregateFunctionChildren(af) { x =>
-                distinctAggChildAttrLookup.get(x).map(evalWithinGroup(id, _, condition))
+                distinctAggChildAttrLookup.get(x.canonicalized)
               }
             }
-            (e, e.copy(aggregateFunction = naf, isDistinct = false, filter = None))
+            val newCondition = if (condition.isDefined) {
+              And(EqualTo(gid, id), condition.get)
+            } else {
+              EqualTo(gid, id)
+            }
+
+            (e, e.copy(aggregateFunction = naf, isDistinct = false, filter = Some(newCondition)))
           }
 
           (projection ++ filterProjection, operators)
@@ -334,10 +333,8 @@ object RewriteDistinctAggregates extends Rule[LogicalPlan] {
         val operator = Alias(e.copy(aggregateFunction = af, filter = filterOpt), e.sql)()
 
         // Select the result of the first aggregate in the last aggregate.
-        val result = AggregateExpression(
-          aggregate.First(evalWithinGroup(regularGroupId, operator.toAttribute, None), true),
-          mode = Complete,
-          isDistinct = false)
+        val result = aggregate.First(operator.toAttribute, ignoreNulls = true)
+          .toAggregateExpression(isDistinct = false, filter = Some(EqualTo(gid, regularGroupId)))
 
         // Some aggregate functions (COUNT) have the special property that they can return a
         // non-null result without any input. We need to make sure we return a result in this case.

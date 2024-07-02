@@ -17,6 +17,8 @@
 
 package org.apache.spark.scheduler
 
+import java.io.NotSerializableException
+import java.nio.ByteBuffer
 import java.util.{Properties, Random}
 
 import scala.collection.mutable
@@ -32,16 +34,19 @@ import org.scalatest.PrivateMethodTester
 import org.scalatest.concurrent.Eventually
 
 import org.apache.spark.{FakeSchedulerBackend => _, _}
+import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
-import org.apache.spark.internal.config.Tests.SKIP_VALIDATE_CORES_TESTING
-import org.apache.spark.resource.{ResourceInformation, ResourceProfile}
+import org.apache.spark.internal.config.Tests.{SKIP_VALIDATE_CORES_TESTING, TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED}
+import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
+import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.serializer.SerializerInstance
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.{AccumulatorV2, Clock, ManualClock, SystemClock}
+import org.apache.spark.util.ArrayImplicits._
 
 class FakeDAGScheduler(sc: SparkContext, taskScheduler: FakeTaskScheduler)
   extends DAGScheduler(sc) {
@@ -57,6 +62,12 @@ class FakeDAGScheduler(sc: SparkContext, taskScheduler: FakeTaskScheduler)
       accumUpdates: Seq[AccumulatorV2[_, _]],
       metricPeaks: Array[Long],
       taskInfo: TaskInfo): Unit = {
+    // Set task accumulables emulating DAGScheduler behavior to enable tests related to
+    // `TaskInfo.accumulables`.
+    accumUpdates.foreach(acc =>
+      taskInfo.setAccumulables(
+        acc.toInfo(Some(acc.value), Some(acc.value)) +: taskInfo.accumulables)
+    )
     taskScheduler.endedTasks(taskInfo.index) = reason
   }
 
@@ -71,7 +82,7 @@ class FakeDAGScheduler(sc: SparkContext, taskScheduler: FakeTaskScheduler)
     taskScheduler.taskSetsFailed += taskSet.id
   }
 
-  override def speculativeTaskSubmitted(task: Task[_]): Unit = {
+  override def speculativeTaskSubmitted(task: Task[_], taskIndex: Int): Unit = {
     taskScheduler.speculativeTasks += task.partitionId
   }
 }
@@ -181,7 +192,8 @@ class FakeTaskScheduler(
 /**
  * A Task implementation that results in a large serialized task.
  */
-class LargeTask(stageId: Int) extends Task[Array[Byte]](stageId, 0, 0) {
+class LargeTask(stageId: Int) extends Task[Array[Byte]](
+    stageId, 0, 0, 1, JobArtifactSet.emptyJobArtifactSet) {
 
   val randomBuffer = new Array[Byte](TaskSetManager.TASK_SIZE_TO_WARN_KIB * 1024)
   val random = new Random(0)
@@ -203,6 +215,9 @@ class TaskSetManagerSuite
 
   val LOCALITY_WAIT_MS = conf.get(config.LOCALITY_WAIT)
   val MAX_TASK_FAILURES = 4
+  val SUBMISSION_TIME = 0L
+  val RUNTIME = 20 * 1000
+  val RECORDS_NUM = 10000L
 
   var sched: FakeTaskScheduler = null
 
@@ -219,6 +234,51 @@ class TaskSetManagerSuite
       sched = null
     }
     super.afterEach()
+  }
+
+  test("SPARK-46383: TaskInfo accumulables are cleared upon task completion") {
+    val conf = new SparkConf().
+      set(config.DROP_TASK_INFO_ACCUMULABLES_ON_TASK_COMPLETION, true)
+    sc = new SparkContext("local", "test", conf)
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+    val taskSet = FakeTask.createTaskSet(2)
+    val clock = new ManualClock
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+    val accumUpdates = taskSet.tasks.head.metrics.internalAccums
+
+    // Offer a host. This will launch the first task.
+    val taskOption = manager.resourceOffer("exec1", "host1", NO_PREF)._1
+    assert(taskOption.isDefined)
+
+    clock.advance(1)
+    // Tell it the first task has finished successfully
+    manager.handleSuccessfulTask(0, createTaskResult(0, accumUpdates))
+    assert(sched.endedTasks(0) === Success)
+
+    // Only one task was launched and it completed successfully, thus the TaskInfo accumulables
+    // should be empty.
+    assert(!manager.taskInfos.exists(t => !t._2.accumulables.isEmpty))
+    assert(manager.taskAttempts.flatMap(t => t.filter(!_.accumulables.isEmpty)).isEmpty)
+
+    // Fail the second task (MAX_TASK_FAILURES - 1) times.
+    (1 to manager.maxTaskFailures - 1).foreach { index =>
+      val offerResult = manager.resourceOffer("exec1", "host1", ANY)._1
+      assert(offerResult.isDefined,
+        "Expect resource offer on iteration %s to return a task".format(index))
+      assert(offerResult.get.index === 1)
+      manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, TaskResultLost)
+    }
+
+    clock.advance(1)
+    // Successfully finish the second task.
+    val taskOption1 = manager.resourceOffer("exec1", "host1", ANY)._1
+    manager.handleSuccessfulTask(taskOption1.get.taskId, createTaskResult(1, accumUpdates))
+    assert(sched.endedTasks(1) === Success)
+    // The TaskInfo accumulables should be empty as the second task has now completed successfully.
+    assert(!manager.taskInfos.exists(t => !t._2.accumulables.isEmpty))
+    assert(manager.taskAttempts.flatMap(t => t.filter(!_.accumulables.isEmpty)).isEmpty)
+
+    assert(sched.finishedManagers.contains(manager))
   }
 
   test("TaskSet with no preferences") {
@@ -377,25 +437,25 @@ class TaskSetManagerSuite
 
     // offers not accepted due to task set zombies are not delay schedule rejects
     manager.isZombie = true
-    val (taskDesciption, delayReject) = manager.resourceOffer("exec2", "host2", ANY)
-    assert(taskDesciption.isEmpty)
+    val (taskDescription, delayReject, _) = manager.resourceOffer("exec2", "host2", ANY)
+    assert(taskDescription.isEmpty)
     assert(delayReject === false)
     manager.isZombie = false
 
-    // offers not accepted due to blacklisting are not delay schedule rejects
-    val tsmSpy = spy(manager)
-    val blacklist = mock(classOf[TaskSetBlacklist])
-    when(tsmSpy.taskSetBlacklistHelperOpt).thenReturn(Some(blacklist))
-    when(blacklist.isNodeBlacklistedForTaskSet(any())).thenReturn(true)
-    val (blacklistTask, blackListReject) = tsmSpy.resourceOffer("exec2", "host2", ANY)
-    assert(blacklistTask.isEmpty)
-    assert(blackListReject === false)
+    // offers not accepted due to excludelist are not delay schedule rejects
+    val tsmSpy = spy[TaskSetManager](manager)
+    val excludelist = mock(classOf[TaskSetExcludelist])
+    when(tsmSpy.taskSetExcludelistHelperOpt).thenReturn(Some(excludelist))
+    when(excludelist.isNodeExcludedForTaskSet(any())).thenReturn(true)
+    val (task, taskReject, _) = tsmSpy.resourceOffer("exec2", "host2", ANY)
+    assert(task.isEmpty)
+    assert(taskReject === false)
 
     // After another delay, we can go ahead and launch that task non-locally
     assert(manager.resourceOffer("exec2", "host2", ANY)._1.get.index === 3)
 
     // offers not accepted due to no pending tasks are not delay schedule rejects
-    val (noPendingTask, noPendingReject) = manager.resourceOffer("exec2", "host2", ANY)
+    val (noPendingTask, noPendingReject, _) = manager.resourceOffer("exec2", "host2", ANY)
     assert(noPendingTask.isEmpty)
     assert(noPendingReject === false)
   }
@@ -479,11 +539,11 @@ class TaskSetManagerSuite
     }
   }
 
-  test("executors should be blacklisted after task failure, in spite of locality preferences") {
+  test("executors should be excluded after task failure, in spite of locality preferences") {
     val rescheduleDelay = 300L
     val conf = new SparkConf().
-      set(config.BLACKLIST_ENABLED, true).
-      set(config.BLACKLIST_TIMEOUT_CONF, rescheduleDelay).
+      set(config.EXCLUDE_ON_FAILURE_ENABLED, true).
+      set(config.EXCLUDE_ON_FAILURE_TIMEOUT_CONF, rescheduleDelay).
       // don't wait to jump locality levels in this test
       set(config.LOCALITY_WAIT.key, "0")
 
@@ -495,11 +555,11 @@ class TaskSetManagerSuite
     val taskSet = FakeTask.createTaskSet(1, Seq(TaskLocation("host1", "exec1")))
     val clock = new ManualClock
     clock.advance(1)
-    // We don't directly use the application blacklist, but its presence triggers blacklisting
+    // We don't directly use the application excludelist, but its presence triggers exclusion
     // within the taskset.
     val mockListenerBus = mock(classOf[LiveListenerBus])
-    val blacklistTrackerOpt = Some(new BlacklistTracker(mockListenerBus, conf, None, clock))
-    val manager = new TaskSetManager(sched, taskSet, 4, blacklistTrackerOpt, clock)
+    val healthTrackerOpt = Some(new HealthTracker(mockListenerBus, conf, None, clock))
+    val manager = new TaskSetManager(sched, taskSet, 4, healthTrackerOpt, clock)
 
     {
       val offerResult = manager.resourceOffer("exec1", "host1", PROCESS_LOCAL)._1
@@ -512,7 +572,7 @@ class TaskSetManagerSuite
       manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, TaskResultLost)
       assert(!sched.taskSetsFailed.contains(taskSet.id))
 
-      // Ensure scheduling on exec1 fails after failure 1 due to blacklist
+      // Ensure scheduling on exec1 fails after failure 1 due to executor being excluded
       assert(manager.resourceOffer("exec1", "host1", PROCESS_LOCAL)._1.isEmpty)
       assert(manager.resourceOffer("exec1", "host1", NODE_LOCAL)._1.isEmpty)
       assert(manager.resourceOffer("exec1", "host1", RACK_LOCAL)._1.isEmpty)
@@ -532,7 +592,7 @@ class TaskSetManagerSuite
       manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, TaskResultLost)
       assert(!sched.taskSetsFailed.contains(taskSet.id))
 
-      // Ensure scheduling on exec1.1 fails after failure 2 due to blacklist
+      // Ensure scheduling on exec1.1 fails after failure 2 due to executor being excluded
       assert(manager.resourceOffer("exec1.1", "host1", NODE_LOCAL)._1.isEmpty)
     }
 
@@ -548,12 +608,12 @@ class TaskSetManagerSuite
       manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, TaskResultLost)
       assert(!sched.taskSetsFailed.contains(taskSet.id))
 
-      // Ensure scheduling on exec2 fails after failure 3 due to blacklist
+      // Ensure scheduling on exec2 fails after failure 3 due to executor being excluded
       assert(manager.resourceOffer("exec2", "host2", ANY)._1.isEmpty)
     }
 
-    // Despite advancing beyond the time for expiring executors from within the blacklist,
-    // we *never* expire from *within* the stage blacklist
+    // Despite advancing beyond the time for expiring executors from within the excludelist,
+    // we *never* expire from *within* the stage excludelist
     clock.advance(rescheduleDelay)
 
     {
@@ -634,6 +694,11 @@ class TaskSetManagerSuite
       ExecutorExited(143, false, "Terminated for reason unrelated to running tasks"))
     assert(!sched.taskSetsFailed.contains(taskSet.id))
     assert(manager.resourceOffer("execC", "host2", ANY)._1.isDefined)
+
+    // Driver receives StatusUpdate(RUNNING) from Executors
+    for ((tid, info) <- manager.taskInfos if info.running) {
+      manager.taskInfos(tid).launchSucceeded()
+    }
     sched.removeExecutor("execC")
     manager.executorLost(
       "execC", "host2", ExecutorExited(1, true, "Terminated due to issue with running tasks"))
@@ -657,6 +722,42 @@ class TaskSetManagerSuite
     // And we'll shift to the new highest locality level, which is PROCESS_LOCAL in this case.
     assert(manager.resourceOffer("execC", "host3", ANY)._1.isEmpty)
     assert(manager.resourceOffer("execA", "host1", ANY)._1.isDefined)
+  }
+
+  test("SPARK-41469: task doesn't need to rerun on executor lost if shuffle data has migrated") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc)
+    val backend = mock(classOf[SchedulerBackend])
+    doNothing().when(backend).reviveOffers()
+    sched.initialize(backend)
+
+    sched.addExecutor("exec0", "host0")
+
+    val mapOutputTracker = sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+    mapOutputTracker.registerShuffle(0, 2, 0)
+
+    val taskSet = FakeTask.createShuffleMapTaskSet(2, 0, 0,
+      Seq(TaskLocation("host0", "exec0")), Seq(TaskLocation("host1", "exec1")))
+    sched.submitTasks(taskSet)
+    val manager = sched.taskSetManagerForAttempt(0, 0).get
+
+    // Schedule task 0 and mark it as completed with shuffle map output registered
+    val taskDesc = manager.resourceOffer("exec0", "host0", PROCESS_LOCAL)._1
+    assert(taskDesc.isDefined)
+    val taskIndex = taskDesc.get.index
+    val taskId = taskDesc.get.taskId
+    manager.handleSuccessfulTask(taskId, createTaskResult(taskId.toInt))
+    mapOutputTracker.registerMapOutput(0, taskIndex,
+      MapStatus(BlockManagerId("exec0", "host0", 8848), Array(1024), taskId))
+
+    // Mock executor "exec0" decommission and migrate shuffle map output of task 0
+    manager.executorDecommission("exec0")
+    mapOutputTracker.updateMapOutput(0, taskId, BlockManagerId("exec1", "host1", 8848))
+
+    // Trigger executor "exec0" lost. Since the map output of task 0 has been migrated, it doesn't
+    // need to rerun. So task 0 should still remain in the successful status.
+    manager.executorLost("exec0", "host0", ExecutorDecommission())
+    assert(manager.successful(taskIndex))
   }
 
   test("SPARK-32653: Decommissioned host should not be used to calculate locality levels") {
@@ -759,7 +860,7 @@ class TaskSetManagerSuite
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
 
     val taskSet = new TaskSet(Array(new LargeTask(0)), 0, 0, 0,
-      null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+      null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, None)
     val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
 
     assert(!manager.emittedTaskSizeWarning)
@@ -775,7 +876,7 @@ class TaskSetManagerSuite
 
     val taskSet = new TaskSet(
       Array(new NotSerializableFakeTask(1, 0), new NotSerializableFakeTask(0, 1)),
-      0, 0, 0, null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+      0, 0, 0, null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, None)
     val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
 
     intercept[TaskNotSerializableException] {
@@ -788,15 +889,15 @@ class TaskSetManagerSuite
     val conf = new SparkConf().set(config.MAX_RESULT_SIZE.key, "2m")
     sc = new SparkContext("local", "test", conf)
 
-    def genBytes(size: Int): (Int) => Array[Byte] = { (x: Int) =>
+    def genBytes(size: Int): (Int) => Seq[Byte] = { (x: Int) =>
       val bytes = Array.ofDim[Byte](size)
       scala.util.Random.nextBytes(bytes)
-      bytes
+      bytes.toImmutableArraySeq
     }
 
     // multiple 1k result
     val r = sc.makeRDD(0 until 10, 10).map(genBytes(1024)).collect()
-    assert(10 === r.size)
+    assert(10 === r.length)
 
     // single 10M result
     val thrown = intercept[SparkException] {sc.makeRDD(genBytes(10 << 20)(0), 1).collect()}
@@ -814,7 +915,7 @@ class TaskSetManagerSuite
     sc = new SparkContext("local", "test", conf)
     // final result is below limit.
     val r = sc.makeRDD(0 until 2000, 2000).distinct(10).filter(_ == 0).collect()
-    assert(1 === r.size)
+    assert(1 === r.length)
   }
 
   test("[SPARK-13931] taskSetManager should not send Resubmitted tasks after being a zombie") {
@@ -853,9 +954,10 @@ class TaskSetManagerSuite
 
     val singleTask = new ShuffleMapTask(0, 0, null, new Partition {
         override def index: Int = 0
-      }, Seq(TaskLocation("host1", "execA")), new Properties, null)
+      }, 1, Seq(TaskLocation("host1", "execA")),
+      JobArtifactSet.getActiveOrDefault(sc), new Properties, null)
     val taskSet = new TaskSet(Array(singleTask), 0, 0, 0,
-      null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+      null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, Some(0))
     val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
 
     // Offer host1, which should be accepted as a PROCESS_LOCAL location
@@ -871,7 +973,7 @@ class TaskSetManagerSuite
     assert(manager.runningTasks === 2)
     assert(manager.isZombie === false)
 
-    val directTaskResult = new DirectTaskResult[String](null, Seq(), Array()) {
+    val directTaskResult = new DirectTaskResult[String]() {
       override def value(resultSer: SerializerInstance): String = ""
     }
     // Complete one copy of the task, which should result in the task set manager
@@ -1322,7 +1424,7 @@ class TaskSetManagerSuite
 
   test("SPARK-19868: DagScheduler only notified of taskEnd when state is ready") {
     // dagScheduler.taskEnded() is async, so it may *seem* ok to call it before we've set all
-    // appropriate state, eg. isZombie.   However, this sets up a race that could go the wrong way.
+    // appropriate state, e.g. isZombie.   However, this sets up a race that could go the wrong way.
     // This is a super-focused regression test which checks the zombie state as soon as
     // dagScheduler.taskEnded() is called, to ensure we haven't introduced a race.
     sc = new SparkContext("local", "test")
@@ -1358,20 +1460,20 @@ class TaskSetManagerSuite
     assert(manager3.name === "TaskSet_1.1")
   }
 
-  test("don't update blacklist for shuffle-fetch failures, preemption, denied commits, " +
+  test("don't update excludelist for shuffle-fetch failures, preemption, denied commits, " +
       "or killed tasks") {
     // Setup a taskset, and fail some tasks for a fetch failure, preemption, denied commit,
     // and killed task.
     val conf = new SparkConf().
-      set(config.BLACKLIST_ENABLED, true)
+      set(config.EXCLUDE_ON_FAILURE_ENABLED, true)
     sc = new SparkContext("local", "test", conf)
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
     val taskSet = FakeTask.createTaskSet(4)
     val tsm = new TaskSetManager(sched, taskSet, 4)
-    // we need a spy so we can attach our mock blacklist
-    val tsmSpy = spy(tsm)
-    val blacklist = mock(classOf[TaskSetBlacklist])
-    when(tsmSpy.taskSetBlacklistHelperOpt).thenReturn(Some(blacklist))
+    // we need a spy so we can attach our mock excludelist
+    val tsmSpy = spy[TaskSetManager](tsm)
+    val excludelist = mock(classOf[TaskSetExcludelist])
+    when(tsmSpy.taskSetExcludelistHelperOpt).thenReturn(Some(excludelist))
 
     // make some offers to our taskset, to get tasks we will fail
     val taskDescs = Seq(
@@ -1392,23 +1494,23 @@ class TaskSetManagerSuite
       TaskCommitDenied(0, 2, 0))
     tsmSpy.handleFailedTask(taskDescs(3).taskId, TaskState.KILLED, TaskKilled("test"))
 
-    // Make sure that the blacklist ignored all of the task failures above, since they aren't
+    // Make sure that the excludelist ignored all of the task failures above, since they aren't
     // the fault of the executor where the task was running.
-    verify(blacklist, never())
-      .updateBlacklistForFailedTask(anyString(), anyString(), anyInt(), anyString())
+    verify(excludelist, never())
+      .updateExcludedForFailedTask(anyString(), anyString(), anyInt(), anyString())
   }
 
-  test("update application blacklist for shuffle-fetch") {
+  test("update application healthTracker for shuffle-fetch") {
     // Setup a taskset, and fail some one task for fetch failure.
     val conf = new SparkConf()
-      .set(config.BLACKLIST_ENABLED, true)
+      .set(config.EXCLUDE_ON_FAILURE_ENABLED, true)
       .set(config.SHUFFLE_SERVICE_ENABLED, true)
-      .set(config.BLACKLIST_FETCH_FAILURE_ENABLED, true)
+      .set(config.EXCLUDE_ON_FAILURE_FETCH_FAILURE_ENABLED, true)
     sc = new SparkContext("local", "test", conf)
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
     val taskSet = FakeTask.createTaskSet(4)
-    val blacklistTracker = new BlacklistTracker(sc, None)
-    val tsm = new TaskSetManager(sched, taskSet, 4, Some(blacklistTracker))
+    val healthTracker = new HealthTracker(sc, None)
+    val tsm = new TaskSetManager(sched, taskSet, 4, Some(healthTracker))
 
     // make some offers to our taskset, to get tasks we will fail
     val taskDescs = Seq(
@@ -1420,22 +1522,22 @@ class TaskSetManagerSuite
     }
     assert(taskDescs.size === 4)
 
-    assert(!blacklistTracker.isExecutorBlacklisted(taskDescs(0).executorId))
-    assert(!blacklistTracker.isNodeBlacklisted("host1"))
+    assert(!healthTracker.isExecutorExcluded(taskDescs(0).executorId))
+    assert(!healthTracker.isNodeExcluded("host1"))
 
     // Fail the task with fetch failure
     tsm.handleFailedTask(taskDescs(0).taskId, TaskState.FAILED,
       FetchFailed(BlockManagerId(taskDescs(0).executorId, "host1", 12345), 0, 0L, 0, 0, "ignored"))
 
-    assert(blacklistTracker.isNodeBlacklisted("host1"))
+    assert(healthTracker.isNodeExcluded("host1"))
   }
 
-  test("update blacklist before adding pending task to avoid race condition") {
-    // When a task fails, it should apply the blacklist policy prior to
+  test("update healthTracker before adding pending task to avoid race condition") {
+    // When a task fails, it should apply the excludeOnFailure policy prior to
     // retrying the task otherwise there's a race condition where run on
     // the same executor that it was intended to be black listed from.
     val conf = new SparkConf().
-      set(config.BLACKLIST_ENABLED, true)
+      set(config.EXCLUDE_ON_FAILURE_ENABLED, true)
 
     // Create a task with two executors.
     sc = new SparkContext("local", "test", conf)
@@ -1448,9 +1550,9 @@ class TaskSetManagerSuite
 
     val clock = new ManualClock
     val mockListenerBus = mock(classOf[LiveListenerBus])
-    val blacklistTracker = new BlacklistTracker(mockListenerBus, conf, None, clock)
-    val taskSetManager = new TaskSetManager(sched, taskSet, 1, Some(blacklistTracker))
-    val taskSetManagerSpy = spy(taskSetManager)
+    val healthTracker = new HealthTracker(mockListenerBus, conf, None, clock)
+    val taskSetManager = new TaskSetManager(sched, taskSet, 1, Some(healthTracker))
+    val taskSetManagerSpy = spy[TaskSetManager](taskSetManager)
 
     val taskDesc = taskSetManagerSpy.resourceOffer(exec, host, TaskLocality.ANY)._1
 
@@ -1458,8 +1560,8 @@ class TaskSetManagerSuite
     when(taskSetManagerSpy.addPendingTask(anyInt(), anyBoolean(), anyBoolean())).thenAnswer(
       (invocationOnMock: InvocationOnMock) => {
         val task: Int = invocationOnMock.getArgument(0)
-        assert(taskSetManager.taskSetBlacklistHelperOpt.get.
-          isExecutorBlacklistedForTask(exec, task))
+        assert(taskSetManager.taskSetExcludelistHelperOpt.get.
+          isExecutorExcludedForTask(exec, task))
       }
     )
 
@@ -1472,7 +1574,7 @@ class TaskSetManagerSuite
 
   test("SPARK-21563 context's added jars shouldn't change mid-TaskSet") {
     sc = new SparkContext("local", "test")
-    val addedJarsPreTaskSet = Map[String, Long](sc.addedJars.toSeq: _*)
+    val addedJarsPreTaskSet = Map[String, Long](sc.allAddedJars.toSeq: _*)
     assert(addedJarsPreTaskSet.size === 0)
 
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
@@ -1481,25 +1583,25 @@ class TaskSetManagerSuite
 
     // all tasks from the first taskset have the same jars
     val taskOption1 = manager1.resourceOffer("exec1", "host1", NO_PREF)._1
-    assert(taskOption1.get.addedJars === addedJarsPreTaskSet)
+    assert(taskOption1.get.artifacts.jars === addedJarsPreTaskSet)
     val taskOption2 = manager1.resourceOffer("exec1", "host1", NO_PREF)._1
-    assert(taskOption2.get.addedJars === addedJarsPreTaskSet)
+    assert(taskOption2.get.artifacts.jars === addedJarsPreTaskSet)
 
     // even with a jar added mid-TaskSet
     val jarPath = Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar")
     sc.addJar(jarPath.toString)
-    val addedJarsMidTaskSet = Map[String, Long](sc.addedJars.toSeq: _*)
+    val addedJarsMidTaskSet = Map[String, Long](sc.allAddedJars.toSeq: _*)
     assert(addedJarsPreTaskSet !== addedJarsMidTaskSet)
     val taskOption3 = manager1.resourceOffer("exec1", "host1", NO_PREF)._1
     // which should have the old version of the jars list
-    assert(taskOption3.get.addedJars === addedJarsPreTaskSet)
+    assert(taskOption3.get.artifacts.jars === addedJarsPreTaskSet)
 
     // and then the jar does appear in the next TaskSet
     val taskSet2 = FakeTask.createTaskSet(1)
     val manager2 = new TaskSetManager(sched, taskSet2, MAX_TASK_FAILURES, clock = new ManualClock)
 
     val taskOption4 = manager2.resourceOffer("exec1", "host1", NO_PREF)._1
-    assert(taskOption4.get.addedJars === addedJarsMidTaskSet)
+    assert(taskOption4.get.artifacts.jars === addedJarsMidTaskSet)
   }
 
   test("SPARK-24677: Avoid NoSuchElementException from MedianHeap") {
@@ -1560,7 +1662,7 @@ class TaskSetManagerSuite
 
     // Keep track of the index of tasks that are resubmitted,
     // so that the test can check that task is resubmitted correctly
-    var resubmittedTasks = new mutable.HashSet[Int]
+    val resubmittedTasks = new mutable.HashSet[Int]
     val dagScheduler = new FakeDAGScheduler(sc, sched) {
       override def taskEnded(
           task: Task[_],
@@ -1768,7 +1870,6 @@ class TaskSetManagerSuite
   }
 
   test("TaskSetManager passes task resource along") {
-    import TestUtils._
 
     sc = new SparkContext("local", "test")
     sc.conf.set(TASK_GPU_ID.amountConf, "2")
@@ -1776,13 +1877,18 @@ class TaskSetManagerSuite
     val taskSet = FakeTask.createTaskSet(1)
     val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
 
-    val taskResourceAssignments = Map(GPU -> new ResourceInformation(GPU, Array("0", "1")))
+    val taskResourceAssignments = Map(
+      GPU -> Map("0" -> ONE_ENTIRE_RESOURCE, "1" -> ONE_ENTIRE_RESOURCE))
     val taskOption =
-      manager.resourceOffer("exec1", "host1", NO_PREF, taskResourceAssignments)._1
+      manager.resourceOffer("exec1", "host1", NO_PREF, 2, taskResourceAssignments)._1
     assert(taskOption.isDefined)
+    val allocatedCpus = taskOption.get.cpus
     val allocatedResources = taskOption.get.resources
+    assert(allocatedCpus == 2)
     assert(allocatedResources.size == 1)
-    assert(allocatedResources(GPU).addresses sameElements Array("0", "1"))
+    assert(allocatedResources(GPU).keys.toArray.sorted sameElements Array("0", "1"))
+    assert(allocatedResources === taskResourceAssignments)
+
   }
 
   test("SPARK-26755 Ensure that a speculative task is submitted only once for execution") {
@@ -1902,15 +2008,20 @@ class TaskSetManagerSuite
       speculationQuantile: Double,
       numTasks: Int,
       numExecutorCores: Int,
-      numCoresPerTask: Int): (TaskSetManager, ManualClock) = {
+      numCoresPerTask: Int,
+      speculationMinimumThreshold: Option[String]): (TaskSetManager, ManualClock) = {
     val conf = new SparkConf()
     conf.set(config.SPECULATION_ENABLED, true)
     conf.set(config.SPECULATION_QUANTILE.key, speculationQuantile.toString)
+    conf.set(config.SPECULATION_MULTIPLIER.key, "1.5")
     // Set the number of slots per executor
     conf.set(config.EXECUTOR_CORES.key, numExecutorCores.toString)
     conf.set(config.CPUS_PER_TASK.key, numCoresPerTask.toString)
     if (speculationThresholdOpt.isDefined) {
       conf.set(config.SPECULATION_TASK_DURATION_THRESHOLD.key, speculationThresholdOpt.get)
+    }
+    if (speculationMinimumThreshold.isDefined) {
+      conf.set(config.SPECULATION_MIN_THRESHOLD.key, speculationMinimumThreshold.get)
     }
     sc = new SparkContext("local", "test", conf)
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
@@ -1938,7 +2049,8 @@ class TaskSetManagerSuite
       speculationQuantile = 1.0,
       numTasks,
       numSlots,
-      numCoresPerTask = 1
+      numCoresPerTask = 1,
+      None
     )
 
     // if the time threshold has not been exceeded, no speculative run should be triggered
@@ -2092,7 +2204,8 @@ class TaskSetManagerSuite
       speculationQuantile = 0.5,
       numTasks = 2,
       numExecutorCores = 2,
-      numCoresPerTask = 1
+      numCoresPerTask = 1,
+      None
     )
 
     // Task duration can't be 0, advance 1 sec
@@ -2174,7 +2287,7 @@ class TaskSetManagerSuite
 
     val tasks = Array.tabulate[Task[_]](2)(partition => new FakeLongTasks(stageId = 0, partition))
     val taskSet: TaskSet = new TaskSet(tasks, stageId = 0, stageAttemptId = 0, priority = 0, null,
-      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, None)
     val stageId = taskSet.stageId
     val stageAttemptId = taskSet.stageAttemptId
     sched.submitTasks(taskSet)
@@ -2190,6 +2303,7 @@ class TaskSetManagerSuite
 
     val (taskId0, index0, exec0) = (task0.taskId, task0.index, task0.executorId)
     val (taskId1, index1, exec1) = (task1.taskId, task1.index, task1.executorId)
+
     // set up two running tasks
     assert(manager.taskInfos(taskId0).running)
     assert(manager.taskInfos(taskId1).running)
@@ -2199,6 +2313,12 @@ class TaskSetManagerSuite
     assert(manager.invokePrivate(numFailures())(index0) === 0)
     assert(manager.invokePrivate(numFailures())(index1) === 0)
 
+    sched.asInstanceOf[TaskSchedulerImpl]
+      .statusUpdate(taskId1, TaskState.RUNNING, ByteBuffer.allocate(0))
+    eventually(timeout(10.seconds), interval(100.milliseconds)) {
+      assert(manager.taskInfos(taskId0).running)
+      assert(manager.taskInfos(taskId1).running && !manager.taskInfos(taskId1).launching)
+    }
     // let exec1 count task failures but exec0 doesn't
     backend.executorsPendingToRemove(exec0) = true
     backend.executorsPendingToRemove(exec1) = false
@@ -2212,6 +2332,399 @@ class TaskSetManagerSuite
       assert(manager.invokePrivate(numFailures())(index1) === 1)
     }
   }
+
+  test("SPARK-33741 Test minimum amount of time a task runs " +
+    "before being considered for speculation") {
+    val (manager, clock) = testSpeculationDurationSetup(
+      None,
+      speculationQuantile = 0.5,
+      numTasks = 2,
+      numExecutorCores = 2,
+      numCoresPerTask = 1,
+      Some("3000") // spark.speculation.minTaskRuntime
+    )
+    // Task duration can't be 0, advance 1 sec
+    clock.advance(1000)
+    // Mark one of the task succeeded, which should satisfy the quantile
+    manager.handleSuccessfulTask(0, createTaskResult(0))
+    // Advance 1 more second so the remaining task takes longer
+    clock.advance(1000)
+    manager.checkSpeculatableTasks(sched.MIN_TIME_TO_SPECULATION)
+    // The task is not considered as speculative task due to minimum threshold interval of 3s
+    assert(sched.speculativeTasks.size == 0)
+    clock.advance(2000)
+    manager.checkSpeculatableTasks(sched.MIN_TIME_TO_SPECULATION)
+    // After 3s have elapsed now the task is marked as speculative task
+    assert(sched.speculativeTasks.size == 1)
+  }
+
+  private def createTaskMetrics(
+       taskSet: TaskSet,
+       inefficientTaskIds: Set[Int],
+       efficientMultiplier: Double = 0.6): Array[TaskMetrics] = {
+    taskSet.tasks.zipWithIndex.map { case (task, index) =>
+      val metrics = task.metrics
+      if (inefficientTaskIds.contains(index)) {
+        updateAndGetTaskMetrics(metrics, efficientMultiplier)
+      } else {
+        updateAndGetTaskMetrics(metrics, 1)
+      }
+    }
+  }
+
+  private def updateAndGetTaskMetrics(
+      taskMetrics: TaskMetrics,
+      efficientMultiplier: Double): TaskMetrics = {
+    taskMetrics.inputMetrics.setRecordsRead((efficientMultiplier * RECORDS_NUM).toLong)
+    taskMetrics.shuffleReadMetrics.setRecordsRead((efficientMultiplier * RECORDS_NUM).toLong)
+    taskMetrics.setExecutorRunTime(RUNTIME)
+    taskMetrics
+  }
+
+  test("SPARK-32170: test speculation for TaskSet with single task") {
+    val conf = new SparkConf()
+      .set(config.SPECULATION_ENABLED, true)
+    sc = new SparkContext("local", "test", conf)
+    Seq(0, 15).foreach { duration =>
+      sc.conf.set(config.SPECULATION_TASK_DURATION_THRESHOLD.key, duration.toString)
+      sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+      val numTasks = 1
+      val taskSet = FakeTask.createTaskSet(numTasks)
+      val clock = new ManualClock()
+      val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+      for ((k, v) <- List("exec1" -> "host1")) {
+        val taskOption = manager.resourceOffer(k, v, NO_PREF)._1
+        assert(taskOption.isDefined)
+        val task = taskOption.get
+        sched.taskIdToTaskSetManager.put(task.taskId, manager)
+      }
+      clock.advance(RUNTIME)
+      // runtimeMs(20s) > 15s(1 * 15s)
+      if (duration <= 0) {
+        assert(!manager.checkSpeculatableTasks(0))
+        assert(sched.speculativeTasks.toSet === Set.empty)
+      } else {
+        assert(manager.checkSpeculatableTasks(0))
+        assert(sched.speculativeTasks.toSet === Set(0))
+      }
+    }
+  }
+
+  test("SPARK-32170: test SPECULATION_MIN_THRESHOLD for speculating inefficient tasks") {
+    // set the speculation multiplier to be 0, so speculative tasks are launched based on
+    // minTimeToSpeculation parameter to checkSpeculatableTasks
+    val conf = new SparkConf()
+      .set(config.SPECULATION_MULTIPLIER, 0.0)
+      .set(config.SPECULATION_QUANTILE, 0.75)
+      .set(config.SPECULATION_ENABLED, true)
+    sc = new SparkContext("local", "test", conf)
+    val ser = sc.env.closureSerializer.newInstance()
+    val speculativeAllDurations = Set(0)
+    val speculativeInefficientDurations = Set(10000)
+    val nonSpeculativeDurations = Set(50000)
+    (speculativeAllDurations ++ speculativeInefficientDurations
+      ++ nonSpeculativeDurations).foreach { minDuration =>
+      sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+      val taskSet = FakeTask.createTaskSet(5)
+      val clock = new ManualClock()
+      val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+      val taskMetricsByTask = createTaskMetrics(taskSet, Set(3), efficientMultiplier = 0.4)
+      val blockManagerId = BlockManagerId("exec1", "localhost", 12345)
+      // offer resources for 5 tasks to start
+      for ((k, v) <- List(
+        "exec1" -> "host1",
+        "exec1" -> "host1",
+        "exec1" -> "host1",
+        "exec2" -> "host2",
+        "exec2" -> "host2")) {
+        val taskOption = manager.resourceOffer(k, v, NO_PREF)._1
+        assert(taskOption.isDefined)
+        val task = taskOption.get
+        sched.taskIdToTaskSetManager.put(task.taskId, manager)
+      }
+      clock.advance(RUNTIME)
+      // complete the 3 tasks and leave 2 task in running
+      val task3Metrics: TaskMetrics =
+        ser.deserialize(ByteBuffer.wrap(ser.serialize(taskMetricsByTask(3)).array()))
+      sched.executorHeartbeatReceived("exec1", Array((3, task3Metrics.internalAccums)),
+        blockManagerId, mutable.Map.empty[(Int, Int), ExecutorMetrics])
+
+      updateAndGetTaskMetrics(taskMetricsByTask(4), efficientMultiplier = 5)
+      val task4Metrics: TaskMetrics =
+        ser.deserialize(ByteBuffer.wrap(ser.serialize(taskMetricsByTask(4)).array()))
+      sched.executorHeartbeatReceived("exec1", Array((4, task4Metrics.internalAccums)),
+        blockManagerId, mutable.Map.empty[(Int, Int), ExecutorMetrics])
+      for (id <- Set(0, 1, 2)) {
+        val resultBytes = ser.serialize(createTaskResult(id, taskMetricsByTask(id).internalAccums))
+        sched.statusUpdate(tid = id, state = TaskState.FINISHED, serializedData = resultBytes)
+        eventually(timeout(1.second), interval(10.milliseconds)) {
+          assert(sched.endedTasks(id) === Success)
+        }
+      }
+      // 1) when SPECULATION_MIN_THRESHOLD is equal 0s, both the task 3 and the task 4 will be
+      // speculated by previous strategy.
+      // 2) when SPECULATION_MIN_THRESHOLD is equal 10s and runtime(20s) is above 10s, the task 3
+      //  will be evaluated an inefficient task to speculate, but the task 4 will not.
+      // 3) when SPECULATION_MIN_THRESHOLD is equal 50s, the task 3 and the task 4 runtime(20s) is
+      // less than (50s) and no needs to speculate at all.
+      if (speculativeAllDurations.contains(minDuration)) {
+        assert(manager.checkSpeculatableTasks(minDuration))
+        assert(sched.speculativeTasks.toSet === Set(3, 4))
+      } else if (speculativeInefficientDurations.contains(minDuration)) {
+        assert(manager.checkSpeculatableTasks(minDuration))
+        assert(sched.speculativeTasks.toSet === Set(3))
+      } else {
+        assert(!manager.checkSpeculatableTasks(minDuration))
+        assert(sched.speculativeTasks.toSet === Set.empty)
+      }
+    }
+  }
+
+  test("SPARK-32170: test SPECULATION_EFFICIENCY_TASK_PROCESS_RATE_MULTIPLIER for " +
+    "speculating inefficient tasks") {
+    // set the speculation multiplier to be 0, so speculative tasks are launched based on
+    // minTimeToSpeculation parameter to checkSpeculatableTasks
+    val conf = new SparkConf()
+      .set(config.SPECULATION_MULTIPLIER, 0.0)
+      .set(config.SPECULATION_ENABLED, true)
+    sc = new SparkContext("local", "test", conf)
+    val ser = sc.env.closureSerializer.newInstance()
+    Seq(0.5, 0.8).foreach(processMultiplier => {
+      sc.conf.set(config.SPECULATION_EFFICIENCY_TASK_PROCESS_RATE_MULTIPLIER, processMultiplier)
+      sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+      val taskSet = FakeTask.createTaskSet(4)
+      val clock = new ManualClock()
+      val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+      val taskMetricsByTask = createTaskMetrics(taskSet, Set(3), efficientMultiplier = 0.6)
+      val blockManagerId = BlockManagerId("exec1", "localhost", 12345)
+      // offer resources for 4 tasks to start
+      for ((k, v) <- List(
+        "exec1" -> "host1",
+        "exec1" -> "host1",
+        "exec2" -> "host2",
+        "exec2" -> "host2")) {
+        val taskOption = manager.resourceOffer(k, v, NO_PREF)._1
+        assert(taskOption.isDefined)
+        val task = taskOption.get
+        sched.taskIdToTaskSetManager.put(task.taskId, manager)
+      }
+      clock.advance(RUNTIME)
+      // complete the 3 tasks and leave 1 task in running
+      val taskMetrics: TaskMetrics =
+        ser.deserialize(ByteBuffer.wrap(ser.serialize(taskMetricsByTask(3)).array()))
+      sched.executorHeartbeatReceived("exec1", Array((3, taskMetrics.internalAccums)),
+        blockManagerId, mutable.Map.empty[(Int, Int), ExecutorMetrics])
+      for (id <- Set(0, 1, 2)) {
+        val resultBytes = ser.serialize(createTaskResult(id, taskMetricsByTask(id).internalAccums))
+        sched.statusUpdate(tid = id, state = TaskState.FINISHED, serializedData = resultBytes)
+        eventually(timeout(1.second), interval(10.milliseconds)) {
+          assert(sched.endedTasks(id) === Success)
+        }
+      }
+      // 0.5 < 0.6 < 0.8
+      if (processMultiplier == 0.8) {
+        assert(manager.checkSpeculatableTasks(15000))
+        assert(sched.speculativeTasks.toSet === Set(3))
+      } else {
+        assert(!manager.checkSpeculatableTasks(15000))
+        assert(sched.speculativeTasks.toSet === Set.empty)
+      }
+    })
+  }
+
+  test("SPARK-32170: test SPECULATION_EFFICIENCY_TASK_DURATION_FACTOR for " +
+    "speculating tasks") {
+    // set the speculation multiplier to be 0, so speculative tasks are launched based on
+    // minTimeToSpeculation parameter to checkSpeculatableTasks
+    val conf = new SparkConf()
+      .set(config.SPECULATION_MULTIPLIER, 0.0)
+      .set(config.SPECULATION_ENABLED, true)
+      .set(config.SPECULATION_EFFICIENCY_TASK_PROCESS_RATE_MULTIPLIER, 0.5)
+    sc = new SparkContext("local", "test", conf)
+    val ser = sc.env.closureSerializer.newInstance()
+    Seq(1.0, 2.0).foreach(factor => {
+      sc.conf.set(config.SPECULATION_EFFICIENCY_TASK_DURATION_FACTOR, factor)
+      sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+      val taskSet = FakeTask.createTaskSet(4)
+      val clock = new ManualClock()
+      val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+      val taskMetricsByTask = createTaskMetrics(taskSet, Set(3), efficientMultiplier = 0.6)
+      val blockManagerId = BlockManagerId("exec1", "localhost", 12345)
+      // offer resources for 4 tasks to start
+      for ((k, v) <- List(
+        "exec1" -> "host1",
+        "exec1" -> "host1",
+        "exec2" -> "host2",
+        "exec2" -> "host2")) {
+        val taskOption = manager.resourceOffer(k, v, NO_PREF)._1
+        assert(taskOption.isDefined)
+        val task = taskOption.get
+        sched.taskIdToTaskSetManager.put(task.taskId, manager)
+      }
+      clock.advance(RUNTIME)
+      // complete the 3 tasks and leave 1 task in running
+      val taskMetrics: TaskMetrics =
+        ser.deserialize(ByteBuffer.wrap(ser.serialize(taskMetricsByTask(3)).array()))
+      sched.executorHeartbeatReceived("exec1", Array((3, taskMetrics.internalAccums)),
+        blockManagerId, mutable.Map.empty[(Int, Int), ExecutorMetrics])
+      for (id <- Set(0, 1, 2)) {
+        val resultBytes = ser.serialize(createTaskResult(id, taskMetricsByTask(id).internalAccums))
+        sched.statusUpdate(tid = id, state = TaskState.FINISHED, serializedData = resultBytes)
+        eventually(timeout(1.second), interval(10.milliseconds)) {
+          assert(sched.endedTasks(id) === Success)
+        }
+      }
+      // runtimeMs(20s) > 15s(1 * 15s)
+      if (factor == 1.0) {
+        assert(manager.checkSpeculatableTasks(15000))
+        assert(sched.speculativeTasks.toSet === Set(3))
+      } else {
+        // runtimeMs(20s) < 30s(2 * 15s)
+        assert(!manager.checkSpeculatableTasks(15000))
+        assert(sched.speculativeTasks.toSet === Set.empty)
+      }
+    })
+  }
+
+  test("SPARK-37580: Reset numFailures when one of task attempts succeeds") {
+    sc = new SparkContext("local", "test")
+    // Set the speculation multiplier to be 0 so speculative tasks are launched immediately
+    sc.conf.set(config.SPECULATION_MULTIPLIER, 0.0)
+    sc.conf.set(config.SPECULATION_QUANTILE, 0.6)
+    sc.conf.set(config.SPECULATION_ENABLED, true)
+
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"), ("exec3", "host3"))
+    sched.backend = mock(classOf[SchedulerBackend])
+    val taskSet = FakeTask.createTaskSet(3)
+    val clock = new ManualClock()
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+
+    // Offer resources for 3 task to start
+    val tasks = new ArrayBuffer[TaskDescription]()
+    for ((k, v) <- List("exec1" -> "host1", "exec2" -> "host2", "exec3" -> "host3")) {
+      val taskOption = manager.resourceOffer(k, v, NO_PREF)._1
+      assert(taskOption.isDefined)
+      val task = taskOption.get
+      assert(task.executorId === k)
+      tasks += task
+    }
+    assert(sched.startedTasks.toSet === (0 until 3).toSet)
+
+    def runningTaskForIndex(index: Int): TaskDescription = {
+      tasks.find { task =>
+        task.index == index && !sched.endedTasks.contains(task.taskId)
+      }.getOrElse {
+        throw new RuntimeException(s"couldn't find index $index in " +
+          s"tasks: ${tasks.map { t => t.index -> t.taskId }} with endedTasks:" +
+          s" ${sched.endedTasks.keys}")
+      }
+    }
+    clock.advance(1)
+
+    // running task with index 1 fail 3 times (not enough to abort the stage)
+    (0 until 3).foreach { attempt =>
+      val task = runningTaskForIndex(1)
+      val endReason = ExceptionFailure("a", "b", Array(), "c", None)
+      manager.handleFailedTask(task.taskId, TaskState.FAILED, endReason)
+      sched.endedTasks(task.taskId) = endReason
+      assert(!manager.isZombie)
+      val nextTask = manager.resourceOffer(s"exec2", s"host2", NO_PREF)._1
+      assert(nextTask.isDefined, s"no offer for attempt $attempt of 1")
+      tasks += nextTask.get
+    }
+
+    val numFailuresField = classOf[TaskSetManager].getDeclaredField("numFailures")
+    numFailuresField.setAccessible(true)
+    val numFailures = numFailuresField.get(manager).asInstanceOf[Array[Int]]
+    // numFailures(1) should be 3
+    assert(numFailures(1) == 3)
+
+    // make task(TID 2) success to speculative other tasks
+    manager.handleSuccessfulTask(2, createTaskResult(2))
+
+    val originalTask = runningTaskForIndex(1)
+    clock.advance(1)
+    assert(manager.checkSpeculatableTasks(0))
+    assert(sched.speculativeTasks.toSet === Set(0, 1))
+
+    // make the speculative task(index 1) success
+    val speculativeTask = manager.resourceOffer("exec1", "host1", NO_PREF)._1
+    assert(speculativeTask.isDefined)
+    manager.handleSuccessfulTask(speculativeTask.get.taskId, createTaskResult(1))
+    // if task success, numFailures will be reset to 0
+    assert(numFailures(1) == 0)
+
+    // failed the originalTask(index 1) and check if the task manager is zombie
+    val failedReason = ExceptionFailure("a", "b", Array(), "c", None)
+    manager.handleFailedTask(originalTask.taskId, TaskState.FAILED, failedReason)
+    assert(!manager.isZombie)
+  }
+
+  test("SPARK-40094: Send TaskEnd if task failed with " +
+    "NotSerializableException or TaskOutputFileAlreadyExistException") {
+    val sparkConf = new SparkConf()
+      .setMaster("local-cluster[1,1,1024]")
+      .setAppName("SPARK-40094")
+      .set(config.DYN_ALLOCATION_TESTING, true)
+      .set(TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED, false)
+      .set(config.DYN_ALLOCATION_ENABLED, true)
+      .set(config.DYN_ALLOCATION_EXECUTOR_IDLE_TIMEOUT, 1L)
+
+    // setup spark context and init ExecutorAllocationManager
+    sc = new SparkContext(sparkConf)
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+    // replace dagScheduler to let handleFailedTask send TaskEnd
+    sched.dagScheduler = sc.dagScheduler
+
+    val taskSet1 = FakeTask.createTaskSet(1)
+    val manager1 = new TaskSetManager(sched, taskSet1, MAX_TASK_FAILURES)
+    val taskSet2 = FakeTask.createTaskSet(1)
+    val manager2 = new TaskSetManager(sched, taskSet2, MAX_TASK_FAILURES)
+    assert(sched.taskSetsFailed.isEmpty)
+
+
+    val offerResult1 = manager1.resourceOffer("exec1", "host1", ANY)._1
+    assert(offerResult1.isDefined,
+      "Expect resource offer on iteration 0 to return a task")
+    assert(offerResult1.get.index === 0)
+
+    val offerResult2 = manager2.resourceOffer("exec2", "host2", ANY)._1
+    assert(offerResult2.isDefined,
+      "Expect resource offer on iteration 0 to return a task")
+    assert(offerResult2.get.index === 0)
+
+    val executorMonitor = sc.executorAllocationManager.get.executorMonitor
+
+    // mock ExecutorMonitor.onTaskStart
+    val executorTracker1 = executorMonitor.ensureExecutorIsTracked("exec1",
+      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    executorTracker1.updateRunningTasks(1)
+    val executorTracker2 = executorMonitor.ensureExecutorIsTracked("exec2",
+      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    executorTracker2.updateRunningTasks(1)
+
+    // assert exec1 and exec2 are not idle
+    assert(!executorMonitor.isExecutorIdle("exec1"))
+    assert(!executorMonitor.isExecutorIdle("exec2"))
+
+    // handle failed task and send TaskEnd
+    val reason1 = new ExceptionFailure(
+      new TaskOutputFileAlreadyExistException(
+        new FileAlreadyExistsException("file already exists")),
+      Seq.empty[AccumulableInfo])
+    manager1.handleFailedTask(offerResult1.get.taskId, TaskState.FAILED, reason1)
+    val reason2 = new ExceptionFailure(
+      new NotSerializableException("test NotSerializableException"),
+      Seq.empty[AccumulableInfo])
+    manager2.handleFailedTask(offerResult2.get.taskId, TaskState.FAILED, reason2)
+
+    Thread.sleep(1200)
+
+    // executor are idle because task has removed by TaskEnd
+    assert(executorMonitor.isExecutorIdle("exec1"))
+    assert(executorMonitor.isExecutorIdle("exec2"))
+  }
+
 }
 
 class FakeLongTasks(stageId: Int, partitionId: Int) extends FakeTask(stageId, partitionId) {

@@ -17,19 +17,21 @@
 
 import functools
 import warnings
-from inspect import getfullargspec
+from inspect import getfullargspec, signature
+from typing import get_type_hints
 
-from pyspark import since
-from pyspark.rdd import PythonEvalType
+from pyspark.util import PythonEvalType
 from pyspark.sql.pandas.typehints import infer_eval_type
 from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
 from pyspark.sql.types import DataType
 from pyspark.sql.udf import _create_udf
+from pyspark.sql.utils import is_remote
+from pyspark.errors import PySparkTypeError, PySparkValueError
 
 
-class PandasUDFType(object):
-    """Pandas UDF Types. See :meth:`pyspark.sql.functions.pandas_udf`.
-    """
+class PandasUDFType:
+    """Pandas UDF Types. See :meth:`pyspark.sql.functions.pandas_udf`."""
+
     SCALAR = PythonEvalType.SQL_SCALAR_PANDAS_UDF
 
     SCALAR_ITER = PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF
@@ -39,7 +41,6 @@ class PandasUDFType(object):
     GROUPED_AGG = PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF
 
 
-@since(2.3)
 def pandas_udf(f=None, returnType=None, functionType=None):
     """
     Creates a pandas user defined function (a.k.a. vectorized user defined function).
@@ -50,14 +51,28 @@ def pandas_udf(f=None, returnType=None, functionType=None):
     additional configuration is required. A Pandas UDF behaves as a regular PySpark function
     API in general.
 
-    :param f: user-defined function. A python function if used as a standalone function
-    :param returnType: the return type of the user-defined function. The value can be either a
+    .. versionadded:: 2.3.0
+
+    .. versionchanged:: 3.4.0
+        Supports Spark Connect.
+
+    .. versionchanged:: 4.0.0
+        Supports keyword-arguments in SCALAR and GROUPED_AGG type.
+
+    Parameters
+    ----------
+    f : function, optional
+        user-defined function. A python function if used as a standalone function
+    returnType : :class:`pyspark.sql.types.DataType` or str, optional
+        the return type of the user-defined function. The value can be either a
         :class:`pyspark.sql.types.DataType` object or a DDL-formatted type string.
-    :param functionType: an enum value in :class:`pyspark.sql.functions.PandasUDFType`.
-        Default: SCALAR.
+    functionType : int, optional
+        an enum value in :class:`pyspark.sql.functions.PandasUDFType`.
+        Default: SCALAR. This parameter exists for compatibility.
+        Using Python type hints is encouraged.
 
-        .. note:: This parameter exists for compatibility. Using Python type hints is encouraged.
-
+    Examples
+    --------
     In order to use this API, customarily the below are imported:
 
     >>> import pandas as pd
@@ -93,7 +108,7 @@ def pandas_udf(f=None, returnType=None, functionType=None):
     ...     s3['col2'] = s1 + s2.str.len()
     ...     return s3
     ...
-    >>> # Create a Spark DataFrame that has three columns including a sturct column.
+    >>> # Create a Spark DataFrame that has three columns including a struct column.
     ... df = spark.createDataFrame(
     ...     [[1, "a string", ("a nested string",)]],
     ...     "long_col long, string_col string, struct_col struct<col1:string>")
@@ -108,7 +123,7 @@ def pandas_udf(f=None, returnType=None, functionType=None):
     |    |-- col1: string (nullable = true)
     |    |-- col2: long (nullable = true)
 
-    In the following sections, it describes the cominations of the supported type hints. For
+    In the following sections, it describes the combinations of the supported type hints. For
     simplicity, `pandas.DataFrame` variant is omitted.
 
     * Series to Series
@@ -138,8 +153,22 @@ def pandas_udf(f=None, returnType=None, functionType=None):
         +------------------+
         |split_expand(name)|
         +------------------+
-        |       [John, Doe]|
+        |       {John, Doe}|
         +------------------+
+
+        This type of Pandas UDF can use keyword arguments:
+
+        >>> @pandas_udf(returnType=IntegerType())
+        ... def calc(a: pd.Series, b: pd.Series) -> pd.Series:
+        ...     return a + 10 * b
+        ...
+        >>> spark.range(2).select(calc(b=col("id") * 10, a=col("id"))).show()
+        +-----------------------------+
+        |calc(b => (id * 10), a => id)|
+        +-----------------------------+
+        |                            0|
+        |                          101|
+        +-----------------------------+
 
         .. note:: The length of the input is not that of the whole input column, but is the
             length of an internal batch used for each call to the function.
@@ -238,6 +267,24 @@ def pandas_udf(f=None, returnType=None, functionType=None):
         |  2|        6.0|
         +---+-----------+
 
+        This type of Pandas UDF can use keyword arguments:
+
+        >>> @pandas_udf("double")
+        ... def weighted_mean_udf(v: pd.Series, w: pd.Series) -> float:
+        ...     import numpy as np
+        ...     return np.average(v, weights=w)
+        ...
+        >>> df = spark.createDataFrame(
+        ...     [(1, 1.0, 1.0), (1, 2.0, 2.0), (2, 3.0, 1.0), (2, 5.0, 2.0), (2, 10.0, 3.0)],
+        ...     ("id", "v", "w"))
+        >>> df.groupby("id").agg(weighted_mean_udf(w=df["w"], v=df["v"])).show()
+        +---+---------------------------------+
+        | id|weighted_mean_udf(w => w, v => v)|
+        +---+---------------------------------+
+        |  1|               1.6666666666666667|
+        |  2|                7.166666666666667|
+        +---+---------------------------------+
+
         This UDF can also be used as window functions as below:
 
         >>> from pyspark.sql import Window
@@ -263,30 +310,32 @@ def pandas_udf(f=None, returnType=None, functionType=None):
             Therefore, mutating the input series is not allowed and will cause incorrect results.
             For the same reason, users should also not rely on the index of the input series.
 
-        .. seealso:: :meth:`pyspark.sql.GroupedData.agg` and :class:`pyspark.sql.Window`
+    Notes
+    -----
+    The user-defined functions do not support conditional expressions or short circuiting
+    in boolean expressions and it ends up with being executed all internally. If the functions
+    can fail on special rows, the workaround is to incorporate the condition into the functions.
 
-    .. note:: The user-defined functions do not support conditional expressions or short circuiting
-        in boolean expressions and it ends up with being executed all internally. If the functions
-        can fail on special rows, the workaround is to incorporate the condition into the functions.
+    The user-defined functions do not take keyword arguments on the calling side.
 
-    .. note:: The user-defined functions do not take keyword arguments on the calling side.
+    The data type of returned `pandas.Series` from the user-defined functions should be
+    matched with defined `returnType` (see :meth:`types.to_arrow_type` and
+    :meth:`types.from_arrow_type`). When there is mismatch between them, Spark might do
+    conversion on returned data. The conversion is not guaranteed to be correct and results
+    should be checked for accuracy by users.
 
-    .. note:: The data type of returned `pandas.Series` from the user-defined functions should be
-        matched with defined `returnType` (see :meth:`types.to_arrow_type` and
-        :meth:`types.from_arrow_type`). When there is mismatch between them, Spark might do
-        conversion on returned data. The conversion is not guaranteed to be correct and results
-        should be checked for accuracy by users.
+    Currently,
+    :class:`pyspark.sql.types.ArrayType` of :class:`pyspark.sql.types.TimestampType` and
+    nested :class:`pyspark.sql.types.StructType`
+    are currently not supported as output types.
 
-    .. note:: Currently,
-        :class:`pyspark.sql.types.MapType`,
-        :class:`pyspark.sql.types.ArrayType` of :class:`pyspark.sql.types.TimestampType` and
-        nested :class:`pyspark.sql.types.StructType`
-        are currently not supported as output types.
-
-    .. seealso:: :meth:`pyspark.sql.DataFrame.mapInPandas`
-    .. seealso:: :meth:`pyspark.sql.GroupedData.applyInPandas`
-    .. seealso:: :meth:`pyspark.sql.PandasCogroupedOps.applyInPandas`
-    .. seealso:: :meth:`pyspark.sql.UDFRegistration.register`
+    See Also
+    --------
+    pyspark.sql.GroupedData.agg
+    pyspark.sql.DataFrame.mapInPandas
+    pyspark.sql.GroupedData.applyInPandas
+    pyspark.sql.PandasCogroupedOps.applyInPandas
+    pyspark.sql.UDFRegistration.register
     """
 
     # The following table shows most of Pandas data and SQL type conversions in Pandas UDFs that
@@ -309,15 +358,15 @@ def pandas_udf(f=None, returnType=None, functionType=None):
     # |                       string|                  None|                 X|                 X|                 X|                   X|                   X|                 X|                 X|                 X|                 X|             X|             X|             X|                                  X|                                                    X|              'a'|                   X|                            X|             X|                X|                 X|            'A'|                               X|  # noqa
     # |                decimal(10,0)|                  None|                 X|                 X|                 X|                   X|                   X|                 X|                 X|                 X|                 X|             X|             X|             X|                                  X|                                                    X|                X|        Decimal('1')|                            X|             X|                X|                 X|              X|                               X|  # noqa
     # |                   array<int>|                  None|                 X|                 X|                 X|                   X|                   X|                 X|                 X|                 X|                 X|             X|             X|             X|                                  X|                                                    X|                X|                   X|                    [1, 2, 3]|             X|                X|                 X|              X|                               X|  # noqa
-    # |              map<string,int>|                     X|                 X|                 X|                 X|                   X|                   X|                 X|                 X|                 X|                 X|             X|             X|             X|                                  X|                                                    X|                X|                   X|                            X|             X|                X|                 X|              X|                               X|  # noqa
+    # |              map<string,int>|                  None|                 X|                 X|                 X|                   X|                   X|                 X|                 X|                 X|                 X|             X|             X|             X|                                  X|                                                    X|                X|                   X|                            X|             X|                X|                 X|              X|                               X|  # noqa
     # |               struct<_1:int>|                     X|                 X|                 X|                 X|                   X|                   X|                 X|                 X|                 X|                 X|             X|             X|             X|                                  X|                                                    X|                X|                   X|                            X|             X|                X|                 X|              X|                               X|  # noqa
     # |                       binary|                  None|bytearray(b'\x01')|bytearray(b'\x01')|bytearray(b'\x01')|  bytearray(b'\x01')|  bytearray(b'\x01')|bytearray(b'\x01')|bytearray(b'\x01')|bytearray(b'\x01')|bytearray(b'\x01')|bytearray(b'')|bytearray(b'')|bytearray(b'')|                     bytearray(b'')|                                       bytearray(b'')|  bytearray(b'a')|                   X|                            X|bytearray(b'')|   bytearray(b'')|    bytearray(b'')|bytearray(b'A')|                  bytearray(b'')|  # noqa
-    # +-----------------------------+----------------------+------------------+------------------+------------------+--------------------+--------------------+------------------+------------------+------------------+------------------+--------------+--------------+--------------+-----------------------------------+-----------------------------------------------------+-----------------+--------------------+-----------------------------+--------------+-----------------+------------------+---------------+--------------------------------+  # noqa    #
+    # +-----------------------------+----------------------+------------------+------------------+------------------+--------------------+--------------------+------------------+------------------+------------------+------------------+--------------+--------------+--------------+-----------------------------------+-----------------------------------------------------+-----------------+--------------------+-----------------------------+--------------+-----------------+------------------+---------------+--------------------------------+  # noqa
     #
     # Note: DDL formatted string is used for 'SQL Type' for simplicity. This string can be
     #       used in `returnType`.
     # Note: The values inside of the table are generated by `repr`.
-    # Note: Python 3.7.3, Pandas 1.1.1 and PyArrow 1.0.1 are used.
+    # Note: Python 3.9.5, Pandas 1.4.0 and PyArrow 6.0.1 are used.
     # Note: Timezone is KST.
     # Note: 'X' means it throws an exception during the conversion.
     require_minimum_pandas_version()
@@ -350,18 +399,31 @@ def pandas_udf(f=None, returnType=None, functionType=None):
             eval_type = None
 
     if return_type is None:
-        raise ValueError("Invalid return type: returnType can not be None")
+        raise PySparkTypeError(
+            error_class="CANNOT_BE_NONE",
+            message_parameters={"arg_name": "returnType"},
+        )
 
-    if eval_type not in [PythonEvalType.SQL_SCALAR_PANDAS_UDF,
-                         PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF,
-                         PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
-                         PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
-                         PythonEvalType.SQL_MAP_PANDAS_ITER_UDF,
-                         PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF,
-                         None]:  # None means it should infer the type from type hints.
-
-        raise ValueError("Invalid function type: "
-                         "functionType must be one the values from PandasUDFType")
+    if eval_type not in [
+        PythonEvalType.SQL_SCALAR_PANDAS_UDF,
+        PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF,
+        PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
+        PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
+        PythonEvalType.SQL_MAP_PANDAS_ITER_UDF,
+        PythonEvalType.SQL_MAP_ARROW_ITER_UDF,
+        PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF,
+        PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE,
+        PythonEvalType.SQL_GROUPED_MAP_ARROW_UDF,
+        PythonEvalType.SQL_COGROUPED_MAP_ARROW_UDF,
+        None,
+    ]:  # None means it should infer the type from type hints.
+        raise PySparkTypeError(
+            error_class="INVALID_PANDAS_UDF_TYPE",
+            message_parameters={
+                "arg_name": "functionType",
+                "arg_type": str(eval_type),
+            },
+        )
 
     if is_decorator:
         return functools.partial(_create_pandas_udf, returnType=return_type, evalType=eval_type)
@@ -369,56 +431,113 @@ def pandas_udf(f=None, returnType=None, functionType=None):
         return _create_pandas_udf(f=f, returnType=return_type, evalType=eval_type)
 
 
-def _create_pandas_udf(f, returnType, evalType):
+# validate the pandas udf and return the adjusted eval type
+def _validate_pandas_udf(f, evalType) -> int:
     argspec = getfullargspec(f)
 
     # pandas UDF by type hints.
-    from inspect import signature
-
-    if evalType in [PythonEvalType.SQL_SCALAR_PANDAS_UDF,
-                    PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF,
-                    PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF]:
+    if evalType in [
+        PythonEvalType.SQL_SCALAR_PANDAS_UDF,
+        PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF,
+        PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
+    ]:
         warnings.warn(
             "In Python 3.6+ and Spark 3.0+, it is preferred to specify type hints for "
             "pandas UDF instead of specifying pandas UDF type which will be deprecated "
-            "in the future releases. See SPARK-28264 for more details.", UserWarning)
-    elif evalType in [PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
-                      PythonEvalType.SQL_MAP_PANDAS_ITER_UDF,
-                      PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF]:
-        # In case of 'SQL_GROUPED_MAP_PANDAS_UDF',  deprecation warning is being triggered
+            "in the future releases. See SPARK-28264 for more details.",
+            UserWarning,
+        )
+    elif evalType in [
+        PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
+        PythonEvalType.SQL_MAP_PANDAS_ITER_UDF,
+        PythonEvalType.SQL_MAP_ARROW_ITER_UDF,
+        PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF,
+        PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE,
+        PythonEvalType.SQL_GROUPED_MAP_ARROW_UDF,
+        PythonEvalType.SQL_COGROUPED_MAP_ARROW_UDF,
+        PythonEvalType.SQL_ARROW_BATCHED_UDF,
+    ]:
+        # In case of 'SQL_GROUPED_MAP_PANDAS_UDF', deprecation warning is being triggered
         # at `apply` instead.
-        # In case of 'SQL_MAP_PANDAS_ITER_UDF' and 'SQL_COGROUPED_MAP_PANDAS_UDF', the
-        # evaluation type will always be set.
+        # In case of 'SQL_MAP_PANDAS_ITER_UDF', 'SQL_MAP_ARROW_ITER_UDF' and
+        # 'SQL_COGROUPED_MAP_PANDAS_UDF', the evaluation type will always be set.
+        # In case of 'SQL_ARROW_BATCHED_UDF', no deprecation warning is required since it is not
+        # exposed to users.
         pass
     elif len(argspec.annotations) > 0:
-        evalType = infer_eval_type(signature(f))
+        try:
+            type_hints = get_type_hints(f)
+        except NameError:
+            type_hints = {}
+        evalType = infer_eval_type(signature(f), type_hints)
         assert evalType is not None
 
     if evalType is None:
         # Set default is scalar UDF.
         evalType = PythonEvalType.SQL_SCALAR_PANDAS_UDF
 
-    if (evalType == PythonEvalType.SQL_SCALAR_PANDAS_UDF or
-            evalType == PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF) and \
-            len(argspec.args) == 0 and \
-            argspec.varargs is None:
-        raise ValueError(
-            "Invalid function: 0-arg pandas_udfs are not supported. "
-            "Instead, create a 1-arg pandas_udf and ignore the arg in your function."
+    if (
+        (
+            evalType == PythonEvalType.SQL_SCALAR_PANDAS_UDF
+            or evalType == PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF
+        )
+        and len(argspec.args) == 0
+        and argspec.varargs is None
+    ):
+        raise PySparkValueError(
+            error_class="INVALID_PANDAS_UDF",
+            message_parameters={
+                "detail": "0-arg pandas_udfs are not supported. "
+                "Instead, create a 1-arg pandas_udf and ignore the arg in your function.",
+            },
         )
 
-    if evalType == PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF \
-            and len(argspec.args) not in (1, 2):
-        raise ValueError(
-            "Invalid function: pandas_udf with function type GROUPED_MAP or "
-            "the function in groupby.applyInPandas "
-            "must take either one argument (data) or two arguments (key, data).")
+    if evalType == PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF and len(argspec.args) not in (1, 2):
+        raise PySparkValueError(
+            error_class="INVALID_PANDAS_UDF",
+            message_parameters={
+                "detail": "pandas_udf with function type GROUPED_MAP or the function in "
+                "groupby.applyInPandas must take either one argument (data) or "
+                "two arguments (key, data).",
+            },
+        )
 
-    if evalType == PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF \
-            and len(argspec.args) not in (2, 3):
-        raise ValueError(
-            "Invalid function: the function in cogroup.applyInPandas "
-            "must take either two arguments (left, right) "
-            "or three arguments (key, left, right).")
+    if evalType == PythonEvalType.SQL_GROUPED_MAP_ARROW_UDF and len(argspec.args) not in (1, 2):
+        raise PySparkValueError(
+            error_class="INVALID_PANDAS_UDF",
+            message_parameters={
+                "detail": "the function in groupby.applyInArrow must take either one argument "
+                "(data) or two arguments (key, data).",
+            },
+        )
 
-    return _create_udf(f, returnType, evalType)
+    if evalType == PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF and len(argspec.args) not in (2, 3):
+        raise PySparkValueError(
+            error_class="INVALID_PANDAS_UDF",
+            message_parameters={
+                "detail": "the function in cogroup.applyInPandas must take either two arguments "
+                "(left, right) or three arguments (key, left, right).",
+            },
+        )
+
+    if evalType == PythonEvalType.SQL_COGROUPED_MAP_ARROW_UDF and len(argspec.args) not in (2, 3):
+        raise PySparkValueError(
+            error_class="INVALID_PANDAS_UDF",
+            message_parameters={
+                "detail": "the function in cogroup.applyInArrow must take either two arguments "
+                "(left, right) or three arguments (key, left, right).",
+            },
+        )
+
+    return evalType
+
+
+def _create_pandas_udf(f, returnType, evalType):
+    evalType = _validate_pandas_udf(f, evalType)
+
+    if is_remote():
+        from pyspark.sql.connect.udf import _create_udf as _create_connect_udf
+
+        return _create_connect_udf(f, returnType, evalType)
+    else:
+        return _create_udf(f, returnType, evalType)

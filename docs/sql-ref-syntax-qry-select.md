@@ -41,9 +41,10 @@ select_statement [ { UNION | INTERSECT | EXCEPT } [ ALL | DISTINCT ] select_stat
 
 While `select_statement` is defined as
 ```sql
-SELECT [ hints , ... ] [ ALL | DISTINCT ] { named_expression [ , ... ] }
+SELECT [ hints , ... ] [ ALL | DISTINCT ] { [ [ named_expression | regex_column_names | star ] [ , ... ] | TRANSFORM (...) ] }
     FROM { from_item [ , ... ] }
     [ PIVOT clause ]
+    [ UNPIVOT clause ]
     [ LATERAL VIEW clause ] [ ... ] 
     [ WHERE boolean_expression ]
     [ GROUP BY expression [ , ... ] ]
@@ -75,20 +76,31 @@ SELECT [ hints , ... ] [ ALL | DISTINCT ] { named_expression [ , ... ] }
 
     An expression with an assigned name. In general, it denotes a column expression.
 
-    **Syntax:** `expression [AS] [alias]`
+    **Syntax:** `expression [[AS] alias]`
+
+* **star**
+
+    The `*` (star) clause is used to select all or most columns from one or all relations in a FROM clause.
 
 * **from_item**
 
      Specifies a source of input for the query. It can be one of the following:
      * Table relation
      * [Join relation](sql-ref-syntax-qry-select-join.html)
+     * [Pivot relation](sql-ref-syntax-qry-select-pivot.html)
+     * [Unpivot relation](sql-ref-syntax-qry-select-unpivot.html)
      * [Table-value function](sql-ref-syntax-qry-select-tvf.html)
      * [Inline table](sql-ref-syntax-qry-select-inline-table.html)
-     * Subquery
+     * [ [LATERAL](sql-ref-syntax-qry-select-lateral-subquery.html) ] ( Subquery )
+     * [File](sql-ref-syntax-qry-select-file.html)
      
 * **PIVOT**
 
      The `PIVOT` clause is used for data perspective; We can get the aggregated values based on specific column value.
+
+* **UNPIVOT**
+
+     The `UNPIVOT` clause transforms columns into rows. It is the reverse of `PIVOT`, except for aggregation of values.
 
 * **LATERAL VIEW**
      
@@ -150,6 +162,22 @@ SELECT [ hints , ... ] [ ALL | DISTINCT ] { named_expression [ , ... ] }
 
      Specifies aliases for one or more source window specifications. The source window specifications can
      be referenced in the widow definitions in the query.
+     
+* **regex_column_names**
+
+     When `spark.sql.parser.quotedRegexColumnNames` is true, quoted identifiers (using backticks) in `SELECT`
+     statement are interpreted as regular expressions and `SELECT` statement can take regex-based column specification.
+     For example, below SQL will only take column `c`:
+
+     ```sql
+     SELECT `(a|b)?+.+` FROM (
+       SELECT 1 as a, 2 as b, 3 as c
+     )
+     ```
+
+* **TRANSFORM**
+
+     Specifies a hive-style transform query specification to transform the input by forking and running user-specified command or script.
 
 ### Related Statements
 
@@ -161,9 +189,11 @@ SELECT [ hints , ... ] [ ALL | DISTINCT ] { named_expression [ , ... ] }
 * [CLUSTER BY Clause](sql-ref-syntax-qry-select-clusterby.html)
 * [DISTRIBUTE BY Clause](sql-ref-syntax-qry-select-distribute-by.html)
 * [LIMIT Clause](sql-ref-syntax-qry-select-limit.html)
+* [OFFSET Clause](sql-ref-syntax-qry-select-offset.html)
 * [Common Table Expression](sql-ref-syntax-qry-select-cte.html)
 * [Hints](sql-ref-syntax-qry-select-hints.html)
 * [Inline Table](sql-ref-syntax-qry-select-inline-table.html)
+* [File](sql-ref-syntax-qry-select-file.html)
 * [JOIN](sql-ref-syntax-qry-select-join.html)
 * [LIKE Predicate](sql-ref-syntax-qry-select-like.html)
 * [Set Operators](sql-ref-syntax-qry-select-setops.html)
@@ -172,4 +202,8 @@ SELECT [ hints , ... ] [ ALL | DISTINCT ] { named_expression [ , ... ] }
 * [Window Function](sql-ref-syntax-qry-select-window.html)
 * [CASE Clause](sql-ref-syntax-qry-select-case.html)
 * [PIVOT Clause](sql-ref-syntax-qry-select-pivot.html)
+* [UNPIVOT Clause](sql-ref-syntax-qry-select-unpivot.html)
 * [LATERAL VIEW Clause](sql-ref-syntax-qry-select-lateral-view.html)
+* [TRANSFORM Clause](sql-ref-syntax-qry-select-transform.html)
+* [LATERAL Subquery](sql-ref-syntax-qry-select-lateral-subquery.html)
+* [star (*) Clause](sql-ref-syntax-qry-star.html)

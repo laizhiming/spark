@@ -22,11 +22,10 @@ import scala.annotation.tailrec
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, PartitioningCollection}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec, ProjectExec, SparkPlan}
-import org.apache.spark.sql.execution.joins.{BaseJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashJoinExec, ShuffledJoin, SortMergeJoinExec}
 
 /**
  * This rule coalesces one side of the `SortMergeJoin` and `ShuffledHashJoin`
@@ -38,21 +37,20 @@ import org.apache.spark.sql.internal.SQLConf
  *   - The ratio of the number of buckets is less than the value set in
  *     COALESCE_BUCKETS_IN_JOIN_MAX_BUCKET_RATIO.
  */
-case class CoalesceBucketsInJoin(conf: SQLConf) extends Rule[SparkPlan] {
+object CoalesceBucketsInJoin extends Rule[SparkPlan] {
   private def updateNumCoalescedBucketsInScan(
       plan: SparkPlan,
       numCoalescedBuckets: Int): SparkPlan = {
     plan transformUp {
-      case f: FileSourceScanExec =>
+      case f: FileSourceScanExec if f.relation.bucketSpec.nonEmpty =>
         f.copy(optionalNumCoalescedBuckets = Some(numCoalescedBuckets))
     }
   }
 
   private def updateNumCoalescedBuckets(
-      join: BaseJoinExec,
+      join: ShuffledJoin,
       numLeftBuckets: Int,
-      numRightBucket: Int,
-      numCoalescedBuckets: Int): BaseJoinExec = {
+      numCoalescedBuckets: Int): ShuffledJoin = {
     if (numCoalescedBuckets != numLeftBuckets) {
       val leftCoalescedChild =
         updateNumCoalescedBucketsInScan(join.left, numCoalescedBuckets)
@@ -73,7 +71,6 @@ case class CoalesceBucketsInJoin(conf: SQLConf) extends Rule[SparkPlan] {
   private def isCoalesceSHJStreamSide(
       join: ShuffledHashJoinExec,
       numLeftBuckets: Int,
-      numRightBucket: Int,
       numCoalescedBuckets: Int): Boolean = {
     if (numCoalescedBuckets == numLeftBuckets) {
       join.buildSide != BuildRight
@@ -94,12 +91,12 @@ case class CoalesceBucketsInJoin(conf: SQLConf) extends Rule[SparkPlan] {
         val numCoalescedBuckets = math.min(numLeftBuckets, numRightBuckets)
         join match {
           case j: SortMergeJoinExec =>
-            updateNumCoalescedBuckets(j, numLeftBuckets, numRightBuckets, numCoalescedBuckets)
+            updateNumCoalescedBuckets(j, numLeftBuckets, numCoalescedBuckets)
           case j: ShuffledHashJoinExec
             // Only coalesce the buckets for shuffled hash join stream side,
             // to avoid OOM for build side.
-            if isCoalesceSHJStreamSide(j, numLeftBuckets, numRightBuckets, numCoalescedBuckets) =>
-            updateNumCoalescedBuckets(j, numLeftBuckets, numRightBuckets, numCoalescedBuckets)
+            if isCoalesceSHJStreamSide(j, numLeftBuckets, numCoalescedBuckets) =>
+            updateNumCoalescedBuckets(j, numLeftBuckets, numCoalescedBuckets)
           case other => other
         }
       case other => other
@@ -118,7 +115,11 @@ object ExtractJoinWithBuckets {
   private def hasScanOperation(plan: SparkPlan): Boolean = plan match {
     case f: FilterExec => hasScanOperation(f.child)
     case p: ProjectExec => hasScanOperation(p.child)
-    case _: FileSourceScanExec => true
+    case j: BroadcastHashJoinExec =>
+      if (j.buildSide == BuildLeft) hasScanOperation(j.right) else hasScanOperation(j.left)
+    case j: BroadcastNestedLoopJoinExec =>
+      if (j.buildSide == BuildLeft) hasScanOperation(j.right) else hasScanOperation(j.left)
+    case f: FileSourceScanExec => f.relation.bucketSpec.nonEmpty
     case _ => false
   }
 
@@ -140,14 +141,14 @@ object ExtractJoinWithBuckets {
     partitioning match {
       case HashPartitioning(exprs, _) if exprs.length == keys.length =>
         exprs.forall(e => keys.exists(_.semanticEquals(e)))
+      case PartitioningCollection(partitionings) =>
+        partitionings.exists(satisfiesOutputPartitioning(keys, _))
       case _ => false
     }
   }
 
-  private def isApplicable(j: BaseJoinExec): Boolean = {
-    (j.isInstanceOf[SortMergeJoinExec] ||
-      j.isInstanceOf[ShuffledHashJoinExec]) &&
-      hasScanOperation(j.left) &&
+  private def isApplicable(j: ShuffledJoin): Boolean = {
+    hasScanOperation(j.left) &&
       hasScanOperation(j.right) &&
       satisfiesOutputPartitioning(j.leftKeys, j.left.outputPartitioning) &&
       satisfiesOutputPartitioning(j.rightKeys, j.right.outputPartitioning)
@@ -160,9 +161,9 @@ object ExtractJoinWithBuckets {
     numBuckets1 != numBuckets2 && large % small == 0
   }
 
-  def unapply(plan: SparkPlan): Option[(BaseJoinExec, Int, Int)] = {
+  def unapply(plan: SparkPlan): Option[(ShuffledJoin, Int, Int)] = {
     plan match {
-      case j: BaseJoinExec if isApplicable(j) =>
+      case j: ShuffledJoin if isApplicable(j) =>
         val leftBucket = getBucketSpec(j.left)
         val rightBucket = getBucketSpec(j.right)
         if (leftBucket.isDefined && rightBucket.isDefined &&

@@ -22,7 +22,8 @@ import scala.reflect.ClassTag
 import breeze.linalg.{Vector => BV}
 
 import org.apache.spark.graphx._
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.NUM_ITERATIONS
 import org.apache.spark.ml.linalg.{Vector, Vectors}
 
 /**
@@ -140,8 +141,32 @@ object PageRank extends Logging {
    */
   def runWithOptions[VD: ClassTag, ED: ClassTag](
       graph: Graph[VD, ED], numIter: Int, resetProb: Double = 0.15,
-      srcId: Option[VertexId] = None): Graph[Double, Double] =
-  {
+      srcId: Option[VertexId] = None): Graph[Double, Double] = {
+    runWithOptions(graph, numIter, resetProb, srcId, normalized = true)
+  }
+
+  /**
+   * Run PageRank for a fixed number of iterations returning a graph
+   * with vertex attributes containing the PageRank and edge
+   * attributes the normalized edge weight.
+   *
+   * @tparam VD the original vertex attribute (not used)
+   * @tparam ED the original edge attribute (not used)
+   *
+   * @param graph the graph on which to compute PageRank
+   * @param numIter the number of iterations of PageRank to run
+   * @param resetProb the random reset probability (alpha)
+   * @param srcId the source vertex for a Personalized Page Rank (optional)
+   * @param normalized whether or not to normalize rank sum
+   *
+   * @return the graph containing with each vertex containing the PageRank and each edge
+   *         containing the normalized weight.
+   *
+   * @since 3.2.0
+   */
+  def runWithOptions[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED], numIter: Int, resetProb: Double,
+      srcId: Option[VertexId], normalized: Boolean): Graph[Double, Double] = {
     require(numIter > 0, s"Number of iterations must be greater than 0," +
       s" but got ${numIter}")
     require(resetProb >= 0 && resetProb <= 1, s"Random reset probability must belong" +
@@ -173,14 +198,19 @@ object PageRank extends Logging {
       rankGraph = runUpdate(rankGraph, personalized, resetProb, src)
       rankGraph.cache()
       rankGraph.edges.foreachPartition(x => {}) // also materializes rankGraph.vertices
-      logInfo(s"PageRank finished iteration $iteration.")
+      logInfo(log"PageRank finished iteration ${MDC(NUM_ITERATIONS, iteration)}.")
       prevRankGraph.vertices.unpersist()
       prevRankGraph.edges.unpersist()
       iteration += 1
     }
 
-    // SPARK-18847 If the graph has sinks (vertices with no outgoing edges) correct the sum of ranks
-    normalizeRankSum(rankGraph, personalized)
+    if (normalized) {
+      // SPARK-18847 If the graph has sinks (vertices with no outgoing edges),
+      // correct the sum of ranks
+      normalizeRankSum(rankGraph, personalized)
+    } else {
+      rankGraph
+    }
   }
 
   /**
@@ -204,6 +234,34 @@ object PageRank extends Logging {
   def runWithOptionsWithPreviousPageRank[VD: ClassTag, ED: ClassTag](
       graph: Graph[VD, ED], numIter: Int, resetProb: Double, srcId: Option[VertexId],
       preRankGraph: Graph[Double, Double]): Graph[Double, Double] = {
+    runWithOptionsWithPreviousPageRank(
+      graph, numIter, resetProb, srcId, normalized = true, preRankGraph
+    )
+  }
+
+  /**
+   * Run PageRank for a fixed number of iterations returning a graph
+   * with vertex attributes containing the PageRank and edge
+   * attributes the normalized edge weight.
+   *
+   * @tparam VD the original vertex attribute (not used)
+   * @tparam ED the original edge attribute (not used)
+   *
+   * @param graph the graph on which to compute PageRank
+   * @param numIter the number of iterations of PageRank to run
+   * @param resetProb the random reset probability (alpha)
+   * @param srcId the source vertex for a Personalized Page Rank (optional)
+   * @param normalized whether or not to normalize rank sum
+   * @param preRankGraph PageRank graph from which to keep iterating
+   *
+   * @return the graph containing with each vertex containing the PageRank and each edge
+   *         containing the normalized weight.
+   *
+   * @since 3.2.0
+   */
+  def runWithOptionsWithPreviousPageRank[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED], numIter: Int, resetProb: Double, srcId: Option[VertexId],
+      normalized: Boolean, preRankGraph: Graph[Double, Double]): Graph[Double, Double] = {
     require(numIter > 0, s"Number of iterations must be greater than 0," +
       s" but got ${numIter}")
     require(resetProb >= 0 && resetProb <= 1, s"Random reset probability must belong" +
@@ -232,14 +290,19 @@ object PageRank extends Logging {
       rankGraph = runUpdate(rankGraph, personalized, resetProb, src)
       rankGraph.cache()
       rankGraph.edges.foreachPartition(x => {}) // also materializes rankGraph.vertices
-      logInfo(s"PageRank finished iteration $iteration.")
+      logInfo(log"PageRank finished iteration ${MDC(NUM_ITERATIONS, iteration)}.")
       prevRankGraph.vertices.unpersist()
       prevRankGraph.edges.unpersist()
       iteration += 1
     }
 
-    // SPARK-18847 If the graph has sinks (vertices with no outgoing edges) correct the sum of ranks
-    normalizeRankSum(rankGraph, personalized)
+    if (normalized) {
+      // SPARK-18847 If the graph has sinks (vertices with no outgoing edges),
+      // correct the sum of ranks
+      normalizeRankSum(rankGraph, personalized)
+    } else {
+      rankGraph
+    }
   }
 
   /**
@@ -272,10 +335,10 @@ object PageRank extends Logging {
     require(sources.nonEmpty, s"The list of sources must be non-empty," +
       s" but got ${sources.mkString("[", ",", "]")}")
 
-    val zero = Vectors.sparse(sources.size, List()).asBreeze
+    val zero = Vectors.sparse(sources.length, List()).asBreeze
     // map of vid -> vector where for each vid, the _position of vid in source_ is set to 1.0
     val sourcesInitMap = sources.zipWithIndex.map { case (vid, i) =>
-      val v = Vectors.sparse(sources.size, Array(i), Array(1.0)).asBreeze
+      val v = Vectors.sparse(sources.length, Array(i), Array(1.0)).asBreeze
       (vid, v)
     }.toMap
 
@@ -314,7 +377,7 @@ object PageRank extends Logging {
       prevRankGraph.vertices.unpersist()
       prevRankGraph.edges.unpersist()
 
-      logInfo(s"Parallel Personalized PageRank finished iteration $i.")
+      logInfo(log"Parallel Personalized PageRank finished iteration ${MDC(NUM_ITERATIONS, i)}.")
 
       i += 1
     }

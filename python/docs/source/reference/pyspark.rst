@@ -32,6 +32,7 @@ Public Classes
     RDD
     Broadcast
     Accumulator
+    AccumulatorParam
     SparkConf
     SparkFiles
     StorageLevel
@@ -40,7 +41,7 @@ Public Classes
     BarrierTaskContext
     BarrierTaskInfo
     InheritableThread
-
+    util.VersionUtils
 
 Spark Context APIs
 ------------------
@@ -52,7 +53,9 @@ Spark Context APIs
 
     SparkContext.PACKAGE_EXTENSIONS
     SparkContext.accumulator
+    SparkContext.addArchive
     SparkContext.addFile
+    SparkContext.addJobTag
     SparkContext.addPyFile
     SparkContext.applicationId
     SparkContext.binaryFiles
@@ -60,25 +63,32 @@ Spark Context APIs
     SparkContext.broadcast
     SparkContext.cancelAllJobs
     SparkContext.cancelJobGroup
+    SparkContext.cancelJobsWithTag
+    SparkContext.clearJobTags
     SparkContext.defaultMinPartitions
     SparkContext.defaultParallelism
     SparkContext.dump_profiles
     SparkContext.emptyRDD
     SparkContext.getCheckpointDir
     SparkContext.getConf
+    SparkContext.getJobTags
     SparkContext.getLocalProperty
     SparkContext.getOrCreate
     SparkContext.hadoopFile
     SparkContext.hadoopRDD
+    SparkContext.listArchives
+    SparkContext.listFiles
     SparkContext.newAPIHadoopFile
     SparkContext.newAPIHadoopRDD
     SparkContext.parallelize
     SparkContext.pickleFile
     SparkContext.range
     SparkContext.resources
+    SparkContext.removeJobTag
     SparkContext.runJob
     SparkContext.sequenceFile
     SparkContext.setCheckpointDir
+    SparkContext.setInterruptOnCancel
     SparkContext.setJobDescription
     SparkContext.setJobGroup
     SparkContext.setLocalProperty
@@ -110,6 +120,7 @@ RDD APIs
     RDD.cache
     RDD.cartesian
     RDD.checkpoint
+    RDD.cleanShuffleDependencies
     RDD.coalesce
     RDD.cogroup
     RDD.collect
@@ -226,6 +237,8 @@ Broadcast and Accumulator
     Broadcast.value
     Accumulator.add
     Accumulator.value
+    AccumulatorParam.addInPlace
+    AccumulatorParam.zero
 
 
 Management
@@ -236,6 +249,7 @@ Management
 .. autosummary::
     :toctree: api/
 
+    inheritable_thread_target
     SparkConf.contains
     SparkConf.get
     SparkConf.getAll
@@ -254,10 +268,12 @@ Management
     StorageLevel.DISK_ONLY_3
     StorageLevel.MEMORY_AND_DISK
     StorageLevel.MEMORY_AND_DISK_2
+    StorageLevel.MEMORY_AND_DISK_DESER
     StorageLevel.MEMORY_ONLY
     StorageLevel.MEMORY_ONLY_2
     StorageLevel.OFF_HEAP
     TaskContext.attemptNumber
+    TaskContext.cpus
     TaskContext.get
     TaskContext.getLocalProperty
     TaskContext.partitionId
@@ -269,6 +285,7 @@ Management
     BarrierTaskContext.allGather
     BarrierTaskContext.attemptNumber
     BarrierTaskContext.barrier
+    BarrierTaskContext.cpus
     BarrierTaskContext.get
     BarrierTaskContext.getLocalProperty
     BarrierTaskContext.getTaskInfos
@@ -276,3 +293,5 @@ Management
     BarrierTaskContext.resources
     BarrierTaskContext.stageId
     BarrierTaskContext.taskAttemptId
+    util.VersionUtils.majorMinorVersion
+

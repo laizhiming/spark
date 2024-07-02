@@ -20,7 +20,7 @@ package org.apache.spark.util.collection.unsafe.sort;
 import java.util.Comparator;
 import java.util.LinkedList;
 
-import org.apache.avro.reflect.Nullable;
+import javax.annotation.Nullable;
 
 import org.apache.spark.TaskContext;
 import org.apache.spark.memory.MemoryConsumer;
@@ -140,8 +140,9 @@ public final class UnsafeInMemorySorter {
     this.initialSize = array.size();
     if (recordComparator != null) {
       this.sortComparator = new SortComparator(recordComparator, prefixComparator, memoryManager);
-      if (canUseRadixSort && prefixComparator instanceof PrefixComparators.RadixSortSupport) {
-        this.radixSortSupport = (PrefixComparators.RadixSortSupport)prefixComparator;
+      if (canUseRadixSort &&
+        prefixComparator instanceof PrefixComparators.RadixSortSupport radixSortSupport) {
+        this.radixSortSupport = radixSortSupport;
       } else {
         this.radixSortSupport = null;
       }
@@ -277,6 +278,7 @@ public final class UnsafeInMemorySorter {
       this.offset = offset;
     }
 
+    @Override
     public SortedIterator clone() {
       SortedIterator iter = new SortedIterator(numRecords, offset);
       iter.position = position;

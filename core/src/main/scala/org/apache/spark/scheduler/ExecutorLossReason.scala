@@ -40,6 +40,10 @@ private[spark] object ExecutorExited {
   }
 }
 
+private[spark] object ExecutorLossMessage {
+  val decommissionFinished = "Finished decommissioning"
+}
+
 private[spark] object ExecutorKilled extends ExecutorLossReason("Executor killed by driver.")
 
 /**
@@ -73,6 +77,13 @@ case class ExecutorProcessLost(
  * If you update this code make sure to re-run the K8s integration tests.
  *
  * @param workerHost it is defined when the worker is decommissioned too
+ * @param reason detailed decommission message
  */
-private [spark] case class ExecutorDecommission(workerHost: Option[String] = None)
- extends ExecutorLossReason("Executor decommission.")
+private [spark] case class ExecutorDecommission(
+    workerHost: Option[String] = None,
+    reason: String = "")
+  extends ExecutorLossReason(ExecutorDecommission.msgPrefix + reason)
+
+private[spark] object ExecutorDecommission {
+  val msgPrefix = "Executor decommission: "
+}

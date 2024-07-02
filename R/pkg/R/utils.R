@@ -115,6 +115,7 @@ isRDD <- function(name, env) {
 #' hashCode("1") # 49
 #'}
 #' @note hashCode since 1.4.0
+#' @keywords internal
 hashCode <- function(key) {
   if (class(key) == "integer") {
     as.integer(key[[1]])
@@ -930,7 +931,7 @@ getOne <- function(x, envir, inherits = TRUE, ifnotfound = NULL) {
 }
 
 # Returns a vector of parent directories, traversing up count times, starting with a full path
-# eg. traverseParentDirs("/Users/user/Library/Caches/spark/spark2.2", 1) should return
+# e.g. traverseParentDirs("/Users/user/Library/Caches/spark/spark2.2", 1) should return
 # this "/Users/user/Library/Caches/spark/spark2.2"
 # and  "/Users/user/Library/Caches/spark"
 traverseParentDirs <- function(x, count) {

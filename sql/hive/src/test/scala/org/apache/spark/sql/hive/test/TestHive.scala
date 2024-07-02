@@ -19,16 +19,13 @@ package org.apache.spark.sql.hive.test
 
 import java.io.File
 import java.net.URI
-import java.util.{Set => JavaSet}
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.language.implicitConversions
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
-import org.apache.hadoop.hive.ql.exec.FunctionRegistry
 import org.apache.hadoop.hive.serde2.`lazy`.LazySimpleSerDe
 
 import org.apache.spark.{SparkConf, SparkContext}
@@ -41,9 +38,9 @@ import org.apache.spark.sql.catalyst.catalog.ExternalCatalogWithListener
 import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode
 import org.apache.spark.sql.catalyst.optimizer.ConvertToLocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, OneRowRelation}
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
-import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
-import org.apache.spark.sql.execution.command.CacheTableCommand
+import org.apache.spark.sql.execution.{CommandExecutionMode, QueryExecution, SQLExecution}
 import org.apache.spark.sql.hive._
 import org.apache.spark.sql.hive.client.HiveClient
 import org.apache.spark.sql.internal.{SessionState, SharedState, SQLConf, WithTestConf}
@@ -73,7 +70,9 @@ object TestHive
         // LocalRelation will exercise the optimization rules better by disabling it as
         // this rule may potentially block testing of other optimization rules such as
         // ConstantPropagation etc.
-        .set(SQLConf.OPTIMIZER_EXCLUDED_RULES.key, ConvertToLocalRelation.ruleName)))
+        .set(SQLConf.OPTIMIZER_EXCLUDED_RULES.key, ConvertToLocalRelation.ruleName))) {
+  override def conf: SQLConf = sparkSession.sessionState.conf
+}
 
 
 case class TestHiveVersion(hiveClient: HiveClient)
@@ -130,12 +129,12 @@ class TestHiveContext(
    * If loadTestTables is false, no test tables are loaded. Note that this flag can only be true
    * when running in the JVM, i.e. it needs to be false when calling from Python.
    */
-  def this(sc: SparkContext, loadTestTables: Boolean = true) {
-    this(new TestHiveSparkSession(HiveUtils.withHiveExternalCatalog(sc), loadTestTables))
+  def this(sc: SparkContext, loadTestTables: Boolean = true) = {
+    this(new TestHiveSparkSession(TestHiveContext.withHiveExternalCatalog(sc), loadTestTables))
   }
 
-  def this(sc: SparkContext, hiveClient: HiveClient) {
-    this(new TestHiveSparkSession(HiveUtils.withHiveExternalCatalog(sc),
+  def this(sc: SparkContext, hiveClient: HiveClient) = {
+    this(new TestHiveSparkSession(TestHiveContext.withHiveExternalCatalog(sc),
       hiveClient,
       loadTestTables = false))
   }
@@ -178,7 +177,7 @@ private[hive] class TestHiveSparkSession(
     private val loadTestTables: Boolean)
   extends SparkSession(sc) with Logging { self =>
 
-  def this(sc: SparkContext, loadTestTables: Boolean) {
+  def this(sc: SparkContext, loadTestTables: Boolean) = {
     this(
       sc,
       existingSharedState = None,
@@ -186,7 +185,7 @@ private[hive] class TestHiveSparkSession(
       loadTestTables)
   }
 
-  def this(sc: SparkContext, hiveClient: HiveClient, loadTestTables: Boolean) {
+  def this(sc: SparkContext, hiveClient: HiveClient, loadTestTables: Boolean) = {
     this(
       sc,
       existingSharedState = Some(new TestHiveSharedState(sc, Some(hiveClient))),
@@ -201,13 +200,13 @@ private[hive] class TestHiveSparkSession(
     val metastoreTempConf = HiveUtils.newTemporaryConfiguration(useInMemoryDerby = false) ++ Map(
       ConfVars.METASTORE_INTEGER_JDO_PUSHDOWN.varname -> "true",
       // scratch directory used by Hive's metastore client
-      ConfVars.SCRATCHDIR.varname -> TestHiveContext.makeScratchDir().toURI.toString,
+      "hive.exec.scratchdir" -> TestHiveContext.makeScratchDir().toURI.toString,
       ConfVars.METASTORE_CLIENT_CONNECT_RETRY_DELAY.varname -> "1") ++
       // After session cloning, the JDBC connect string for a JDBC metastore should not be changed.
       existingSharedState.map { state =>
         val connKey =
-          state.sparkContext.hadoopConfiguration.get(ConfVars.METASTORECONNECTURLKEY.varname)
-        ConfVars.METASTORECONNECTURLKEY.varname -> connKey
+          state.sparkContext.hadoopConfiguration.get("javax.jdo.option.ConnectionURL")
+        "javax.jdo.option.ConnectionURL" -> connKey
       }
 
     metastoreTempConf.foreach { case (k, v) =>
@@ -224,7 +223,7 @@ private[hive] class TestHiveSparkSession(
 
   @transient
   override lazy val sessionState: SessionState = {
-    new TestHiveSessionStateBuilder(this, parentSessionState, Map.empty).build()
+    new TestHiveSessionStateBuilder(this, parentSessionState).build()
   }
 
   lazy val metadataHive: HiveClient = {
@@ -328,20 +327,22 @@ private[hive] class TestHiveSparkSession(
   }
 
   if (loadTestTables) {
+    def createTableSQL(tblName: String): String = {
+      s"CREATE TABLE $tblName (key INT, value STRING) STORED AS textfile"
+    }
     // The test tables that are defined in the Hive QTestUtil.
     // /itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
     // https://github.com/apache/hive/blob/branch-0.13/data/scripts/q_test_init.sql
     @transient
     val hiveQTestUtilTables: Seq[TestTable] = Seq(
       TestTable("src",
-        "CREATE TABLE src (key INT, value STRING) STORED AS TEXTFILE".cmd,
+        createTableSQL("src").cmd,
         s"LOAD DATA LOCAL INPATH '${quoteHiveFile("data/files/kv1.txt")}' INTO TABLE src".cmd),
       TestTable("src1",
-        "CREATE TABLE src1 (key INT, value STRING) STORED AS TEXTFILE".cmd,
+        createTableSQL("src1").cmd,
         s"LOAD DATA LOCAL INPATH '${quoteHiveFile("data/files/kv3.txt")}' INTO TABLE src1".cmd),
       TestTable("srcpart", () => {
-        "CREATE TABLE srcpart (key INT, value STRING) PARTITIONED BY (ds STRING, hr STRING)"
-          .cmd.apply()
+        s"${createTableSQL("srcpart")} PARTITIONED BY (ds STRING, hr STRING)".cmd.apply()
         for (ds <- Seq("2008-04-08", "2008-04-09"); hr <- Seq("11", "12")) {
           s"""
              |LOAD DATA LOCAL INPATH '${quoteHiveFile("data/files/kv1.txt")}'
@@ -350,8 +351,7 @@ private[hive] class TestHiveSparkSession(
         }
       }),
       TestTable("srcpart1", () => {
-        "CREATE TABLE srcpart1 (key INT, value STRING) PARTITIONED BY (ds STRING, hr INT)"
-          .cmd.apply()
+        s"${createTableSQL("srcpart1")} PARTITIONED BY (ds STRING, hr INT)".cmd.apply()
         for (ds <- Seq("2008-04-08", "2008-04-09"); hr <- 11 to 12) {
           s"""
              |LOAD DATA LOCAL INPATH '${quoteHiveFile("data/files/kv1.txt")}'
@@ -496,7 +496,10 @@ private[hive] class TestHiveSparkSession(
   def getLoadedTables: collection.mutable.HashSet[String] = sharedState.loadedTables
 
   def loadTestTable(name: String): Unit = {
-    if (!sharedState.loadedTables.contains(name)) {
+    // LOAD DATA does not work on temporary views. Since temporary views are resolved first,
+    // skip loading if there exists a temporary view with the given name.
+    if (sessionState.catalog.getTempView(name).isEmpty &&
+        !sharedState.loadedTables.contains(name)) {
       // Marks the table as loaded first to prevent infinite mutually recursive table loading.
       sharedState.loadedTables += name
       logDebug(s"Loading test table $name")
@@ -521,21 +524,16 @@ private[hive] class TestHiveSparkSession(
   }
 
   /**
-   * Records the UDFs present when the server starts, so we can delete ones that are created by
-   * tests.
-   */
-  protected val originalUDFs: JavaSet[String] = FunctionRegistry.getFunctionNames
-
-  /**
    * Resets the test instance by deleting any table, view, temp view, and UDF that have been created
    */
   def reset(): Unit = {
     try {
       // HACK: Hive is too noisy by default.
-      org.apache.log4j.LogManager.getCurrentLoggers.asScala.foreach { log =>
-        val logger = log.asInstanceOf[org.apache.log4j.Logger]
-        if (!logger.getName.contains("org.apache.spark")) {
-          logger.setLevel(org.apache.log4j.Level.WARN)
+      org.apache.logging.log4j.LogManager.getContext(false)
+        .asInstanceOf[org.apache.logging.log4j.core.LoggerContext].getConfiguration.getLoggers()
+        .asScala.foreach { case (_, log) =>
+        if (!log.getName.contains("org.apache.spark")) {
+          log.setLevel(org.apache.logging.log4j.Level.WARN)
         }
       }
 
@@ -554,7 +552,7 @@ private[hive] class TestHiveSparkSession(
       // ${hive.scratch.dir.permission}. To resolve the permission issue, the simplest way is to
       // delete it. Later, it will be re-created with the right permission.
       val hadoopConf = sessionState.newHadoopConf()
-      val location = new Path(hadoopConf.get(ConfVars.SCRATCHDIR.varname))
+      val location = new Path(hadoopConf.get("hive.exec.scratchdir"))
       val fs = location.getFileSystem(hadoopConf)
       fs.delete(location, true)
 
@@ -581,27 +579,26 @@ private[hive] class TestHiveSparkSession(
 
 private[hive] class TestHiveQueryExecution(
     sparkSession: TestHiveSparkSession,
-    logicalPlan: LogicalPlan)
-  extends QueryExecution(sparkSession, logicalPlan) with Logging {
+    logicalPlan: LogicalPlan,
+    mode: CommandExecutionMode.Value = CommandExecutionMode.ALL)
+  extends QueryExecution(sparkSession, logicalPlan, mode = mode) with Logging {
 
-  def this(sparkSession: TestHiveSparkSession, sql: String) {
+  def this(sparkSession: TestHiveSparkSession, sql: String) = {
     this(sparkSession, sparkSession.sessionState.sqlParser.parsePlan(sql))
   }
 
-  def this(sql: String) {
+  def this(sql: String) = {
     this(TestHive.sparkSession, sql)
   }
 
   override lazy val analyzed: LogicalPlan = sparkSession.withActive {
-    val describedTables = logical match {
-      case CacheTableCommand(tbl, _, _, _) => tbl :: Nil
-      case _ => Nil
-    }
-
     // Make sure any test tables referenced are loaded.
-    val referencedTables =
-      describedTables ++
-        logical.collect { case UnresolvedRelation(ident, _, _) => ident.asTableIdentifier }
+    val referencedTables = logical.collect {
+      case UnresolvedRelation(ident, _, _) =>
+        if (ident.length > 1 && ident.head.equalsIgnoreCase(CatalogManager.SESSION_CATALOG_NAME)) {
+          ident.tail.asTableIdentifier
+        } else ident.asTableIdentifier
+    }
     val resolver = sparkSession.sessionState.conf.resolver
     val referencedTestTables = referencedTables.flatMap { tbl =>
       val testTableOpt = sparkSession.testTables.keys.find(resolver(_, tbl.table))
@@ -646,22 +643,26 @@ private[hive] object TestHiveContext {
     scratchDir
   }
 
+  private def withHiveExternalCatalog(sc: SparkContext): SparkContext = {
+    sc.conf.set(CATALOG_IMPLEMENTATION.key, "hive")
+    sc
+  }
 }
 
 private[sql] class TestHiveSessionStateBuilder(
     session: SparkSession,
-    state: Option[SessionState],
-    options: Map[String, String])
-  extends HiveSessionStateBuilder(session, state, options)
+    state: Option[SessionState])
+  extends HiveSessionStateBuilder(session, state)
   with WithTestConf {
 
   override def overrideConfs: Map[String, String] = TestHiveContext.overrideConfs
 
-  override def createQueryExecution: (LogicalPlan) => QueryExecution = { plan =>
-    new TestHiveQueryExecution(session.asInstanceOf[TestHiveSparkSession], plan)
-  }
+  override def createQueryExecution:
+    (LogicalPlan, CommandExecutionMode.Value) => QueryExecution =
+      (plan, mode) =>
+        new TestHiveQueryExecution(session.asInstanceOf[TestHiveSparkSession], plan, mode)
 
-  override protected def newBuilder: NewBuilder = new TestHiveSessionStateBuilder(_, _, Map.empty)
+  override protected def newBuilder: NewBuilder = new TestHiveSessionStateBuilder(_, _)
 }
 
 private[hive] object HiveTestJars {
@@ -680,7 +681,7 @@ private[hive] object HiveTestJars {
     val fileName = urlString.split("/").last
     val targetFile = new File(hiveTestJarsDir, fileName)
     if (!targetFile.exists()) {
-      Utils.doFetchFile(urlString, hiveTestJarsDir, fileName, new SparkConf, null, null)
+      Utils.doFetchFile(urlString, hiveTestJarsDir, fileName, new SparkConf, null)
     }
     targetFile
   }

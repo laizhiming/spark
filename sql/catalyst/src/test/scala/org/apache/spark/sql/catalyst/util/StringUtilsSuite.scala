@@ -128,4 +128,12 @@ class StringUtilsSuite extends SparkFunSuite with SQLHelper {
       assert(concat.toString === "plan fragment 0plan fragment 1... 15 more characters")
     }
   }
+
+  test("SPARK-43841: mix of multipart and single-part identifiers") {
+    val baseString = "b"
+    // mix of multipart and single-part
+    val testStrings = Seq(Seq("c1"), Seq("v1", "c2"), Seq("v2.c2"))
+    val expectedOutput = Seq("`c1`", "`v2.c2`", "`v1`.`c2`")
+    assert(orderSuggestedIdentifiersBySimilarity(baseString, testStrings) === expectedOutput)
+  }
 }

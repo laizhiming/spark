@@ -64,7 +64,8 @@ class OffsetSeqLog(sparkSession: SparkSession, path: String)
       case "" => None
       case md => Some(md)
     }
-    OffsetSeq.fill(metadata, lines.map(parseOffset).toArray: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    OffsetSeq.fill(metadata, lines.map(parseOffset).toArray.toImmutableArraySeq: _*)
   }
 
   override protected def serialize(offsetSeq: OffsetSeq, out: OutputStream): Unit = {
@@ -83,6 +84,10 @@ class OffsetSeqLog(sparkSession: SparkSession, path: String)
         case None => out.write(OffsetSeqLog.SERIALIZED_VOID_OFFSET.getBytes(UTF_8))
       }
     }
+  }
+
+  def offsetSeqMetadataForBatchId(batchId: Long): Option[OffsetSeqMetadata] = {
+    if (batchId < 0) None else get(batchId).flatMap(_.metadata)
   }
 }
 

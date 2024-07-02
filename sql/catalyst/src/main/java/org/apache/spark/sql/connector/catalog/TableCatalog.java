@@ -22,9 +22,13 @@ import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
+import org.apache.spark.sql.errors.QueryCompilationErrors;
+import org.apache.spark.sql.errors.QueryExecutionErrors;
 import org.apache.spark.sql.types.StructType;
 
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Catalog methods for working with Tables.
@@ -47,6 +51,17 @@ public interface TableCatalog extends CatalogPlugin {
   String PROP_LOCATION = "location";
 
   /**
+   * A reserved property to indicate that the table location is managed, not user-specified.
+   * If this property is "true", SHOW CREATE TABLE will not generate the LOCATION clause.
+   */
+  String PROP_IS_MANAGED_LOCATION = "is_managed_location";
+
+  /**
+   * A reserved property to specify a table was created with EXTERNAL.
+   */
+  String PROP_EXTERNAL = "external";
+
+  /**
    * A reserved property to specify the description of the table.
    */
   String PROP_COMMENT = "comment";
@@ -60,6 +75,16 @@ public interface TableCatalog extends CatalogPlugin {
    * A reserved property to specify the owner of the table.
    */
   String PROP_OWNER = "owner";
+
+  /**
+   * A prefix used to pass OPTIONS in table properties
+   */
+  String OPTION_PREFIX = "option.";
+
+  /**
+   * @return the set of capabilities for this TableCatalog
+   */
+  default Set<TableCatalogCapability> capabilities() { return Collections.emptySet(); }
 
   /**
    * List the tables in a namespace from the catalog.
@@ -83,6 +108,36 @@ public interface TableCatalog extends CatalogPlugin {
    * @throws NoSuchTableException If the table doesn't exist or is a view
    */
   Table loadTable(Identifier ident) throws NoSuchTableException;
+
+  /**
+   * Load table metadata of a specific version by {@link Identifier identifier} from the catalog.
+   * <p>
+   * If the catalog supports views and contains a view for the identifier and not a table, this
+   * must throw {@link NoSuchTableException}.
+   *
+   * @param ident a table identifier
+   * @param version version of the table
+   * @return the table's metadata
+   * @throws NoSuchTableException If the table doesn't exist or is a view
+   */
+  default Table loadTable(Identifier ident, String version) throws NoSuchTableException {
+    throw QueryCompilationErrors.noSuchTableError(ident);
+  }
+
+  /**
+   * Load table metadata at a specific time by {@link Identifier identifier} from the catalog.
+   * <p>
+   * If the catalog supports views and contains a view for the identifier and not a table, this
+   * must throw {@link NoSuchTableException}.
+   *
+   * @param ident a table identifier
+   * @param timestamp timestamp of the table, which is microseconds since 1970-01-01 00:00:00 UTC
+   * @return the table's metadata
+   * @throws NoSuchTableException If the table doesn't exist or is a view
+   */
+  default Table loadTable(Identifier ident, long timestamp) throws NoSuchTableException {
+    throw QueryCompilationErrors.noSuchTableError(ident);
+  }
 
   /**
    * Invalidate cached table metadata for an {@link Identifier identifier}.
@@ -114,21 +169,46 @@ public interface TableCatalog extends CatalogPlugin {
 
   /**
    * Create a table in the catalog.
-   *
-   * @param ident a table identifier
-   * @param schema the schema of the new table, as a struct type
-   * @param partitions transforms to use for partitioning data in the table
-   * @param properties a string map of table properties
-   * @return metadata for the new table
-   * @throws TableAlreadyExistsException If a table or view already exists for the identifier
-   * @throws UnsupportedOperationException If a requested partition transform is not supported
-   * @throws NoSuchNamespaceException If the identifier namespace does not exist (optional)
+   * <p>
+   * @deprecated This is deprecated. Please override
+   * {@link #createTable(Identifier, Column[], Transform[], Map)} instead.
    */
+  @Deprecated(since = "3.4.0")
   Table createTable(
       Identifier ident,
       StructType schema,
       Transform[] partitions,
       Map<String, String> properties) throws TableAlreadyExistsException, NoSuchNamespaceException;
+
+  /**
+   * Create a table in the catalog.
+   *
+   * @param ident a table identifier
+   * @param columns the columns of the new table.
+   * @param partitions transforms to use for partitioning data in the table
+   * @param properties a string map of table properties
+   * @return metadata for the new table. This can be null if getting the metadata for the new table
+   *         is expensive. Spark will call {@link #loadTable(Identifier)} if needed (e.g. CTAS).
+   *
+   * @throws TableAlreadyExistsException If a table or view already exists for the identifier
+   * @throws UnsupportedOperationException If a requested partition transform is not supported
+   * @throws NoSuchNamespaceException If the identifier namespace does not exist (optional)
+   */
+  default Table createTable(
+      Identifier ident,
+      Column[] columns,
+      Transform[] partitions,
+      Map<String, String> properties) throws TableAlreadyExistsException, NoSuchNamespaceException {
+    return createTable(ident, CatalogV2Util.v2ColumnsToStructType(columns), partitions, properties);
+  }
+
+  /**
+   * If true, mark all the fields of the query schema as nullable when executing
+   * CREATE/REPLACE TABLE ... AS SELECT ... and creating the table.
+   */
+  default boolean useNullableQuerySchema() {
+    return true;
+  }
 
   /**
    * Apply a set of {@link TableChange changes} to a table in the catalog.
@@ -143,7 +223,9 @@ public interface TableCatalog extends CatalogPlugin {
    *
    * @param ident a table identifier
    * @param changes changes to apply to the table
-   * @return updated metadata for the table
+   * @return updated metadata for the table. This can be null if getting the metadata for the
+   *         updated table is expensive. Spark always discard the returned table here.
+   *
    * @throws NoSuchTableException If the table doesn't exist or is a view
    * @throws IllegalArgumentException If any change is rejected by the implementation.
    */
@@ -161,6 +243,26 @@ public interface TableCatalog extends CatalogPlugin {
    * @return true if a table was deleted, false if no table exists for the identifier
    */
   boolean dropTable(Identifier ident);
+
+  /**
+   * Drop a table in the catalog and completely remove its data by skipping a trash even if it is
+   * supported.
+   * <p>
+   * If the catalog supports views and contains a view for the identifier and not a table, this
+   * must not drop the view and must return false.
+   * <p>
+   * If the catalog supports to purge a table, this method should be overridden.
+   * The default implementation throws {@link UnsupportedOperationException}.
+   *
+   * @param ident a table identifier
+   * @return true if a table was deleted, false if no table exists for the identifier
+   * @throws UnsupportedOperationException If table purging is not supported
+   *
+   * @since 3.1.0
+   */
+  default boolean purgeTable(Identifier ident) throws UnsupportedOperationException {
+    throw QueryExecutionErrors.unsupportedPurgeTableError();
+  }
 
   /**
    * Renames a table in the catalog.

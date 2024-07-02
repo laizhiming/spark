@@ -22,6 +22,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{Final, PartialMerge}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanExecBase
+import org.apache.spark.sql.execution.joins.BaseJoinExec
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 
@@ -35,7 +36,7 @@ import org.apache.spark.sql.internal.SQLConf
  * optimization to prune data. During physical planning, redundant project nodes can be removed
  * to simplify the query plan.
  */
-case class RemoveRedundantProjects(conf: SQLConf) extends Rule[SparkPlan] {
+object RemoveRedundantProjects extends Rule[SparkPlan] {
   def apply(plan: SparkPlan): SparkPlan = {
     if (!conf.getConf(SQLConf.REMOVE_REDUNDANT_PROJECTS_ENABLED)) {
       plan
@@ -47,8 +48,10 @@ case class RemoveRedundantProjects(conf: SQLConf) extends Rule[SparkPlan] {
   private def removeProject(plan: SparkPlan, requireOrdering: Boolean): SparkPlan = {
     plan match {
       case p @ ProjectExec(_, child) =>
-        if (isRedundant(p, child, requireOrdering)) {
+        if (isRedundant(p, child, requireOrdering) && canRemove(p, child)) {
           val newPlan = removeProject(child, requireOrdering)
+          // The `newPlan` should retain the logical plan link already. We call `setLogicalLink`
+          // here to make sure the `newPlan` sets the `LOGICAL_PLAN_TAG` tag.
           newPlan.setLogicalLink(child.logicalLink.get)
           newPlan
         } else {
@@ -62,13 +65,23 @@ case class RemoveRedundantProjects(conf: SQLConf) extends Rule[SparkPlan] {
         val keepOrdering = a.aggregateExpressions
           .exists(ae => ae.mode.equals(Final) || ae.mode.equals(PartialMerge))
         a.mapChildren(removeProject(_, keepOrdering))
-      // GenerateExec requires column ordering since it binds input rows directly with its
-      // requiredChildOutput without using child's output schema.
-      case g: GenerateExec => g.mapChildren(removeProject(_, true))
-      // JoinExec ordering requirement will inherit from its parent. If there is no ProjectExec in
-      // its ancestors, JoinExec should require output columns to be ordered.
-      case o => o.mapChildren(removeProject(_, requireOrdering))
+      case o =>
+        val required = if (canPassThrough(o)) requireOrdering else true
+        o.mapChildren(removeProject(_, requireOrdering = required))
     }
+  }
+
+  /**
+   * Check if the given node can pass the ordering requirement from its parent.
+   */
+  private def canPassThrough(plan: SparkPlan): Boolean = plan match {
+    case _: FilterExec => true
+    // JoinExec ordering requirement should inherit from its parent. If there is no ProjectExec in
+    // its ancestors, JoinExec should require output columns to be ordered, and vice versa.
+    case _: BaseJoinExec => true
+    case _: WindowExec => true
+    case _: ExpandExec => true
+    case _ => false
   }
 
   /**
@@ -86,6 +99,7 @@ case class RemoveRedundantProjects(conf: SQLConf) extends Rule[SparkPlan] {
       // If a DataSourceV2ScanExec node does not support columnar, a ProjectExec node is required
       // to convert the rows to UnsafeRow. See DataSourceV2Strategy for more details.
       case d: DataSourceV2ScanExecBase if !d.supportsColumnar => false
+      case FilterExec(_, d: DataSourceV2ScanExecBase) if !d.supportsColumnar => false
       case _ =>
         if (requireOrdering) {
           project.output.map(_.exprId.id) == child.output.map(_.exprId.id) &&
@@ -97,5 +111,12 @@ case class RemoveRedundantProjects(conf: SQLConf) extends Rule[SparkPlan] {
             checkNullability(orderedProjectOutput, orderedChildOutput)
         }
     }
+  }
+
+  // SPARK-36020: Currently a project can only be removed if (1) its logical link is empty or (2)
+  // its logical link is the same as the child's logical link. This is to ensure the physical
+  // plan node can correctly map to its logical plan node in AQE.
+  private def canRemove(project: ProjectExec, child: SparkPlan): Boolean = {
+    project.logicalLink.isEmpty || project.logicalLink.exists(child.logicalLink.contains)
   }
 }

@@ -19,13 +19,17 @@ package org.apache.spark.sql.sources
 
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.execution.FileSourceScanExec
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, DisableAdaptiveExecutionSuite, EnableAdaptiveExecutionSuite}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
 import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
+import org.apache.spark.tags.SlowSQLTest
 
+@SlowSQLTest
 class DisableUnnecessaryBucketedScanWithoutHiveSupportSuite
   extends DisableUnnecessaryBucketedScanSuite
-  with SharedSparkSession {
+  with SharedSparkSession
+  with DisableAdaptiveExecutionSuite {
 
   protected override def beforeAll(): Unit = {
     super.beforeAll()
@@ -33,7 +37,23 @@ class DisableUnnecessaryBucketedScanWithoutHiveSupportSuite
   }
 }
 
-abstract class DisableUnnecessaryBucketedScanSuite extends QueryTest with SQLTestUtils {
+@SlowSQLTest
+class DisableUnnecessaryBucketedScanWithoutHiveSupportSuiteAE
+  extends DisableUnnecessaryBucketedScanSuite
+  with SharedSparkSession
+  with EnableAdaptiveExecutionSuite {
+
+  protected override def beforeAll(): Unit = {
+    super.beforeAll()
+    assert(spark.sparkContext.conf.get(CATALOG_IMPLEMENTATION) == "in-memory")
+  }
+}
+
+abstract class DisableUnnecessaryBucketedScanSuite
+  extends QueryTest
+  with SQLTestUtils
+  with AdaptiveSparkPlanHelper {
+
   import testImplicits._
 
   private lazy val df1 =
@@ -48,7 +68,7 @@ abstract class DisableUnnecessaryBucketedScanSuite extends QueryTest with SQLTes
 
     def checkNumBucketedScan(query: String, expectedNumBucketedScan: Int): Unit = {
       val plan = sql(query).queryExecution.executedPlan
-      val bucketedScan = plan.collect { case s: FileSourceScanExec if s.bucketedScan => s }
+      val bucketedScan = collect(plan) { case s: FileSourceScanExec if s.bucketedScan => s }
       assert(bucketedScan.length == expectedNumBucketedScan)
     }
 
@@ -75,7 +95,7 @@ abstract class DisableUnnecessaryBucketedScanSuite extends QueryTest with SQLTes
         ("SELECT i FROM t1", 0, 1),
         ("SELECT j FROM t1", 0, 0),
         // Filter on bucketed column
-        ("SELECT * FROM t1 WHERE i = 1", 1, 1),
+        ("SELECT * FROM t1 WHERE i = 1", 0, 1),
         // Filter on non-bucketed column
         ("SELECT * FROM t1 WHERE j = 1", 0, 1),
         // Join with same buckets
@@ -215,6 +235,32 @@ abstract class DisableUnnecessaryBucketedScanSuite extends QueryTest with SQLTes
          """.stripMargin, 0, 0)
       ).foreach { case (query, numScanWithAutoScanEnabled, numScanWithAutoScanDisabled) =>
         checkDisableBucketedScan(query, numScanWithAutoScanEnabled, numScanWithAutoScanDisabled)
+      }
+    }
+  }
+
+  test("Aggregates with no groupby over tables having 1 BUCKET, return multiple rows") {
+    withTable("t1") {
+      withSQLConf(SQLConf.AUTO_BUCKETED_SCAN_ENABLED.key -> "true") {
+        sql(
+          """
+            |CREATE TABLE t1 (`id` BIGINT, `event_date` DATE)
+            |USING PARQUET
+            |CLUSTERED BY (id)
+            |INTO 1 BUCKETS
+            |""".stripMargin)
+        sql(
+          """
+            |INSERT INTO TABLE t1 VALUES(1.23, cast("2021-07-07" as date))
+            |""".stripMargin)
+        sql(
+          """
+            |INSERT INTO TABLE t1 VALUES(2.28, cast("2021-08-08" as date))
+            |""".stripMargin)
+        val df = spark.sql("select sum(id) from t1 where id is not null")
+        assert(df.count() == 1)
+        checkDisableBucketedScan(query = "SELECT SUM(id) FROM t1 WHERE id is not null",
+          expectedNumScanWithAutoScanEnabled = 1, expectedNumScanWithAutoScanDisabled = 1)
       }
     }
   }

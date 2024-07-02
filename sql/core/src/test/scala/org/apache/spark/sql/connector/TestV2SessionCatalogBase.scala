@@ -17,13 +17,13 @@
 
 package org.apache.spark.sql.connector
 
-import java.util
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.sql.catalyst.catalog.CatalogTableType
-import org.apache.spark.sql.connector.catalog.{DelegatingCatalogExtension, Identifier, Table, V1Table}
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, DelegatingCatalogExtension, Identifier, Table, TableCatalog, V1Table}
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.types.StructType
 
@@ -34,13 +34,20 @@ import org.apache.spark.sql.types.StructType
  */
 private[connector] trait TestV2SessionCatalogBase[T <: Table] extends DelegatingCatalogExtension {
 
-  protected val tables: util.Map[Identifier, T] = new ConcurrentHashMap[Identifier, T]()
+  protected val tables: java.util.Map[Identifier, T] = new ConcurrentHashMap[Identifier, T]()
+
+  private val tableCreated: AtomicBoolean = new AtomicBoolean(false)
+
+  private def addTable(ident: Identifier, table: T): Unit = {
+    tableCreated.set(true)
+    tables.put(ident, table)
+  }
 
   protected def newTable(
       name: String,
       schema: StructType,
       partitions: Array[Transform],
-      properties: util.Map[String, String]): T
+      properties: java.util.Map[String, String]): T
 
   override def loadTable(ident: Identifier): Table = {
     if (tables.containsKey(ident)) {
@@ -51,7 +58,7 @@ private[connector] trait TestV2SessionCatalogBase[T <: Table] extends Delegating
         case v1Table: V1Table if v1Table.v1Table.tableType == CatalogTableType.VIEW => v1Table
         case t =>
           val table = newTable(t.name(), t.schema(), t.partitioning(), t.properties())
-          tables.put(ident, table)
+          addTable(ident, table)
           table
       }
     }
@@ -59,12 +66,28 @@ private[connector] trait TestV2SessionCatalogBase[T <: Table] extends Delegating
 
   override def createTable(
       ident: Identifier,
-      schema: StructType,
+      columns: Array[Column],
       partitions: Array[Transform],
-      properties: util.Map[String, String]): Table = {
-    val created = super.createTable(ident, schema, partitions, properties)
-    val t = newTable(created.name(), schema, partitions, properties)
-    tables.put(ident, t)
+      properties: java.util.Map[String, String]): Table = {
+    import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.IdentifierHelper
+    val key = TestV2SessionCatalogBase.SIMULATE_ALLOW_EXTERNAL_PROPERTY
+    val propsWithLocation = if (properties.containsKey(key)) {
+      // Always set a location so that CREATE EXTERNAL TABLE won't fail with LOCATION not specified.
+      if (!properties.containsKey(TableCatalog.PROP_LOCATION)) {
+        val newProps = new java.util.HashMap[String, String]()
+        newProps.putAll(properties)
+        newProps.put(TableCatalog.PROP_LOCATION, "file:/abc")
+        newProps
+      } else {
+        properties
+      }
+    } else {
+      properties
+    }
+    super.createTable(ident, columns, partitions, propsWithLocation)
+    val schema = CatalogV2Util.v2ColumnsToStructType(columns)
+    val t = newTable(ident.quoted, schema, partitions, propsWithLocation)
+    addTable(ident, t)
     t
   }
 
@@ -74,8 +97,15 @@ private[connector] trait TestV2SessionCatalogBase[T <: Table] extends Delegating
   }
 
   def clearTables(): Unit = {
-    assert(!tables.isEmpty, "Tables were empty, maybe didn't use the session catalog code path?")
+    assert(
+      tableCreated.get,
+      "Tables are not created, maybe didn't use the session catalog code path?")
     tables.keySet().asScala.foreach(super.dropTable)
     tables.clear()
+    tableCreated.set(false)
   }
+}
+
+object TestV2SessionCatalogBase {
+  val SIMULATE_ALLOW_EXTERNAL_PROPERTY = "spark.sql.test.simulateAllowExternal"
 }

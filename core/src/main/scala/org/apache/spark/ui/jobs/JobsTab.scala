@@ -17,7 +17,7 @@
 
 package org.apache.spark.ui.jobs
 
-import javax.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.JobExecutionStatus
 import org.apache.spark.internal.config.SCHEDULER_MODE
@@ -30,6 +30,7 @@ private[ui] class JobsTab(parent: SparkUI, store: AppStatusStore)
   extends SparkUITab(parent, "jobs") {
 
   val sc = parent.sc
+  val conf = parent.conf
   val killEnabled = parent.killEnabled
 
   // Show pool information for only live UI.

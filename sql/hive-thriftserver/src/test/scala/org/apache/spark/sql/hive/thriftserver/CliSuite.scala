@@ -19,27 +19,30 @@ package org.apache.spark.sql.hive.thriftserver
 
 import java.io._
 import java.nio.charset.StandardCharsets
-import java.sql.Timestamp
-import java.util.Date
+import java.util.concurrent.CountDownLatch
 
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Promise
 import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
 
-import org.apache.hadoop.hive.conf.HiveConf.ConfVars
-import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
+import org.apache.hadoop.hive.cli.CliSessionState
+import org.apache.hadoop.hive.ql.session.SessionState
 
-import org.apache.spark.SparkFunSuite
-import org.apache.spark.internal.Logging
+import org.apache.spark.{ErrorMessageFormat, SparkConf, SparkContext, SparkFunSuite}
+import org.apache.spark.ProcessTestUtils.ProcessOutputCapturer
+import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
+import org.apache.spark.sql.hive.HiveUtils._
+import org.apache.spark.sql.hive.client.HiveClientImpl
 import org.apache.spark.sql.hive.test.HiveTestJars
-import org.apache.spark.sql.internal.StaticSQLConf
-import org.apache.spark.sql.test.ProcessTestUtils.ProcessOutputCapturer
+import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.util.{ThreadUtils, Utils}
 
 /**
  * A test suite for the `spark-sql` CLI tool.
  */
-class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
+class CliSuite extends SparkFunSuite {
   val warehousePath = Utils.createTempDir()
   val metastorePath = Utils.createTempDir()
   val scratchDirPath = Utils.createTempDir()
@@ -75,7 +78,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
    *                       `hive.metastore.warehouse.dir`.
    * @param useExternalHiveFile whether to load the hive-site.xml from `src/test/noclasspath` or
    *                            not, disabled by default
-   * @param metastore which path the embedded derby database for metastore locates. Use the the
+   * @param metastore which path the embedded derby database for metastore locates. Use the
    *                  global `metastorePath` by default
    * @param queriesAndExpectedAnswers one or more tuples of query + answer
    */
@@ -85,7 +88,8 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
       errorResponses: Seq[String] = Seq("Error:"),
       maybeWarehouse: Option[File] = Some(warehousePath),
       useExternalHiveFile: Boolean = false,
-      metastore: File = metastorePath)(
+      metastore: File = metastorePath,
+      prompt: String = "spark-sql>")(
       queriesAndExpectedAnswers: (String, String)*): Unit = {
 
     // Explicitly adds ENTER for each statement to make sure they are actually entered into the CLI.
@@ -98,10 +102,8 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
           Seq(answer)
         } else {
           // spark-sql echoes the submitted queries
-          val queryEcho = query.split("\n").toList match {
-            case firstLine :: tail =>
-              s"spark-sql> $firstLine" :: tail.map(l => s"         > $l")
-          }
+          val xs = query.split("\n").toList
+          val queryEcho = s"$prompt ${xs.head}" :: xs.tail.map(l => s"         > $l")
           // longer lines sometimes get split in the output,
           // match the first 60 characters of each query line
           queryEcho.map(_.take(60)) :+ answer
@@ -114,7 +116,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
       ""
     }
     val warehouseConf =
-      maybeWarehouse.map(dir => s"--hiveconf ${ConfVars.METASTOREWAREHOUSE}=$dir").getOrElse("")
+      maybeWarehouse.map(dir => s"--hiveconf hive.metastore.warehouse.dir=$dir").getOrElse("")
     val command = {
       val cliScript = "../../bin/spark-sql".split("/").mkString(File.separator)
       val jdbcUrl = s"jdbc:derby:;databaseName=$metastore;create=true"
@@ -123,8 +125,9 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
          |  --driver-java-options -Dderby.system.durability=test
          |  $extraHive
          |  --conf spark.ui.enabled=false
-         |  --hiveconf ${ConfVars.METASTORECONNECTURLKEY}=$jdbcUrl
-         |  --hiveconf ${ConfVars.SCRATCHDIR}=$scratchDirPath
+         |  --conf ${SQLConf.LEGACY_EMPTY_CURRENT_DB_IN_CLI.key}=true
+         |  --hiveconf javax.jdo.option.ConnectionURL=$jdbcUrl
+         |  --hiveconf hive.exec.scratchdir=$scratchDirPath
          |  --hiveconf conf1=conftest
          |  --hiveconf conf2=1
          |  $warehouseConf
@@ -138,11 +141,8 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     val lock = new Object
 
     def captureOutput(source: String)(line: String): Unit = lock.synchronized {
-      // This test suite sometimes gets extremely slow out of unknown reason on Jenkins.  Here we
-      // add a timestamp to provide more diagnosis information.
-      val newLine = s"${new Timestamp(new Date().getTime)} - $source> $line"
-      log.info(newLine)
-      buffer += newLine
+      logInfo(s"$source> $line")
+      buffer += line
 
       if (line.startsWith("Spark master: ") && line.contains("Application Id: ")) {
         foundMasterAndApplicationIdMessage.trySuccess(())
@@ -158,7 +158,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
         }
       } else {
         errorResponses.foreach { r =>
-          if (line.contains(r)) {
+          if (line.contains(r) && !line.contains("IntentionallyFaultyConnectionProvider")) {
             foundAllExpectedAnswers.tryFailure(
               new RuntimeException(s"Failed with error line '$line'"))
           }
@@ -191,7 +191,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
       ThreadUtils.awaitResult(foundAllExpectedAnswers.future, timeoutForQuery)
       log.info("Found all expected output.")
     } catch { case cause: Throwable =>
-      val message =
+      val message = lock.synchronized {
         s"""
            |=======================
            |CliSuite failure output
@@ -205,6 +205,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
            |End CliSuite failure output
            |===========================
          """.stripMargin
+      }
       logError(message, cause)
       fail(message, cause)
     } finally {
@@ -249,7 +250,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     try {
       runCliWithin(2.minute,
         extraArgs =
-          Seq("--conf", s"spark.hadoop.${ConfVars.METASTOREWAREHOUSE}=$sparkWareHouseDir"),
+          Seq("--conf", s"spark.hadoop.hive.metastore.warehouse.dir=$sparkWareHouseDir"),
         maybeWarehouse = None,
         useExternalHiveFile = true,
         metastore = metastore)(
@@ -260,7 +261,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
 
       // override conf from --hiveconf too
       runCliWithin(2.minute,
-        extraArgs = Seq("--conf", s"spark.${ConfVars.METASTOREWAREHOUSE}=$sparkWareHouseDir"),
+        extraArgs = Seq("--conf", s"spark.hive.metastore.warehouse.dir=$sparkWareHouseDir"),
         metastore = metastore)(
         "desc database default;" -> sparkWareHouseDir.getAbsolutePath,
         "create database cliTestDb;" -> "",
@@ -279,7 +280,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
       runCliWithin(2.minute,
         extraArgs = Seq(
             "--conf", s"${StaticSQLConf.WAREHOUSE_PATH.key}=${sparkWareHouseDir}1",
-            "--conf", s"spark.hadoop.${ConfVars.METASTOREWAREHOUSE}=${sparkWareHouseDir}2"),
+            "--conf", s"spark.hadoop.hive.metastore.warehouse.dir=${sparkWareHouseDir}2"),
         metastore = metastore)(
         "desc database default;" -> sparkWareHouseDir.getAbsolutePath.concat("1"))
     } finally {
@@ -361,7 +362,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     val hiveContribJar = HiveTestJars.getHiveHcatalogCoreJar().getCanonicalPath
     runCliWithin(
       3.minute,
-      Seq("--conf", s"spark.hadoop.${ConfVars.HIVEAUXJARS}=$hiveContribJar"))(
+      Seq("--conf", s"spark.hadoop.hive.aux.jars.path=$hiveContribJar"))(
       """CREATE TABLE addJarWithHiveAux(key string, val string)
         |ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe';""".stripMargin
         -> "",
@@ -381,11 +382,10 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     )
   }
 
-  test("SPARK-11188 Analysis error reporting") {
+  testRetry("SPARK-11188 Analysis error reporting") {
     runCliWithin(timeout = 2.minute,
       errorResponses = Seq("AnalysisException"))(
-      "select * from nonexistent_table;"
-        -> "Error in query: Table or view not found: nonexistent_table;"
+      "select * from nonexistent_table;" -> "nonexistent_table"
     )
   }
 
@@ -441,7 +441,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     val hiveContribJar = HiveTestJars.getHiveContribJar().getCanonicalPath
     runCliWithin(
       1.minute,
-      Seq("--conf", s"spark.hadoop.${ConfVars.HIVEAUXJARS}=$hiveContribJar"))(
+      Seq("--conf", s"spark.hadoop.hive.aux.jars.path=$hiveContribJar"))(
       "CREATE TEMPORARY FUNCTION example_format AS " +
         "'org.apache.hadoop.hive.contrib.udf.example.UDFExampleFormat';" -> "",
       "SELECT example_format('%o', 93);" -> "135"
@@ -465,7 +465,7 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     runCliWithin(
       2.minutes,
       Seq("--jars", s"$jarFile", "--conf",
-        s"spark.hadoop.${ConfVars.HIVEAUXJARS}=$hiveContribJar"))(
+        s"spark.hadoop.hive.aux.jars.path=$hiveContribJar"))(
       "CREATE TEMPORARY FUNCTION testjar AS" +
         " 'org.apache.spark.sql.hive.execution.UDTFStack';" -> "",
       "SELECT testjar(1,'TEST-SPARK-TEST-jar', 28840);" -> "TEST-SPARK-TEST-jar\t28840",
@@ -550,27 +550,280 @@ class CliSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
     )
   }
 
-  test("AnalysisException with root cause will be printStacktrace") {
+  testRetry("SparkException with root cause will be printStacktrace") {
     // If it is not in silent mode, will print the stacktrace
     runCliWithin(
       1.minute,
       extraArgs = Seq("--hiveconf", "hive.session.silent=false",
-        "-e", "select date_sub(date'2011-11-11', '1.2');"),
-      errorResponses = Seq("NumberFormatException"))(
-      ("", "Error in query: The second argument of 'date_sub' function needs to be an integer."),
-      ("", "NumberFormatException: invalid input syntax for type numeric: 1.2"))
+        "-e", "select from_json('a', 'a INT', map('mode', 'FAILFAST'));"),
+      errorResponses = Seq("JsonParseException"))(
+      ("", "SparkException: [MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION]"),
+      ("", "JsonParseException: Unrecognized token 'a'"))
     // If it is in silent mode, will print the error message only
     runCliWithin(
       1.minute,
       extraArgs = Seq("--conf", "spark.hive.session.silent=true",
-        "-e", "select date_sub(date'2011-11-11', '1.2');"),
-      errorResponses = Seq("AnalysisException"))(
-      ("", "Error in query: The second argument of 'date_sub' function needs to be an integer."))
+        "-e", "select from_json('a', 'a INT', map('mode', 'FAILFAST'));"),
+      errorResponses = Seq("SparkException"))(
+      ("", "SparkException: [MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION]"))
   }
 
   test("SPARK-30808: use Java 8 time API in Thrift SQL CLI by default") {
     // If Java 8 time API is enabled via the SQL config `spark.sql.datetime.java8API.enabled`,
     // the date formatter for `java.sql.LocalDate` must output negative years with sign.
     runCliWithin(1.minute)("SELECT MAKE_DATE(-44, 3, 15);" -> "-0044-03-15")
+  }
+
+  testRetry("SPARK-33100: Ignore a semicolon inside a bracketed comment in spark-sql") {
+    runCliWithin(1.minute)(
+      "/* SELECT 'test';*/ SELECT 'test';" -> "test",
+      ";;/* SELECT 'test';*/ SELECT 'test';" -> "test",
+      "/* SELECT 'test';*/;; SELECT 'test';" -> "test",
+      "SELECT 'test'; -- SELECT 'test';" -> "test",
+      "SELECT 'test'; /* SELECT 'test';*/;" -> "test",
+      "/*$meta chars{^\\;}*/ SELECT 'test';" -> "test",
+      "/*\nmulti-line\n*/ SELECT 'test';" -> "test",
+      "/*/* multi-level bracketed*/ SELECT 'test';" -> "test"
+    )
+  }
+
+  test("SPARK-33100: test sql statements with hint in bracketed comment") {
+    runCliWithin(2.minute)(
+      "CREATE TEMPORARY VIEW t1 AS SELECT * FROM VALUES(1, 2) AS t1(k, v);" -> "",
+      "CREATE TEMPORARY VIEW t2 AS SELECT * FROM VALUES(2, 1) AS t2(k, v);" -> "",
+      "EXPLAIN SELECT /*+ MERGEJOIN(t1) */ t1.* FROM t1 JOIN t2 ON t1.k = t2.v;" -> "SortMergeJoin",
+      "EXPLAIN SELECT /* + MERGEJOIN(t1) */ t1.* FROM t1 JOIN t2 ON t1.k = t2.v;"
+        -> "BroadcastHashJoin"
+    )
+  }
+
+  test("SPARK-35086: --verbose should be passed to Spark SQL CLI") {
+    runCliWithin(2.minute, Seq("--verbose"))(
+      "SELECT 'SPARK-35086' AS c1, '--verbose' AS c2;" ->
+        "SELECT 'SPARK-35086' AS c1, '--verbose' AS c2"
+    )
+  }
+
+  test("SPARK-35102: Make spark.sql.hive.version meaningful and not deprecated") {
+    runCliWithin(1.minute,
+      Seq("--conf", "spark.sql.hive.version=0.1"),
+      Seq(s"please use ${HIVE_METASTORE_VERSION.key}"))("" -> "")
+    runCliWithin(2.minute,
+      Seq("--conf", s"${BUILTIN_HIVE_VERSION.key}=$builtinHiveVersion"))(
+      s"set ${BUILTIN_HIVE_VERSION.key};" -> builtinHiveVersion, "SET -v;" -> builtinHiveVersion)
+  }
+
+  test("SPARK-37471: spark-sql support nested bracketed comment ") {
+    runCliWithin(1.minute)(
+      """
+        |/* SELECT /*+ HINT() */ 4; */
+        |SELECT 1;
+        |""".stripMargin -> "SELECT 1"
+    )
+  }
+
+  testRetry("SPARK-37555: spark-sql should pass last unclosed comment to backend") {
+    runCliWithin(1.minute)(
+      // Only unclosed comment.
+      "/* SELECT /*+ HINT() 4; */;".stripMargin -> "Syntax error at or near ';'",
+      // Unclosed nested bracketed comment.
+      "/* SELECT /*+ HINT() 4; */ SELECT 1;".stripMargin -> "1",
+      // Unclosed comment with query.
+      "/* Here is a unclosed bracketed comment SELECT 1;"->
+        "Found an unclosed bracketed comment. Please, append */ at the end of the comment.",
+      // Whole comment.
+      "/* SELECT /*+ HINT() */ 4; */;".stripMargin -> ""
+    )
+  }
+
+  testRetry("SPARK-37694: delete [jar|file|archive] shall use spark sql processor") {
+    runCliWithin(2.minute, errorResponses = Seq("ParseException"))(
+      "delete jar dummy.jar;" ->
+        "Syntax error at or near 'jar': missing 'FROM'. SQLSTATE: 42601 (line 1, pos 7)")
+  }
+
+  test("SPARK-37906: Spark SQL CLI should not pass final comment") {
+    val sparkConf = new SparkConf(loadDefaults = true)
+      .setMaster("local-cluster[1,1,1024]")
+      .setAppName("SPARK-37906")
+    val sparkContext = new SparkContext(sparkConf)
+    SparkSQLEnv.sparkContext = sparkContext
+    val hadoopConf = SparkHadoopUtil.get.newConfiguration(sparkConf)
+    val cliConf = HiveClientImpl.newHiveConf(sparkConf, hadoopConf)
+    val sessionState = new CliSessionState(cliConf)
+    SessionState.setCurrentSessionState(sessionState)
+    val cli = new SparkSQLCLIDriver
+    Seq("SELECT 1; --comment" -> Seq("SELECT 1"),
+      "SELECT 1; /* comment */" -> Seq("SELECT 1"),
+      "SELECT 1; /* comment" -> Seq("SELECT 1", " /* comment"),
+      "SELECT 1; /* comment select 1;" -> Seq("SELECT 1", " /* comment select 1;"),
+      "/* This is a comment without end symbol SELECT 1;" ->
+        Seq("/* This is a comment without end symbol SELECT 1;"),
+      "SELECT 1; --comment\n" -> Seq("SELECT 1"),
+      "SELECT 1; /* comment */\n" -> Seq("SELECT 1"),
+      "SELECT 1; /* comment\n" -> Seq("SELECT 1", " /* comment\n"),
+      "SELECT 1; /* comment select 1;\n" -> Seq("SELECT 1", " /* comment select 1;\n"),
+      "/* This is a comment without end symbol SELECT 1;\n" ->
+        Seq("/* This is a comment without end symbol SELECT 1;\n"),
+      "/* comment */ SELECT 1;" -> Seq("/* comment */ SELECT 1"),
+      "SELECT /* comment */  1;" -> Seq("SELECT /* comment */  1"),
+      "-- comment " -> Seq(),
+      "-- comment \nSELECT 1" -> Seq("-- comment \nSELECT 1"),
+      "/*  comment */  " -> Seq()
+    ).foreach { case (query, ret) =>
+      assert(cli.splitSemiColon(query).asScala === ret)
+    }
+    sessionState.close()
+    SparkSQLEnv.stop()
+  }
+
+  testRetry("SPARK-39068: support in-memory catalog and running concurrently") {
+    val extraConf = Seq("-c", s"${StaticSQLConf.CATALOG_IMPLEMENTATION.key}=in-memory")
+    val cd = new CountDownLatch(2)
+    def t: Thread = new Thread {
+      override def run(): Unit = {
+        // catalog is in-memory and isolated, so that we can create table with duplicated
+        // names.
+        runCliWithin(1.minute, extraArgs = extraConf)(
+          "create table src(key int) using hive;" ->
+            "NOT_SUPPORTED_COMMAND_WITHOUT_HIVE_SUPPORT",
+          "create table src(key int) using parquet;" -> "")
+        cd.countDown()
+      }
+    }
+    t.start()
+    t.start()
+    cd.await()
+  }
+
+  // scalastyle:off line.size.limit
+  testRetry("formats of error messages") {
+    def check(format: ErrorMessageFormat.Value, errorMessage: String, silent: Boolean): Unit = {
+      val expected = errorMessage.split(System.lineSeparator()).map("" -> _)
+      import org.apache.spark.util.ArrayImplicits._
+      runCliWithin(
+        1.minute,
+        extraArgs = Seq(
+          "--conf", s"spark.hive.session.silent=$silent",
+          "--conf", s"${SQLConf.ERROR_MESSAGE_FORMAT.key}=$format",
+          "--conf", s"${SQLConf.ANSI_ENABLED.key}=true",
+          "-e", "select 1 / 0"),
+        errorResponses = Seq("DIVIDE_BY_ZERO"))(expected.toImmutableArraySeq: _*)
+    }
+    check(
+      format = ErrorMessageFormat.PRETTY,
+      errorMessage =
+        """[DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set "spark.sql.ansi.enabled" to "false" to bypass this error.
+          |== SQL (line 1, position 8) ==
+          |select 1 / 0
+          |       ^^^^^
+          |""".stripMargin,
+      silent = true)
+    check(
+      format = ErrorMessageFormat.PRETTY,
+      errorMessage =
+        """[DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set "spark.sql.ansi.enabled" to "false" to bypass this error.
+          |== SQL (line 1, position 8) ==
+          |select 1 / 0
+          |       ^^^^^
+          |
+          |org.apache.spark.SparkArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set "spark.sql.ansi.enabled" to "false" to bypass this error.
+          |""".stripMargin,
+      silent = false)
+    Seq(true, false).foreach { silent =>
+      check(
+        format = ErrorMessageFormat.MINIMAL,
+        errorMessage =
+          """{
+            |  "errorClass" : "DIVIDE_BY_ZERO",
+            |  "sqlState" : "22012",
+            |  "messageParameters" : {
+            |    "config" : "\"spark.sql.ansi.enabled\""
+            |  },
+            |  "queryContext" : [ {
+            |    "objectType" : "",
+            |    "objectName" : "",
+            |    "startIndex" : 8,
+            |    "stopIndex" : 12,
+            |    "fragment" : "1 / 0"
+            |  } ]
+            |}""".stripMargin,
+        silent)
+      check(
+        format = ErrorMessageFormat.STANDARD,
+        errorMessage =
+          """{
+            |  "errorClass" : "DIVIDE_BY_ZERO",
+            |  "messageTemplate" : "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set <config> to \"false\" to bypass this error.",
+            |  "sqlState" : "22012",
+            |  "messageParameters" : {
+            |    "config" : "\"spark.sql.ansi.enabled\""
+            |  },
+            |  "queryContext" : [ {
+            |    "objectType" : "",
+            |    "objectName" : "",
+            |    "startIndex" : 8,
+            |    "stopIndex" : 12,
+            |    "fragment" : "1 / 0"
+            |  } ]
+            |}""".stripMargin,
+        silent)
+    }
+  }
+  // scalastyle:on line.size.limit
+
+  test("SPARK-35242: Support change catalog default database for spark") {
+    // Create db and table first
+    runCliWithin(2.minute,
+      Seq("--conf", s"${StaticSQLConf.WAREHOUSE_PATH.key}=${sparkWareHouseDir}"))(
+      "create database spark_35242;" -> "",
+      "use spark_35242;" -> "",
+      "CREATE TABLE spark_test(key INT, val STRING);" -> "")
+
+    // Set default db
+    runCliWithin(2.minute,
+      Seq("--conf", s"${StaticSQLConf.WAREHOUSE_PATH.key}=${sparkWareHouseDir}",
+          "--conf", s"${StaticSQLConf.CATALOG_DEFAULT_DATABASE.key}=spark_35242"))(
+      "show tables;" -> "spark_test")
+  }
+
+  test("SPARK-42448: Print correct database in prompt") {
+    runCliWithin(
+      2.minute,
+      Seq("--conf", s"${SQLConf.LEGACY_EMPTY_CURRENT_DB_IN_CLI.key}=false"),
+      prompt = "spark-sql (default)>")(
+      "set abc;" -> "abc\t<undefined>",
+      "create database spark_42448;" -> "")
+
+    runCliWithin(
+      2.minute,
+      Seq("--conf", s"${SQLConf.LEGACY_EMPTY_CURRENT_DB_IN_CLI.key}=false", "--database",
+        "spark_42448"),
+      prompt = "spark-sql (spark_42448)>")(
+      "select current_database();" -> "spark_42448")
+  }
+
+  test("SPARK-42823: multipart identifier support for specify database by --database option") {
+    val catalogName = "testcat"
+    val catalogImpl = s"spark.sql.catalog.$catalogName=${classOf[JDBCTableCatalog].getName}"
+    val catalogUrl =
+      s"spark.sql.catalog.$catalogName.url=jdbc:derby:memory:$catalogName;create=true"
+    val catalogDriver =
+      s"spark.sql.catalog.$catalogName.driver=org.apache.derby.iapi.jdbc.AutoloadedDriver"
+    val catalogConfigs =
+      Seq(catalogImpl, catalogDriver, catalogUrl, "spark.sql.catalogImplementation=in-memory")
+        .flatMap(Seq("--conf", _))
+    runCliWithin(
+      2.minute,
+      catalogConfigs ++ Seq("--database", s"$catalogName.SYS"))(
+      "SELECT CURRENT_CATALOG();" -> catalogName,
+      "SELECT CURRENT_SCHEMA();" -> "SYS")
+
+    runCliWithin(
+      2.minute,
+      catalogConfigs ++
+        Seq("--conf", s"spark.sql.defaultCatalog=$catalogName", "--database", "SYS"))(
+      "SELECT CURRENT_CATALOG();" -> catalogName,
+      "SELECT CURRENT_SCHEMA();" -> "SYS")
   }
 }

@@ -20,12 +20,13 @@ package org.apache.spark.rpc.netty
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap, CountDownLatch}
 import javax.annotation.concurrent.GuardedBy
 
-import scala.collection.JavaConverters._
 import scala.concurrent.Promise
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
-import org.apache.spark.SparkException
-import org.apache.spark.internal.Logging
+import org.apache.spark.{SparkEnv, SparkException}
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.network.client.RpcResponseCallback
 import org.apache.spark.rpc._
 
@@ -123,7 +124,8 @@ private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int) exte
       val name = iter.next
         postMessage(name, message, (e) => { e match {
           case e: RpcEnvStoppedException => logDebug(s"Message $message dropped. ${e.getMessage}")
-          case e: Throwable => logWarning(s"Message $message dropped. ${e.getMessage}")
+          case e: Throwable =>
+            logWarning(log"Message ${MDC(MESSAGE, message)} dropped. ${MDC(ERROR, e.getMessage)}")
         }}
       )}
   }
@@ -147,13 +149,16 @@ private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int) exte
   /** Posts a one-way message. */
   def postOneWayMessage(message: RequestMessage): Unit = {
     postMessage(message.receiver.name, OneWayMessage(message.senderAddress, message.content),
-      (e) => e match {
+      {
         // SPARK-31922: in local cluster mode, there's always a RpcEnvStoppedException when
         // stop is called due to some asynchronous message handling. We catch the exception
         // and log it at debug level to avoid verbose error message when user stop a local
         // cluster in spark shell.
         case re: RpcEnvStoppedException => logDebug(s"Message $message dropped. ${re.getMessage}")
-        case _ => throw e
+        case e if SparkEnv.get.isStopped =>
+          logWarning(log"Message ${MDC(MESSAGE, message)} dropped due to sparkEnv " +
+            log"is stopped. ${MDC(ERROR, e.getMessage)}")
+        case e => throw e
       })
   }
 

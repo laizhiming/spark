@@ -171,7 +171,7 @@ abstract class HiveComparisonTest extends SparkFunSuite with BeforeAndAfterAll {
       // and does not return it as a query answer.
       case _: SetCommand => Seq("0")
       case _: ExplainCommand => answer
-      case _: DescribeCommandBase | ShowColumnsCommand(_, _) =>
+      case _: DescribeCommandBase | ShowColumnsCommand(_, _, _) =>
         // Filter out non-deterministic lines and lines which do not have actual results but
         // can introduce problems because of the way Hive formats these lines.
         // Then, remove empty lines. Do not sort the results.
@@ -364,7 +364,7 @@ abstract class HiveComparisonTest extends SparkFunSuite with BeforeAndAfterAll {
           }
         }
 
-        (queryList, hiveResults, catalystResults).zipped.foreach {
+        queryList.lazyZip(hiveResults).lazyZip(catalystResults).foreach {
           case (query, hive, (hiveQuery, catalyst)) =>
             // Check that the results match unless its an EXPLAIN query.
             val preparedHive = prepareAnswer(hiveQuery, hive)

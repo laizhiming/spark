@@ -22,11 +22,11 @@ import java.io.File
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
-import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.sql.hive.test.TestHive
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
 import org.apache.spark.tags.SlowHiveTest
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Runs the test cases that are included in the hive distribution.
@@ -41,11 +41,14 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
   private val originalInMemoryPartitionPruning = TestHive.conf.inMemoryPartitionPruning
   private val originalCrossJoinEnabled = TestHive.conf.crossJoinEnabled
   private val originalSessionLocalTimeZone = TestHive.conf.sessionLocalTimeZone
-  private val originalLegacyAllowCastNumericToTimestamp =
-    TestHive.conf.legacyAllowCastNumericToTimestamp
+  private val originalAnsiMode = TestHive.conf.getConf(SQLConf.ANSI_ENABLED)
+  private val originalStoreAssignmentPolicy =
+    TestHive.conf.getConf(SQLConf.STORE_ASSIGNMENT_POLICY)
+  private val originalCreateHiveTable =
+    TestHive.conf.getConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT)
 
   def testCases: Seq[(String, File)] = {
-    hiveQueryDir.listFiles.map(f => f.getName.stripSuffix(".q") -> f)
+    hiveQueryDir.listFiles.map(f => f.getName.stripSuffix(".q") -> f).toImmutableArraySeq
   }
 
   override def beforeAll(): Unit = {
@@ -57,13 +60,14 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     TestHive.setConf(SQLConf.IN_MEMORY_PARTITION_PRUNING, true)
     // Ensures that cross joins are enabled so that we can test them
     TestHive.setConf(SQLConf.CROSS_JOINS_ENABLED, true)
-    // Ensures that the table insertion behaivor is consistent with Hive
+    // Hive doesn't follow ANSI Standard.
+    TestHive.setConf(SQLConf.ANSI_ENABLED, false)
+    // Ensures that the table insertion behavior is consistent with Hive
     TestHive.setConf(SQLConf.STORE_ASSIGNMENT_POLICY, StoreAssignmentPolicy.LEGACY.toString)
     // Fix session local timezone to America/Los_Angeles for those timezone sensitive tests
     // (timestamp_*)
     TestHive.setConf(SQLConf.SESSION_LOCAL_TIMEZONE, "America/Los_Angeles")
-    // Ensures that cast numeric to timestamp enabled so that we can test them
-    TestHive.setConf(SQLConf.LEGACY_ALLOW_CAST_NUMERIC_TO_TIMESTAMP, true)
+    TestHive.setConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT, true)
     RuleExecutor.resetMetrics()
   }
 
@@ -74,8 +78,9 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
       TestHive.setConf(SQLConf.IN_MEMORY_PARTITION_PRUNING, originalInMemoryPartitionPruning)
       TestHive.setConf(SQLConf.CROSS_JOINS_ENABLED, originalCrossJoinEnabled)
       TestHive.setConf(SQLConf.SESSION_LOCAL_TIMEZONE, originalSessionLocalTimeZone)
-      TestHive.setConf(SQLConf.LEGACY_ALLOW_CAST_NUMERIC_TO_TIMESTAMP,
-        originalLegacyAllowCastNumericToTimestamp)
+      TestHive.setConf(SQLConf.ANSI_ENABLED, originalAnsiMode)
+      TestHive.setConf(SQLConf.STORE_ASSIGNMENT_POLICY, originalStoreAssignmentPolicy)
+      TestHive.setConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT, originalCreateHiveTable)
 
       // For debugging dump some statistics about how much time was spent in various optimizer rules
       logWarning(RuleExecutor.dumpTimeSpent())
@@ -146,6 +151,10 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     // Hive returns null for minute('2015-03-18')
     "udf_minute",
 
+    // Hive DESC FUNCTION returns a string to indicate undefined function, while Spark triggers a
+    // query error.
+    "udf_index",
+    "udf_stddev_pop",
 
     // Cant run without local map/reduce.
     "index_auto_update",
@@ -308,7 +317,7 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     // Unsupported underscore syntax.
     "inputddl5",
 
-    // Thift is broken...
+    // Thrift is broken...
     "inputddl8",
 
     // Hive changed ordering of ddl:
@@ -499,7 +508,7 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "drop_partitions_filter2",
     "drop_partitions_filter3",
 
-    // The following failes due to truncate table
+    // The following fails due to truncate table
     "truncate_table",
 
     // We do not support DFS command.
@@ -719,7 +728,7 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "groupby_multi_insert_common_distinct",
     "groupby_multi_single_reducer2",
     "groupby_multi_single_reducer3",
-    "groupby_mutli_insert_common_distinct",
+    "groupby_multi_insert_common_distinct",
     "groupby_neg_float",
     "groupby_ppd",
     "groupby_ppr",
@@ -961,8 +970,8 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "subq2",
     "subquery_exists",
     "subquery_exists_having",
-    "subquery_notexists",
-    "subquery_notexists_having",
+    "subquery_nonexistent",
+    "subquery_nonexistent_having",
     "subquery_in_having",
     "tablename_with_select",
     "timestamp_comparison",

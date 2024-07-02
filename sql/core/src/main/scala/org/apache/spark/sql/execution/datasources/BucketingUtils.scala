@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.datasources
 
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SpecificInternalRow, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
+import org.apache.spark.sql.types.{DataType, StringType}
 
 object BucketingUtils {
   // The file name of bucketed data should have 3 parts:
@@ -32,6 +33,9 @@ object BucketingUtils {
   // An example of bucketed parquet file name with bucket id 3:
   //   part-r-00000-2dd664f9-d2c4-4ffe-878f-c6c70c1fb0cb_00003.gz.parquet
   private val bucketedFileName = """.*_(\d+)(?:\..*)?$""".r
+
+  // The reserved option name for data source to write Hive-compatible bucketed table
+  val optionForHiveCompatibleBucketWrite = "__hive_compatible_bucketed_table_insertion__"
 
   def getBucketId(fileName: String): Option[Int] = fileName match {
     case bucketedFileName(bucketId) => Some(bucketId.toInt)
@@ -47,6 +51,11 @@ object BucketingUtils {
       HashPartitioning(Seq(bucketColumn), numBuckets).partitionIdExpression :: Nil,
       bucketColumn :: Nil)
     bucketIdGenerator(mutableInternalRow).getInt(0)
+  }
+
+  def canBucketOn(dataType: DataType): Boolean = dataType match {
+    case st: StringType => st.supportsBinaryOrdering
+    case other => true
   }
 
   def bucketIdToString(id: Int): String = f"_$id%05d"

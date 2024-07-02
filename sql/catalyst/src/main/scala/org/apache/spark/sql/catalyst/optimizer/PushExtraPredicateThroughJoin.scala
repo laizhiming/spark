@@ -17,11 +17,13 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.expressions.{And, Expression, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.trees.TreePattern.JOIN
 
 /**
  * Try pushing down disjunctive join condition into left and right child.
@@ -37,7 +39,8 @@ object PushExtraPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHel
     case _ => false
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(JOIN), ruleId) {
     case j @ Join(left, right, joinType, Some(joinCondition), hint)
         if canPushThrough(joinType) =>
       val alreadyProcessed = j.getTagValue(processedJoinConditionTag).exists { condition =>
@@ -69,7 +72,7 @@ object PushExtraPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHel
           case LeftOuter | LeftAnti | ExistenceJoin(_) =>
             Join(left, newRight, joinType, Some(joinCondition), hint)
           case other =>
-            throw new IllegalStateException(s"Unexpected join type: $other")
+            throw SparkException.internalError(s"Unexpected join type: $other")
         }
         newJoin.setTagValue(processedJoinConditionTag, joinCondition)
         newJoin

@@ -92,7 +92,7 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
       val attr = Attribute.fromStructField(rows.head.schema("labelIndex"))
         .asInstanceOf[NominalAttribute]
       assert(attr.values.get === Array("a", "c", "b"))
-      assert(rows.seq === expected.collect().toSeq)
+      assert(rows === expected.collect().toSeq)
     }
   }
 
@@ -139,7 +139,7 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
       val attrSkip = Attribute.fromStructField(rows.head.schema("labelIndex"))
         .asInstanceOf[NominalAttribute]
       assert(attrSkip.values.get === Array("b", "a"))
-      assert(rows.seq === expectedSkip.collect().toSeq)
+      assert(rows === expectedSkip.collect().toSeq)
     }
 
     indexer.setHandleInvalid("keep")
@@ -483,6 +483,6 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
 
     val metadata = spark.read.json(s"$modelPath/metadata")
     val sparkVersionStr = metadata.select("sparkVersion").first().getString(0)
-    assert(sparkVersionStr == "2.4.4")
+    assert(sparkVersionStr === "2.4.4")
   }
 }

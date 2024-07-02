@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.hive.thriftserver.ui
 
+import java.io.File
 import java.util.Properties
 
 import org.mockito.Mockito.{mock, RETURNS_SMART_NULLS}
@@ -33,6 +34,15 @@ import org.apache.spark.util.kvstore.InMemoryStore
 class HiveThriftServer2ListenerSuite extends SparkFunSuite with BeforeAndAfter {
 
   private var kvstore: ElementTrackingStore = _
+
+  protected override def beforeAll(): Unit = {
+    val tmpDirName = System.getProperty("java.io.tmpdir")
+    val tmpDir = new File(tmpDirName)
+    if (!tmpDir.exists()) {
+      tmpDir.mkdirs()
+    }
+    super.beforeAll()
+  }
 
   after {
     if (kvstore != null) {
@@ -151,6 +161,7 @@ class HiveThriftServer2ListenerSuite extends SparkFunSuite with BeforeAndAfter {
       "stmt", "groupId", 0))
     listener.onOtherEvent(SparkListenerThriftServerOperationParsed(unknownOperation, "query"))
     listener.onOtherEvent(SparkListenerThriftServerOperationCanceled(unknownOperation, 0))
+    listener.onOtherEvent(SparkListenerThriftServerOperationTimeout(unknownOperation, 0))
     listener.onOtherEvent(SparkListenerThriftServerOperationError(unknownOperation,
       "msg", "trace", 0))
     listener.onOtherEvent(SparkListenerThriftServerOperationFinish(unknownOperation, 0))
@@ -172,7 +183,7 @@ class HiveThriftServer2ListenerSuite extends SparkFunSuite with BeforeAndAfter {
     if (live) {
       val server = mock(classOf[HiveThriftServer2], RETURNS_SMART_NULLS)
       val listener = new HiveThriftServer2Listener(kvstore, sparkConf, Some(server))
-      (new HiveThriftServer2AppStatusStore(kvstore, Some(listener)), listener)
+      (new HiveThriftServer2AppStatusStore(kvstore), listener)
     } else {
       (new HiveThriftServer2AppStatusStore(kvstore),
         new HiveThriftServer2Listener(kvstore, sparkConf, None, false))

@@ -24,8 +24,8 @@ import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.SECONDS_PER_DAY
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{withDefaultTimeZone, LA}
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.{LegacyBehaviorPolicy, ParquetOutputTimestampType}
+import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
+import org.apache.spark.sql.internal.SQLConf.ParquetOutputTimestampType
 
 object DateTime extends Enumeration {
   type DateTime = Value
@@ -37,10 +37,11 @@ object DateTime extends Enumeration {
  * To run this benchmark:
  * {{{
  *   1. without sbt:
- *      bin/spark-submit --class <this class> --jars <spark core test jar> <sql core test jar>
- *   2. build/sbt "sql/test:runMain <this class>"
+ *      bin/spark-submit --class <this class>
+ *        --jars <spark core test jar>,<spark catalyst test jar> <sql core test jar>
+ *   2. build/sbt "sql/Test/runMain <this class>"
  *   3. generate result:
- *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/test:runMain <this class>"
+ *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/Test/runMain <this class>"
  *      Results will be written to "benchmarks/DateTimeRebaseBenchmark-results.txt".
  * }}}
  */
@@ -165,7 +166,8 @@ object DateTimeRebaseBenchmark extends SqlBasedBenchmark {
                   benchmark.addCase(caseName(modernDates, dateTime, Some(mode)), 1) { _ =>
                     withSQLConf(
                       SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key -> getOutputType(dateTime),
-                      SQLConf.LEGACY_PARQUET_REBASE_MODE_IN_WRITE.key -> mode.toString) {
+                      SQLConf.PARQUET_REBASE_MODE_IN_WRITE.key -> mode.toString,
+                      SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE.key -> mode.toString) {
                       genDF(rowsNum, dateTime, modernDates)
                         .write
                         .mode("overwrite")

@@ -20,8 +20,10 @@ package org.apache.spark.sql.catalyst.expressions.aggregate
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A central moment is the expected value of a specified power of the deviation of a random
@@ -45,21 +47,20 @@ import org.apache.spark.sql.types._
  * @param child to compute central moments of.
  */
 abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
-  extends DeclarativeAggregate with ImplicitCastInputTypes {
+  extends DeclarativeAggregate with ImplicitCastInputTypes with UnaryLike[Expression] {
 
   /**
    * The central moment order to be computed.
    */
   protected def momentOrder: Int
 
-  override def children: Seq[Expression] = Seq(child)
   override def nullable: Boolean = true
   override def dataType: DataType = DoubleType
   override def inputTypes: Seq[AbstractDataType] = Seq(DoubleType)
 
   protected val n = AttributeReference("n", DoubleType, nullable = false)()
   protected val avg = AttributeReference("avg", DoubleType, nullable = false)()
-  protected val m2 = AttributeReference("m2", DoubleType, nullable = false)()
+  protected[sql] val m2 = AttributeReference("m2", DoubleType, nullable = false)()
   protected val m3 = AttributeReference("m3", DoubleType, nullable = false)()
   protected val m4 = AttributeReference("m4", DoubleType, nullable = false)()
 
@@ -74,7 +75,8 @@ abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
 
   override val aggBufferAttributes = trimHigherOrder(Seq(n, avg, m2, m3, m4))
 
-  override val initialValues: Seq[Expression] = Array.fill(momentOrder + 1)(Literal(0.0))
+  override val initialValues: Seq[Expression] =
+    Array.fill(momentOrder + 1)(Literal(0.0)).toImmutableArraySeq
 
   override lazy val updateExpressions: Seq[Expression] = updateExpressionsDef
 
@@ -167,6 +169,9 @@ case class StddevPop(
   }
 
   override def prettyName: String = "stddev_pop"
+
+  override protected def withNewChildInternal(newChild: Expression): StddevPop =
+    copy(child = newChild)
 }
 
 // Compute the sample standard deviation of a column
@@ -197,6 +202,9 @@ case class StddevSamp(
 
   override def prettyName: String =
     getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("stddev_samp")
+
+  override protected def withNewChildInternal(newChild: Expression): StddevSamp =
+    copy(child = newChild)
 }
 
 // Compute the population variance of a column
@@ -223,6 +231,9 @@ case class VariancePop(
   }
 
   override def prettyName: String = "var_pop"
+
+  override protected def withNewChildInternal(newChild: Expression): VariancePop =
+    copy(child = newChild)
 }
 
 // Compute the sample variance of a column
@@ -250,6 +261,22 @@ case class VarianceSamp(
   }
 
   override def prettyName: String = getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("var_samp")
+
+  override protected def withNewChildInternal(newChild: Expression): VarianceSamp =
+    copy(child = newChild)
+}
+
+case class RegrReplacement(child: Expression)
+  extends CentralMomentAgg(child, !SQLConf.get.legacyStatisticalAggregate) {
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType), m2)
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): RegrReplacement =
+    copy(child = newChild)
 }
 
 @ExpressionDescription(
@@ -278,6 +305,9 @@ case class Skewness(
     If(n === 0.0, Literal.create(null, DoubleType),
       If(m2 === 0.0, divideByZeroEvalResult, sqrt(n) * m3 / sqrt(m2 * m2 * m2)))
   }
+
+  override protected def withNewChildInternal(newChild: Expression): Skewness =
+    copy(child = newChild)
 }
 
 @ExpressionDescription(
@@ -306,4 +336,114 @@ case class Kurtosis(
   }
 
   override def prettyName: String = "kurtosis"
+
+  override protected def withNewChildInternal(newChild: Expression): Kurtosis =
+    copy(child = newChild)
+}
+
+/**
+ * Standard deviation in Pandas' fashion.
+ * This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nanstd.
+ */
+case class PandasStddev(
+    child: Expression,
+    ddof: Int)
+  extends CentralMomentAgg(child, true) {
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === ddof.toDouble, divideByZeroEvalResult, sqrt(m2 / (n - ddof.toDouble))))
+  }
+
+  override def prettyName: String = "pandas_stddev"
+
+  override protected def withNewChildInternal(newChild: Expression): PandasStddev =
+    copy(child = newChild)
+}
+
+/**
+ * Variance in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nanvar.
+ */
+case class PandasVariance(
+    child: Expression,
+    ddof: Int)
+  extends CentralMomentAgg(child, true) {
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === ddof.toDouble, divideByZeroEvalResult, m2 / (n - ddof.toDouble)))
+  }
+
+  override def prettyName: String = "pandas_variance"
+
+  override protected def withNewChildInternal(newChild: Expression): PandasVariance =
+    copy(child = newChild)
+}
+
+/**
+ * Skewness in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nanskew.
+ */
+case class PandasSkewness(child: Expression)
+  extends CentralMomentAgg(child, true) {
+
+  override def prettyName: String = "pandas_skewness"
+
+  override protected def momentOrder = 3
+
+  override val evaluateExpression: Expression = {
+    // floating point error
+    //
+    // Pandas #18044 in _libs/windows.pyx calc_skew follow this behavior
+    // to fix the fperr to treat m2 <1e-14 as zero
+    //
+    // see https://github.com/pandas-dev/pandas/issues/18044 for details
+    val _m2 = If(abs(m2) < 1e-14, Literal(0.0), m2)
+    val _m3 = If(abs(m3) < 1e-14, Literal(0.0), m3)
+
+    If(n < 3.0, Literal.create(null, DoubleType),
+      If(_m2 === 0.0, Literal(0.0), sqrt(n - 1.0) * (n / (n - 2.0)) * _m3 / sqrt(_m2 * _m2 * _m2)))
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): PandasSkewness =
+    copy(child = newChild)
+}
+
+/**
+ * Kurtosis in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nankurt.
+ */
+case class PandasKurtosis(child: Expression)
+  extends CentralMomentAgg(child, true) {
+
+  override protected def momentOrder = 4
+
+  override val evaluateExpression: Expression = {
+    val adj = ((n - 1.0) / (n - 2.0)) * ((n - 1.0) / (n - 3.0)) * 3.0
+    val numerator = n * (n + 1.0) * (n - 1.0) * m4
+    val denominator = (n - 2.0) * (n - 3.0) * m2 * m2
+
+    // floating point error
+    //
+    // Pandas #18044 in _libs/windows.pyx calc_kurt follow this behavior
+    // to fix the fperr to treat denom <1e-14 as zero
+    //
+    // see https://github.com/pandas-dev/pandas/issues/18044 for details
+    val _numerator = If(abs(numerator) < 1e-14, Literal(0.0), numerator)
+    val _denominator = If(abs(denominator) < 1e-14, Literal(0.0), denominator)
+
+    If(n < 4.0, Literal.create(null, DoubleType),
+      If(_denominator === 0.0, Literal(0.0), _numerator / _denominator - adj))
+  }
+
+  override def prettyName: String = "pandas_kurtosis"
+
+  override protected def withNewChildInternal(newChild: Expression): PandasKurtosis =
+    copy(child = newChild)
 }

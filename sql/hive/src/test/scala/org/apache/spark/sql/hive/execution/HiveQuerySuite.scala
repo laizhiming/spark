@@ -19,12 +19,11 @@ package org.apache.spark.sql.hive.execution
 
 import java.io.File
 import java.net.URI
+import java.nio.file.Files
 import java.sql.Timestamp
-import java.util.Locale
 
 import scala.util.Try
 
-import org.apache.commons.lang3.{JavaVersion, SystemUtils}
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
 import org.scalatest.BeforeAndAfter
 
@@ -34,7 +33,7 @@ import org.apache.spark.sql.catalyst.expressions.Cast
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.execution.joins.BroadcastNestedLoopJoinExec
-import org.apache.spark.sql.hive._
+import org.apache.spark.sql.hive.HiveUtils.{builtinHiveVersion => hiveVersion}
 import org.apache.spark.sql.hive.test.{HiveTestJars, TestHive}
 import org.apache.spark.sql.hive.test.TestHive._
 import org.apache.spark.sql.internal.SQLConf
@@ -72,9 +71,17 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
     }
   }
 
-  private def assertUnsupportedFeature(body: => Unit): Unit = {
-    val e = intercept[ParseException] { body }
-    assert(e.getMessage.toLowerCase(Locale.ROOT).contains("operation not allowed"))
+  private def assertUnsupportedFeature(
+      body: => Unit,
+      operation: String,
+      expectedContext: ExpectedContext): Unit = {
+    checkError(
+      exception = intercept[ParseException] {
+        body
+      },
+      errorClass = "INVALID_STATEMENT_OR_CLAUSE",
+      parameters = Map("operation" -> operation),
+      context = expectedContext)
   }
 
   // Testing the Broadcast based join for cartesian join (cross join)
@@ -153,16 +160,6 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
       |  SELECT key FROM gen_tmp ORDER BY key ASC;
     """.stripMargin)
 
-  test("multiple generators in projection") {
-    intercept[AnalysisException] {
-      sql("SELECT explode(array(key, key)), explode(array(key, key)) FROM src").collect()
-    }
-
-    intercept[AnalysisException] {
-      sql("SELECT explode(array(key, key)) as k1, explode(array(key, key)) FROM src").collect()
-    }
-  }
-
   createQueryTest("! operator",
     """
       |SELECT a FROM (
@@ -209,7 +206,7 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
       |FROM src LIMIT 1""".stripMargin)
 
   test("constant null testing timestamp") {
-    var r1 = sql(
+    val r1 = sql(
       """
         |SELECT IF(FALSE, CAST(NULL AS TIMESTAMP),
         |CAST('1969-12-31 16:00:01' AS TIMESTAMP)) AS COL20
@@ -235,17 +232,19 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   createQueryTest("no from clause",
     "SELECT 1, +1, -1")
 
-  createQueryTest("boolean = number",
-    """
-      |SELECT
-      |  1 = true, 1L = true, 1Y = true, true = 1, true = 1L, true = 1Y,
-      |  0 = true, 0L = true, 0Y = true, true = 0, true = 0L, true = 0Y,
-      |  1 = false, 1L = false, 1Y = false, false = 1, false = 1L, false = 1Y,
-      |  0 = false, 0L = false, 0Y = false, false = 0, false = 0L, false = 0Y,
-      |  2 = true, 2L = true, 2Y = true, true = 2, true = 2L, true = 2Y,
-      |  2 = false, 2L = false, 2Y = false, false = 2, false = 2L, false = 2Y
-      |FROM src LIMIT 1
+  if (!conf.ansiEnabled) {
+    createQueryTest("boolean = number",
+      """
+        |SELECT
+        |  1 = true, 1L = true, 1Y = true, true = 1, true = 1L, true = 1Y,
+        |  0 = true, 0L = true, 0Y = true, true = 0, true = 0L, true = 0Y,
+        |  1 = false, 1L = false, 1Y = false, false = 1, false = 1L, false = 1Y,
+        |  0 = false, 0L = false, 0Y = false, false = 0, false = 0L, false = 0Y,
+        |  2 = true, 2L = true, 2Y = true, true = 2, true = 2L, true = 2Y,
+        |  2 = false, 2L = false, 2Y = false, false = 2, false = 2L, false = 2Y
+        |FROM src LIMIT 1
     """.stripMargin)
+  }
 
   test("CREATE TABLE AS runs once") {
     sql("CREATE TABLE foo AS SELECT 1 FROM src LIMIT 1").collect()
@@ -281,11 +280,13 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   createQueryTest("Constant Folding Optimization for AVG_SUM_COUNT",
     "SELECT AVG(0), SUM(0), COUNT(null), COUNT(value) FROM src GROUP BY key")
 
-  createQueryTest("Cast Timestamp to Timestamp in UDF",
-    """
-      | SELECT DATEDIFF(CAST(value AS timestamp), CAST('2002-03-21 00:00:00' AS timestamp))
-      | FROM src LIMIT 1
+  if (!conf.ansiEnabled) {
+    createQueryTest("Cast Timestamp to Timestamp in UDF",
+      """
+        | SELECT DATEDIFF(CAST(value AS timestamp), CAST('2002-03-21 00:00:00' AS timestamp))
+        | FROM src LIMIT 1
     """.stripMargin)
+  }
 
   createQueryTest("Date comparison test 1",
     """
@@ -368,7 +369,7 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
 
   test("SPARK-7270: consider dynamic partition when comparing table output") {
     withTable("test_partition", "ptest") {
-      sql(s"CREATE TABLE test_partition (a STRING) PARTITIONED BY (b BIGINT, c STRING)")
+      sql(s"CREATE TABLE test_partition (a STRING) USING HIVE PARTITIONED BY (b BIGINT, c STRING)")
       sql(s"CREATE TABLE ptest (a STRING, b BIGINT, c STRING)")
 
       val analyzedPlan = sql(
@@ -515,8 +516,10 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   createQueryTest("Specify the udtf output",
     "SELECT d FROM (SELECT explode(array(1,1)) d FROM src LIMIT 1) t")
 
-  createQueryTest("SPARK-9034 Reflect field names defined in GenericUDTF #1",
-    "SELECT col FROM (SELECT explode(array(key,value)) FROM src LIMIT 1) t")
+  if (!conf.ansiEnabled) {
+    createQueryTest("SPARK-9034 Reflect field names defined in GenericUDTF #1",
+      "SELECT col FROM (SELECT explode(array(key,value)) FROM src LIMIT 1) t")
+  }
 
   createQueryTest("SPARK-9034 Reflect field names defined in GenericUDTF #2",
     "SELECT key,value FROM (SELECT explode(map(key,value)) FROM src LIMIT 1) t")
@@ -679,9 +682,12 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   // TODO: adopt this test when Spark SQL has the functionality / framework to report errors.
   // See https://github.com/apache/spark/pull/1055#issuecomment-45820167 for a discussion.
   ignore("non-boolean conditions in a CaseWhen are illegal") {
-    intercept[Exception] {
-      sql("SELECT (CASE WHEN key > 2 THEN 3 WHEN 1 THEN 2 ELSE 0 END) FROM src").collect()
-    }
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("SELECT (CASE WHEN key > 2 THEN 3 WHEN 1 THEN 2 ELSE 0 END) FROM src").collect()
+      },
+      errorClass = null,
+      parameters = Map.empty)
   }
 
   createQueryTest("case sensitivity when query Hive table",
@@ -756,20 +762,20 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   test("SPARK-5383 alias for udfs with multi output columns") {
     assert(
       sql("select stack(2, key, value, key, value) as (a, b) from src limit 5")
-        .collect()
-        .size == 5)
+        .collect().length == 5)
 
     assert(
       sql("select a, b from (select stack(2, key, value, key, value) as (a, b) from src) t limit 5")
-        .collect()
-        .size == 5)
+        .collect().length == 5)
   }
 
   test("SPARK-5367: resolve star expression in udf") {
-    assert(sql("select concat(*) from src limit 5").collect().size == 5)
-    assert(sql("select array(*) from src limit 5").collect().size == 5)
-    assert(sql("select concat(key, *) from src limit 5").collect().size == 5)
-    assert(sql("select array(key, *) from src limit 5").collect().size == 5)
+    assert(sql("select concat(*) from src limit 5").collect().length == 5)
+    assert(sql("select concat(key, *) from src limit 5").collect().length == 5)
+    if (!conf.ansiEnabled) {
+      assert(sql("select array(*) from src limit 5").collect().length == 5)
+      assert(sql("select array(key, *) from src limit 5").collect().length == 5)
+    }
   }
 
   test("Exactly once semantics for DDL and command statements") {
@@ -798,14 +804,17 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   }
 
   test("ADD JAR command") {
-    val testJar = TestHive.getHiveFile("data/files/TestSerDe.jar").getCanonicalPath
-    sql("CREATE TABLE alter1(a INT, b INT)")
-    intercept[Exception] {
-      sql(
-        """ALTER TABLE alter1 SET SERDE 'org.apache.hadoop.hive.serde2.TestSerDe'
-          |WITH serdeproperties('s1'='9')
-        """.stripMargin)
-    }
+    sql("CREATE TABLE alter1(a INT, b INT) USING HIVE")
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql(
+          """ALTER TABLE alter1 SET SERDE 'org.apache.hadoop.hive.serde2.TestSerDe'
+            |WITH serdeproperties('s1'='9')""".stripMargin)
+      },
+      errorClass = "_LEGACY_ERROR_TEMP_3065",
+      parameters = Map(
+        "clazz" -> "org.apache.hadoop.hive.ql.metadata.HiveException",
+        "msg" -> "at least one column must be specified for the table"))
     sql("DROP TABLE alter1")
   }
 
@@ -829,6 +838,18 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
     assert(sql(s"list jar $testJar").count() == 1)
   }
 
+  test("SPARK-34955: ADD JAR should treat paths which contains white spaces") {
+    withTempDir { dir =>
+      val file = File.createTempFile("someprefix1", "somesuffix1", dir)
+      Files.write(file.toPath, "test_file1".getBytes)
+      val jarFile = new File(dir, "test file.jar")
+      TestUtils.createJar(Seq(file), jarFile)
+      sql(s"ADD JAR '${jarFile.getAbsolutePath}'")
+      assert(sql("LIST JARS").
+        filter(_.getString(0).contains(s"${jarFile.getName}".replace(" ", "%20"))).count() > 0)
+    }
+  }
+
   test("CREATE TEMPORARY FUNCTION") {
     val funcJar = TestHive.getHiveFile("TestUDTF.jar")
     val jarURL = funcJar.toURI.toURL
@@ -837,7 +858,7 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
       """CREATE TEMPORARY FUNCTION udtf_count2 AS
         |'org.apache.spark.sql.hive.execution.GenericUDTFCount2'
       """.stripMargin)
-    assert(sql("DESCRIBE FUNCTION udtf_count2").count > 1)
+    assert(sql("DESCRIBE FUNCTION udtf_count2").count() > 1)
     sql("DROP TEMPORARY FUNCTION udtf_count2")
   }
 
@@ -855,6 +876,273 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
     assert(sql("list file").
       filter(_.getString(0).contains("data/files/v1.txt")).count() > 0)
     assert(sql(s"list file $testFile").count() == 1)
+  }
+
+  test("ADD ARCHIVE/LIST ARCHIVES commands") {
+    withTempDir { dir =>
+      val file1 = File.createTempFile("someprefix1", "somesuffix1", dir)
+      val file2 = File.createTempFile("someprefix2", "somesuffix2", dir)
+
+      Files.write(file1.toPath, "file1".getBytes)
+      Files.write(file2.toPath, "file2".getBytes)
+
+      val zipFile = new File(dir, "test.zip")
+      val jarFile = new File(dir, "test.jar")
+      TestUtils.createJar(Seq(file1), zipFile)
+      TestUtils.createJar(Seq(file2), jarFile)
+
+      sql(s"ADD ARCHIVE ${zipFile.getAbsolutePath}#foo")
+      sql(s"ADD ARCHIVE ${jarFile.getAbsolutePath}#bar")
+
+      val checkAddArchive =
+        sparkContext.parallelize(
+          Seq(
+            "foo",
+            s"foo/${file1.getName}",
+            "nonexistence",
+            "bar",
+            s"bar/${file2.getName}"), 1).map { name =>
+          val file = new File(SparkFiles.get(name))
+          val contents =
+            if (file.isFile) {
+              Some(String.join("", new String(Files.readAllBytes(file.toPath))))
+            } else {
+              None
+            }
+          (name, file.canRead, contents)
+        }.collect()
+
+      assert(checkAddArchive(0) === ("foo", true, None))
+      assert(checkAddArchive(1) === (s"foo/${file1.getName}", true, Some("file1")))
+      assert(checkAddArchive(2) === ("nonexistence", false, None))
+      assert(checkAddArchive(3) === ("bar", true, None))
+      assert(checkAddArchive(4) === (s"bar/${file2.getName}", true, Some("file2")))
+      assert(sql("list archives").
+        filter(_.getString(0).contains(s"${zipFile.getAbsolutePath}")).count() > 0)
+      assert(sql("list archive").
+        filter(_.getString(0).contains(s"${jarFile.getAbsolutePath}")).count() > 0)
+      assert(sql(s"list archive ${zipFile.getAbsolutePath}").count() === 1)
+      assert(sql(s"list archives ${zipFile.getAbsolutePath} nonexistence").count() === 1)
+      assert(sql(s"list archives ${zipFile.getAbsolutePath} " +
+        s"${jarFile.getAbsolutePath}").count() === 2)
+    }
+  }
+
+  test("ADD ARCHIVE/List ARCHIVES commands - unsupported archive formats") {
+    withTempDir { dir =>
+      val file1 = File.createTempFile("someprefix1", "somesuffix1", dir)
+      val file2 = File.createTempFile("someprefix2", "somesuffix2", dir)
+
+      Files.write(file1.toPath, "file1".getBytes)
+      Files.write(file2.toPath, "file2".getBytes)
+
+      // Emulate unsupported archive formats with .bz2 and .xz suffix.
+      val bz2File = new File(dir, "test.bz2")
+      val xzFile = new File(dir, "test.xz")
+      TestUtils.createJar(Seq(file1), bz2File)
+      TestUtils.createJar(Seq(file2), xzFile)
+
+      sql(s"ADD ARCHIVE ${bz2File.getAbsolutePath}#foo")
+      sql(s"ADD ARCHIVE ${xzFile.getAbsolutePath}#bar")
+
+      val checkAddArchive =
+        sparkContext.parallelize(
+          Seq(
+            "foo",
+            "bar"), 1).map { name =>
+          val file = new File(SparkFiles.get(name))
+          val contents =
+            if (file.isFile) {
+              Some(Files.readAllBytes(file.toPath).toSeq)
+            } else {
+              None
+            }
+          (name, file.canRead, contents)
+        }.collect()
+
+      assert(checkAddArchive(0) === ("foo", true, Some(Files.readAllBytes(bz2File.toPath).toSeq)))
+      assert(checkAddArchive(1) === ("bar", true, Some(Files.readAllBytes(xzFile.toPath).toSeq)))
+      assert(sql("list archives").
+        filter(_.getString(0).contains(s"${bz2File.getAbsolutePath}")).count() > 0)
+      assert(sql("list archive").
+        filter(_.getString(0).contains(s"${xzFile.getAbsolutePath}")).count() > 0)
+      assert(sql(s"list archive ${bz2File.getAbsolutePath}").count() === 1)
+      assert(sql(s"list archives ${bz2File.getAbsolutePath} " +
+        s"${xzFile.getAbsolutePath}").count() === 2)
+    }
+  }
+
+  test("SPARK-35105: ADD FILES command with multiple files") {
+    withTempDir { dir =>
+      val file1 = File.createTempFile("someprefix1", "somesuffix1", dir)
+      val file2 = File.createTempFile("someprefix2", "somesuffix 2", dir)
+      val file3 = File.createTempFile("someprefix3", "somesuffix 3", dir)
+      val file4 = File.createTempFile("someprefix4", "somesuffix4", dir)
+
+      Files.write(file1.toPath, "file1".getBytes)
+      Files.write(file2.toPath, "file2".getBytes)
+      Files.write(file3.toPath, "file3".getBytes)
+      Files.write(file4.toPath, "file3".getBytes)
+
+      sql(s"ADD FILE ${file1.getAbsolutePath} '${file2.getAbsoluteFile}'")
+      sql(s"""ADD FILES "${file3.getAbsolutePath}" ${file4.getAbsoluteFile}""")
+      val listFiles = sql(s"LIST FILES ${file1.getAbsolutePath} " +
+        s"'${file2.getAbsolutePath}' '${file3.getAbsolutePath}' ${file4.getAbsolutePath}")
+      assert(listFiles.count() === 4)
+      assert(listFiles.filter(_.getString(0).contains(file1.getName)).count() === 1)
+      assert(listFiles.filter(
+        _.getString(0).contains(file2.getName.replace(" ", "%20"))).count() === 1)
+      assert(listFiles.filter(
+        _.getString(0).contains(file3.getName.replace(" ", "%20"))).count() === 1)
+      assert(listFiles.filter(_.getString(0).contains(file4.getName)).count() === 1)
+    }
+  }
+
+  test("SPARK-35105: ADD JARS command with multiple files") {
+    withTempDir { dir =>
+      val file1 = new File(dir, "test1.txt")
+      val file2 = new File(dir, "test2.txt")
+      val file3 = new File(dir, "test3.txt")
+      val file4 = new File(dir, "test4.txt")
+
+      Files.write(file1.toPath, "file1".getBytes)
+      Files.write(file2.toPath, "file2".getBytes)
+      Files.write(file3.toPath, "file3".getBytes)
+      Files.write(file4.toPath, "file4".getBytes)
+
+      val jarFile1 = File.createTempFile("someprefix1", "somesuffix 1", dir)
+      val jarFile2 = File.createTempFile("someprefix2", "somesuffix2", dir)
+      val jarFile3 = File.createTempFile("someprefix3", "somesuffix3", dir)
+      val jarFile4 = File.createTempFile("someprefix4", "somesuffix 4", dir)
+
+      TestUtils.createJar(Seq(file1), jarFile1)
+      TestUtils.createJar(Seq(file2), jarFile2)
+      TestUtils.createJar(Seq(file3), jarFile3)
+      TestUtils.createJar(Seq(file4), jarFile4)
+
+      sql(s"""ADD JAR "${jarFile1.getAbsolutePath}" ${jarFile2.getAbsoluteFile}""")
+      sql(s"ADD JARS ${jarFile3.getAbsolutePath} '${jarFile4.getAbsoluteFile}'")
+      val listFiles = sql(s"LIST JARS '${jarFile1.getAbsolutePath}' " +
+        s"${jarFile2.getAbsolutePath} ${jarFile3.getAbsolutePath} '${jarFile4.getAbsoluteFile}'")
+      assert(listFiles.count() === 4)
+      assert(listFiles.filter(
+        _.getString(0).contains(jarFile1.getName.replace(" ", "%20"))).count() === 1)
+      assert(listFiles.filter(_.getString(0).contains(jarFile2.getName)).count() === 1)
+      assert(listFiles.filter(_.getString(0).contains(jarFile3.getName)).count() === 1)
+      assert(listFiles.filter(
+        _.getString(0).contains(jarFile4.getName.replace(" ", "%20"))).count() === 1)
+    }
+  }
+
+  test("SPARK-35105: ADD ARCHIVES command with multiple files") {
+    withTempDir { dir =>
+      val file1 = new File(dir, "test1.txt")
+      val file2 = new File(dir, "test2.txt")
+      val file3 = new File(dir, "test3.txt")
+      val file4 = new File(dir, "test4.txt")
+
+      Files.write(file1.toPath, "file1".getBytes)
+      Files.write(file2.toPath, "file2".getBytes)
+      Files.write(file3.toPath, "file3".getBytes)
+      Files.write(file4.toPath, "file4".getBytes)
+
+      val jarFile1 = File.createTempFile("someprefix1", "somesuffix1", dir)
+      val jarFile2 = File.createTempFile("someprefix2", "somesuffix 2", dir)
+      val jarFile3 = File.createTempFile("someprefix3", "somesuffix3", dir)
+      val jarFile4 = File.createTempFile("someprefix4", "somesuffix 4", dir)
+
+      TestUtils.createJar(Seq(file1), jarFile1)
+      TestUtils.createJar(Seq(file2), jarFile2)
+      TestUtils.createJar(Seq(file3), jarFile3)
+      TestUtils.createJar(Seq(file4), jarFile4)
+
+      sql(s"""ADD ARCHIVE ${jarFile1.getAbsolutePath} "${jarFile2.getAbsoluteFile}"""")
+      sql(s"ADD ARCHIVES ${jarFile3.getAbsolutePath} '${jarFile4.getAbsoluteFile}'")
+      val listFiles = sql(s"LIST ARCHIVES ${jarFile1.getAbsolutePath} " +
+        s"'${jarFile2.getAbsolutePath}' ${jarFile3.getAbsolutePath} '${jarFile4.getAbsolutePath}'")
+      assert(listFiles.count() === 4)
+      assert(listFiles.filter(_.getString(0).contains(jarFile1.getName)).count() === 1)
+      assert(listFiles.filter(
+        _.getString(0).contains(jarFile2.getName.replace(" ", "%20"))).count() === 1)
+      assert(listFiles.filter(_.getString(0).contains(jarFile3.getName)).count() === 1)
+      assert(listFiles.filter(
+        _.getString(0).contains(jarFile4.getName.replace(" ", "%20"))).count() === 1)
+    }
+  }
+
+  test("SPARK-34977: LIST FILES/JARS/ARCHIVES should handle multiple quoted path arguments") {
+    withTempDir { dir =>
+      val file1 = File.createTempFile("someprefix1", "somesuffix1", dir)
+      val file2 = File.createTempFile("someprefix2", "somesuffix2", dir)
+      val file3 = File.createTempFile("someprefix3", "somesuffix 3", dir)
+
+      Files.write(file1.toPath, "file1".getBytes)
+      Files.write(file2.toPath, "file2".getBytes)
+      Files.write(file3.toPath, "file3".getBytes)
+
+      sql(s"ADD FILE ${file1.getAbsolutePath}")
+      sql(s"ADD FILE ${file2.getAbsolutePath}")
+      sql(s"ADD FILE '${file3.getAbsolutePath}'")
+      val listFiles = sql("LIST FILES " +
+        s"""'${file1.getAbsolutePath}' ${file2.getAbsolutePath} "${file3.getAbsolutePath}"""")
+
+      assert(listFiles.count() === 3)
+      assert(listFiles.filter(_.getString(0).contains(file1.getName)).count() === 1)
+      assert(listFiles.filter(_.getString(0).contains(file2.getName)).count() === 1)
+      assert(listFiles.filter(
+        _.getString(0).contains(file3.getName.replace(" ", "%20"))).count() === 1)
+
+      val file4 = File.createTempFile("someprefix4", "somesuffix4", dir)
+      val file5 = File.createTempFile("someprefix5", "somesuffix5", dir)
+      val file6 = File.createTempFile("someprefix6", "somesuffix6", dir)
+      Files.write(file4.toPath, "file4".getBytes)
+      Files.write(file5.toPath, "file5".getBytes)
+      Files.write(file6.toPath, "file6".getBytes)
+
+      val jarFile1 = new File(dir, "test1.jar")
+      val jarFile2 = new File(dir, "test2.jar")
+      val jarFile3 = new File(dir, "test 3.jar")
+      TestUtils.createJar(Seq(file4), jarFile1)
+      TestUtils.createJar(Seq(file5), jarFile2)
+      TestUtils.createJar(Seq(file6), jarFile3)
+
+      sql(s"ADD ARCHIVE ${jarFile1.getAbsolutePath}")
+      sql(s"ADD ARCHIVE ${jarFile2.getAbsolutePath}#foo")
+      sql(s"ADD ARCHIVE '${jarFile3.getAbsolutePath}'")
+      val listArchives = sql(s"LIST ARCHIVES '${jarFile1.getAbsolutePath}' " +
+        s"""${jarFile2.getAbsolutePath} "${jarFile3.getAbsolutePath}"""")
+
+      assert(listArchives.count() === 3)
+      assert(listArchives.filter(_.getString(0).contains(jarFile1.getName)).count() === 1)
+      assert(listArchives.filter(_.getString(0).contains(jarFile2.getName)).count() === 1)
+      assert(listArchives.filter(
+        _.getString(0).contains(jarFile3.getName.replace(" ", "%20"))).count() === 1)
+
+      val file7 = File.createTempFile("someprefix7", "somesuffix7", dir)
+      val file8 = File.createTempFile("someprefix8", "somesuffix8", dir)
+      val file9 = File.createTempFile("someprefix9", "somesuffix9", dir)
+      Files.write(file4.toPath, "file7".getBytes)
+      Files.write(file5.toPath, "file8".getBytes)
+      Files.write(file6.toPath, "file9".getBytes)
+
+      val jarFile4 = new File(dir, "test4.jar")
+      val jarFile5 = new File(dir, "test5.jar")
+      val jarFile6 = new File(dir, "test 6.jar")
+      TestUtils.createJar(Seq(file7), jarFile4)
+      TestUtils.createJar(Seq(file8), jarFile5)
+      TestUtils.createJar(Seq(file9), jarFile6)
+
+      sql(s"ADD JAR ${jarFile4.getAbsolutePath}")
+      sql(s"ADD JAR ${jarFile5.getAbsolutePath}")
+      sql(s"ADD JAR '${jarFile6.getAbsolutePath}'")
+      val listJars = sql(s"LIST JARS '${jarFile4.getAbsolutePath}' " +
+        s"""${jarFile5.getAbsolutePath} "${jarFile6.getAbsolutePath}"""")
+      assert(listJars.count() === 3)
+      assert(listJars.filter(_.getString(0).contains(jarFile4.getName)).count() === 1)
+      assert(listJars.filter(_.getString(0).contains(jarFile5.getName)).count() === 1)
+      assert(listJars.filter(
+        _.getString(0).contains(jarFile6.getName.replace(" ", "%20"))).count() === 1)
+    }
   }
 
   createQueryTest("dynamic_partition",
@@ -920,42 +1208,51 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   }
 
   test("SPARK-5592: get java.net.URISyntaxException when dynamic partitioning") {
-    sql("""
-      |create table sc as select *
-      |from (select '2011-01-11', '2011-01-11+14:18:26' from src tablesample (1 rows)
-      |union all
-      |select '2011-01-11', '2011-01-11+15:18:26' from src tablesample (1 rows)
-      |union all
-      |select '2011-01-11', '2011-01-11+16:18:26' from src tablesample (1 rows) ) s
+    withSQLConf("hive.exec.dynamic.partition" -> "true",
+      "hive.exec.dynamic.partition.mode" -> "nonstrict") {
+      sql(
+        """
+          |create table sc as select *
+          |from (select '2011-01-11', '2011-01-11+14:18:26' from src tablesample (1 rows)
+          |union all
+          |select '2011-01-11', '2011-01-11+15:18:26' from src tablesample (1 rows)
+          |union all
+          |select '2011-01-11', '2011-01-11+16:18:26' from src tablesample (1 rows) ) s
     """.stripMargin)
-    sql("create table sc_part (key string) partitioned by (ts string) stored as rcfile")
-    sql("set hive.exec.dynamic.partition=true")
-    sql("set hive.exec.dynamic.partition.mode=nonstrict")
-    sql("insert overwrite table sc_part partition(ts) select * from sc")
-    sql("drop table sc_part")
+      sql("create table sc_part (key string) partitioned by (ts string) stored as rcfile")
+      sql("insert overwrite table sc_part partition(ts) select * from sc")
+      sql("drop table sc_part")
+    }
   }
 
   test("Partition spec validation") {
-    sql("DROP TABLE IF EXISTS dp_test")
-    sql("CREATE TABLE dp_test(key INT, value STRING) PARTITIONED BY (dp INT, sp INT)")
-    sql("SET hive.exec.dynamic.partition.mode=strict")
-
-    // Should throw when using strict dynamic partition mode without any static partition
-    intercept[AnalysisException] {
-      sql(
-        """INSERT INTO TABLE dp_test PARTITION(dp)
-          |SELECT key, value, key % 5 FROM src
-        """.stripMargin)
-    }
-
-    sql("SET hive.exec.dynamic.partition.mode=nonstrict")
-
-    // Should throw when a static partition appears after a dynamic partition
-    intercept[AnalysisException] {
-      sql(
-        """INSERT INTO TABLE dp_test PARTITION(dp, sp = 1)
-          |SELECT key, value, key % 5 FROM src
-        """.stripMargin)
+    withTable("dp_test") {
+      sql("CREATE TABLE dp_test(key INT, value STRING) USING HIVE PARTITIONED BY (dp INT, sp INT)")
+      withSQLConf("hive.exec.dynamic.partition.mode" -> "strict") {
+        // Should throw when using strict dynamic partition mode without any static partition
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(
+              """INSERT INTO TABLE dp_test PARTITION(dp)
+                |SELECT key, value, key % 5 FROM src""".stripMargin)
+          },
+          errorClass = "INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS",
+          parameters = Map(
+            "tableName" -> "`spark_catalog`.`default`.`dp_test`",
+            "tableColumns" -> "`key`, `value`, `dp`, `sp`",
+            "dataColumns" -> "`key`, `value`, `(key % 5)`"))
+      }
+      withSQLConf("hive.exec.dynamic.partition.mode" -> "nonstrict") {
+        // Should throw when a static partition appears after a dynamic partition
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(
+              """INSERT INTO TABLE dp_test PARTITION(dp, sp = 1)
+                |SELECT key, value, key % 5 FROM src""".stripMargin)
+          },
+          errorClass = "_LEGACY_ERROR_TEMP_3079",
+          parameters = Map.empty)
+      }
     }
   }
 
@@ -997,21 +1294,22 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   }
 
   test("SPARK-3810: PreprocessTableInsertion dynamic partitioning support") {
-    val analyzedPlan = {
-      loadTestTable("srcpart")
-      sql("DROP TABLE IF EXISTS withparts")
-      sql("CREATE TABLE withparts LIKE srcpart")
-      sql("SET hive.exec.dynamic.partition.mode=nonstrict")
+    withSQLConf("hive.exec.dynamic.partition.mode" -> "nonstrict") {
+      val analyzedPlan = {
+        loadTestTable("srcpart")
+        sql("DROP TABLE IF EXISTS withparts")
+        sql("CREATE TABLE withparts LIKE srcpart")
 
-      sql("CREATE TABLE IF NOT EXISTS withparts LIKE srcpart")
-      sql("INSERT INTO TABLE withparts PARTITION(ds, hr) SELECT key, value, '1', '2' FROM src")
-        .queryExecution.analyzed
-    }
+        sql("CREATE TABLE IF NOT EXISTS withparts LIKE srcpart")
+        sql("INSERT INTO TABLE withparts PARTITION(ds, hr) SELECT key, value, '1', '2' FROM src")
+          .queryExecution.analyzed
+      }
 
-    assertResult(2, "Duplicated project detected\n" + analyzedPlan) {
-      analyzedPlan.collect {
-        case i: InsertIntoHiveTable => i.query.collect { case p: Project => () }.size
-      }.sum
+      assertResult(2, "Duplicated project detected\n" + analyzedPlan) {
+        analyzedPlan.collect {
+          case i: InsertIntoHiveTable => i.query.collect { case p: Project => () }.size
+        }.sum
+      }
     }
   }
 
@@ -1050,15 +1348,30 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
       s2.sql("create table test_b(key INT, value STRING)")
 
       sql("select * from test_a")
-      intercept[AnalysisException] {
-        sql("select * from test_b")
-      }
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("select * from test_b")
+        },
+        errorClass = "TABLE_OR_VIEW_NOT_FOUND",
+        parameters = Map("relationName" -> "`test_b`"),
+        context = ExpectedContext(
+          fragment = "test_b",
+          start = 14,
+          stop = 19))
+
       sql("select * from b.test_b")
 
       s2.sql("select * from test_b")
-      intercept[AnalysisException] {
-        s2.sql("select * from test_a")
-      }
+      checkError(
+        exception = intercept[AnalysisException] {
+          s2.sql("select * from test_a")
+        },
+        errorClass = "TABLE_OR_VIEW_NOT_FOUND",
+        parameters = Map("relationName" -> "`test_a`"),
+        context = ExpectedContext(
+          fragment = "test_a",
+          start = 14,
+          stop = 19))
       s2.sql("select * from a.test_a")
     } finally {
       sql("DROP TABLE IF EXISTS test_a")
@@ -1074,28 +1387,50 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
     sql("USE hive_test_db")
     assert("hive_test_db" == sql("select current_database()").first().getString(0))
 
-    intercept[AnalysisException] {
-      sql("USE not_existing_db")
-    }
+    assert("hive_test_db" == sql("select current_schema()").first().getString(0))
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("USE not_existing_db")
+      },
+      errorClass = "SCHEMA_NOT_FOUND",
+      parameters = Map("schemaName" -> "`not_existing_db`"))
 
     sql(s"USE $currentDatabase")
     assert(currentDatabase == sql("select current_database()").first().getString(0))
   }
 
   test("lookup hive UDF in another thread") {
-    val e = intercept[AnalysisException] {
-      range(1).selectExpr("not_a_udf()")
-    }
-    assert(e.getMessage.contains("Undefined function"))
-    assert(e.getMessage.contains("not_a_udf"))
+    checkError(
+      exception = intercept[AnalysisException] {
+        range(1).selectExpr("not_a_udf()")
+      },
+      errorClass = "UNRESOLVED_ROUTINE",
+      sqlState = None,
+      parameters = Map(
+        "routineName" -> "`not_a_udf`",
+        "searchPath" -> "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`a`]"),
+      context = ExpectedContext(
+        fragment = "not_a_udf()",
+        start = 0,
+        stop = 10))
+
     var success = false
     val t = new Thread("test") {
       override def run(): Unit = {
-        val e = intercept[AnalysisException] {
-          range(1).selectExpr("not_a_udf()")
-        }
-        assert(e.getMessage.contains("Undefined function"))
-        assert(e.getMessage.contains("not_a_udf"))
+        checkError(
+          exception = intercept[AnalysisException] {
+            range(1).selectExpr("not_a_udf()")
+          },
+          errorClass = "UNRESOLVED_ROUTINE",
+          sqlState = None,
+          parameters = Map(
+            "routineName" -> "`not_a_udf`",
+            "searchPath" -> "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`a`]"),
+          context = ExpectedContext(
+            fragment = "not_a_udf()",
+            start = 0,
+            stop = 10))
         success = true
       }
     }
@@ -1111,53 +1446,129 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   // since they modify /clear stuff.
 
   test("role management commands are not supported") {
-    assertUnsupportedFeature { sql("CREATE ROLE my_role") }
-    assertUnsupportedFeature { sql("DROP ROLE my_role") }
-    assertUnsupportedFeature { sql("SHOW CURRENT ROLES") }
-    assertUnsupportedFeature { sql("SHOW ROLES") }
-    assertUnsupportedFeature { sql("SHOW GRANT") }
-    assertUnsupportedFeature { sql("SHOW ROLE GRANT USER my_principal") }
-    assertUnsupportedFeature { sql("SHOW PRINCIPALS my_role") }
-    assertUnsupportedFeature { sql("SET ROLE my_role") }
-    assertUnsupportedFeature { sql("GRANT my_role TO USER my_user") }
-    assertUnsupportedFeature { sql("GRANT ALL ON my_table TO USER my_user") }
-    assertUnsupportedFeature { sql("REVOKE my_role FROM USER my_user") }
-    assertUnsupportedFeature { sql("REVOKE ALL ON my_table FROM USER my_user") }
+    assertUnsupportedFeature(
+      sql("CREATE ROLE my_role"),
+      "CREATE ROLE",
+      ExpectedContext(fragment = "CREATE ROLE my_role", start = 0, stop = 18))
+    assertUnsupportedFeature(
+      sql("DROP ROLE my_role"),
+      "DROP ROLE",
+      ExpectedContext(fragment = "DROP ROLE my_role", start = 0, stop = 16))
+    assertUnsupportedFeature(
+      sql("SHOW CURRENT ROLES"),
+      "SHOW CURRENT ROLES",
+      ExpectedContext(fragment = "SHOW CURRENT ROLES", start = 0, stop = 17))
+    assertUnsupportedFeature(
+      sql("SHOW ROLES"),
+      "SHOW ROLES",
+      ExpectedContext(fragment = "SHOW ROLES", start = 0, stop = 9))
+    assertUnsupportedFeature(
+      sql("SHOW GRANT"),
+      "SHOW GRANT",
+      ExpectedContext(fragment = "SHOW GRANT", start = 0, stop = 9))
+    assertUnsupportedFeature(
+      sql("SHOW ROLE GRANT USER my_principal"),
+      "SHOW ROLE GRANT",
+      ExpectedContext(fragment = "SHOW ROLE GRANT USER my_principal", start = 0, stop = 32))
+    assertUnsupportedFeature(
+      sql("SHOW PRINCIPALS my_role"),
+      "SHOW PRINCIPALS",
+      ExpectedContext(fragment = "SHOW PRINCIPALS my_role", start = 0, stop = 22))
+    assertUnsupportedFeature(
+      sql("SET ROLE my_role"),
+      "SET ROLE",
+      ExpectedContext(fragment = "SET ROLE my_role", start = 0, stop = 15))
+    assertUnsupportedFeature(
+      sql("GRANT my_role TO USER my_user"),
+      "GRANT",
+      ExpectedContext(fragment = "GRANT my_role TO USER my_user", start = 0, stop = 28))
+    assertUnsupportedFeature(
+      sql("GRANT ALL ON my_table TO USER my_user"),
+      "GRANT",
+      ExpectedContext(fragment = "GRANT ALL ON my_table TO USER my_user", start = 0, stop = 36))
+    assertUnsupportedFeature(
+      sql("REVOKE my_role FROM USER my_user"),
+      "REVOKE",
+      ExpectedContext(fragment = "REVOKE my_role FROM USER my_user", start = 0, stop = 31))
+    assertUnsupportedFeature(
+      sql("REVOKE ALL ON my_table FROM USER my_user"),
+      "REVOKE",
+      ExpectedContext(fragment = "REVOKE ALL ON my_table FROM USER my_user", start = 0, stop = 39))
   }
 
   test("import/export commands are not supported") {
-    assertUnsupportedFeature { sql("IMPORT TABLE my_table FROM 'my_path'") }
-    assertUnsupportedFeature { sql("EXPORT TABLE my_table TO 'my_path'") }
+    assertUnsupportedFeature(
+      sql("IMPORT TABLE my_table FROM 'my_path'"),
+      "IMPORT TABLE",
+      ExpectedContext(fragment = "IMPORT TABLE my_table FROM 'my_path'", start = 0, stop = 35))
+    assertUnsupportedFeature(
+      sql("EXPORT TABLE my_table TO 'my_path'"),
+      "EXPORT TABLE",
+      ExpectedContext(fragment = "EXPORT TABLE my_table TO 'my_path'", start = 0, stop = 33))
   }
 
   test("some show commands are not supported") {
-    assertUnsupportedFeature { sql("SHOW COMPACTIONS") }
-    assertUnsupportedFeature { sql("SHOW TRANSACTIONS") }
-    assertUnsupportedFeature { sql("SHOW INDEXES ON my_table") }
-    assertUnsupportedFeature { sql("SHOW LOCKS my_table") }
+    assertUnsupportedFeature(
+      sql("SHOW COMPACTIONS"),
+      "SHOW COMPACTIONS",
+      ExpectedContext(fragment = "SHOW COMPACTIONS", start = 0, stop = 15))
+    assertUnsupportedFeature(
+      sql("SHOW TRANSACTIONS"),
+      "SHOW TRANSACTIONS",
+      ExpectedContext(fragment = "SHOW TRANSACTIONS", start = 0, stop = 16))
+    assertUnsupportedFeature(
+      sql("SHOW INDEXES ON my_table"),
+      "SHOW INDEXES",
+      ExpectedContext(fragment = "SHOW INDEXES ON my_table", start = 0, stop = 23))
+    assertUnsupportedFeature(
+      sql("SHOW LOCKS my_table"),
+      "SHOW LOCKS",
+      ExpectedContext(fragment = "SHOW LOCKS my_table", start = 0, stop = 18))
   }
 
   test("lock/unlock table and database commands are not supported") {
-    assertUnsupportedFeature { sql("LOCK TABLE my_table SHARED") }
-    assertUnsupportedFeature { sql("UNLOCK TABLE my_table") }
-    assertUnsupportedFeature { sql("LOCK DATABASE my_db SHARED") }
-    assertUnsupportedFeature { sql("UNLOCK DATABASE my_db") }
+    assertUnsupportedFeature(
+      sql("LOCK TABLE my_table SHARED"),
+      "LOCK TABLE",
+      ExpectedContext(fragment = "LOCK TABLE my_table SHARED", start = 0, stop = 25))
+    assertUnsupportedFeature(
+      sql("UNLOCK TABLE my_table"),
+      "UNLOCK TABLE",
+      ExpectedContext(fragment = "UNLOCK TABLE my_table", start = 0, stop = 20))
+    assertUnsupportedFeature(
+      sql("LOCK DATABASE my_db SHARED"),
+      "LOCK DATABASE",
+      ExpectedContext(fragment = "LOCK DATABASE my_db SHARED", start = 0, stop = 25))
+    assertUnsupportedFeature(
+      sql("UNLOCK DATABASE my_db"),
+      "UNLOCK DATABASE",
+      ExpectedContext(fragment = "UNLOCK DATABASE my_db", start = 0, stop = 20))
   }
 
-  test("create/drop/alter index commands are not supported") {
-    assertUnsupportedFeature {
-      sql("CREATE INDEX my_index ON TABLE my_table(a) as 'COMPACT' WITH DEFERRED REBUILD")}
-    assertUnsupportedFeature { sql("DROP INDEX my_index ON my_table") }
-    assertUnsupportedFeature { sql("ALTER INDEX my_index ON my_table REBUILD")}
-    assertUnsupportedFeature {
-      sql("ALTER INDEX my_index ON my_table set IDXPROPERTIES (\"prop1\"=\"val1_new\")")}
+  test("alter index command is not supported") {
+    val sql1 = "ALTER INDEX my_index ON my_table REBUILD"
+    assertUnsupportedFeature(
+      sql(sql1),
+      "ALTER INDEX",
+      ExpectedContext(fragment = sql1, start = 0, stop = 39))
+    val sql2 = "ALTER INDEX my_index ON my_table set IDXPROPERTIES (\"prop1\"=\"val1_new\")"
+    assertUnsupportedFeature(
+      sql(sql2),
+      "ALTER INDEX",
+      ExpectedContext(fragment = sql2, start = 0, stop = 70))
   }
 
   test("create/drop macro commands are not supported") {
-    assertUnsupportedFeature {
-      sql("CREATE TEMPORARY MACRO SIGMOID (x DOUBLE) 1.0 / (1.0 + EXP(-x))")
-    }
-    assertUnsupportedFeature { sql("DROP TEMPORARY MACRO SIGMOID") }
+    val sql1 = "CREATE TEMPORARY MACRO SIGMOID (x DOUBLE) 1.0 / (1.0 + EXP(-x))"
+    assertUnsupportedFeature(
+      sql(sql1),
+      "CREATE TEMPORARY MACRO",
+      ExpectedContext(fragment = sql1, start = 0, stop = 62))
+    val sql2 = "DROP TEMPORARY MACRO SIGMOID"
+    assertUnsupportedFeature(
+      sql(sql2),
+      "DROP TEMPORARY MACRO",
+      ExpectedContext(fragment = sql2, start = 0, stop = 27))
   }
 
   test("dynamic partitioning is allowed when hive.exec.dynamic.partition.mode is nonstrict") {
@@ -1209,15 +1620,30 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   test("udf_radians") {
     withSQLConf("hive.fetch.task.conversion" -> "more") {
       val result = sql("select radians(57.2958) FROM src tablesample (1 rows)").collect()
-      if (SystemUtils.isJavaVersionAtLeast(JavaVersion.JAVA_9)) {
-        assertResult(Array(Row(1.0000003575641672))) (result)
-      } else {
-        assertResult(Array(Row(1.000000357564167))) (result)
-      }
-
+      assertResult(Array(Row(1.0000003575641672))) (result)
       assertResult(Array(Row(2.4999991485811655))) {
         sql("select radians(143.2394) FROM src tablesample (1 rows)").collect()
       }
+    }
+  }
+
+  test("SPARK-33084: Add jar support Ivy URI in SQL") {
+    val testData = TestHive.getHiveFile("data/files/sample.json").toURI
+    withTable("t") {
+      // Use transitive=false as it should be good enough to test the Ivy support
+      // in Hive ADD JAR
+      sql(s"ADD JAR ivy://org.apache.hive.hcatalog:hive-hcatalog-core:$hiveVersion" +
+        "?transitive=false")
+      sql(
+        """CREATE TABLE t(a string, b string)
+          |ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'""".stripMargin)
+      sql(s"""LOAD DATA LOCAL INPATH "$testData" INTO TABLE t""")
+      sql("SELECT * FROM src JOIN t on src.key = t.a")
+      assert(sql("LIST JARS").filter(_.getString(0).contains(
+        s"org.apache.hive.hcatalog_hive-hcatalog-core-$hiveVersion.jar")).count() > 0)
+      assert(sql("LIST JAR").
+        filter(_.getString(0).contains(
+          s"org.apache.hive.hcatalog_hive-hcatalog-core-$hiveVersion.jar")).count() > 0)
     }
   }
 }

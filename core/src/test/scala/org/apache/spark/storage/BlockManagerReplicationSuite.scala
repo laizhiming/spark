@@ -50,12 +50,13 @@ trait BlockManagerReplicationBehavior extends SparkFunSuite
   with BeforeAndAfter
   with LocalSparkContext {
 
-  val conf: SparkConf
+  val conf: SparkConf = createConf()
+  protected def createConf(): SparkConf
 
   protected var rpcEnv: RpcEnv = null
   protected var master: BlockManagerMaster = null
   protected lazy val securityMgr = new SecurityManager(conf)
-  protected lazy val bcastManager = new BroadcastManager(true, conf, securityMgr)
+  protected lazy val bcastManager = new BroadcastManager(true, conf)
   protected lazy val mapOutputTracker = new MapOutputTrackerMaster(conf, bcastManager, true)
   protected lazy val shuffleManager = new SortShuffleManager(conf)
 
@@ -75,9 +76,10 @@ trait BlockManagerReplicationBehavior extends SparkFunSuite
       memoryManager: Option[UnifiedMemoryManager] = None): BlockManager = {
     conf.set(TEST_MEMORY, maxMem)
     conf.set(MEMORY_OFFHEAP_SIZE, maxMem)
-    val transfer = new NettyBlockTransferService(conf, securityMgr, "localhost", "localhost", 0, 1)
-    val memManager = memoryManager.getOrElse(UnifiedMemoryManager(conf, numCores = 1))
     val serializerManager = new SerializerManager(serializer, conf)
+    val transfer = new NettyBlockTransferService(
+      conf, securityMgr, serializerManager, "localhost", "localhost", 0, 1)
+    val memManager = memoryManager.getOrElse(UnifiedMemoryManager(conf, numCores = 1))
     val store = new BlockManager(name, rpcEnv, master, serializerManager, conf,
       memManager, mapOutputTracker, shuffleManager, transfer, securityMgr, None)
     memManager.setMemoryStore(store.memoryStore)
@@ -95,8 +97,6 @@ trait BlockManagerReplicationBehavior extends SparkFunSuite
     conf.set(MEMORY_STORAGE_FRACTION, 0.999)
     conf.set(STORAGE_UNROLL_MEMORY_THRESHOLD, 512L)
 
-    // to make a replication attempt to inactive store fail fast
-    conf.set("spark.core.connection.ack.wait.timeout", "1s")
     // to make cached peers refresh frequently
     conf.set(STORAGE_CACHED_PEERS_TTL, 10)
 
@@ -104,7 +104,8 @@ trait BlockManagerReplicationBehavior extends SparkFunSuite
     val blockManagerInfo = new mutable.HashMap[BlockManagerId, BlockManagerInfo]()
     master = new BlockManagerMaster(rpcEnv.setupEndpoint("blockmanager",
       new BlockManagerMasterEndpoint(rpcEnv, true, conf,
-        new LiveListenerBus(conf), None, blockManagerInfo, mapOutputTracker)),
+        new LiveListenerBus(conf), None, blockManagerInfo, mapOutputTracker, sc.env.shuffleManager,
+        isDriver = true)),
       rpcEnv.setupEndpoint("blockmanagerHeartbeat",
       new BlockManagerMasterHeartbeatEndpoint(rpcEnv, true, blockManagerInfo)), conf, true)
     allStores.clear()
@@ -275,7 +276,7 @@ trait BlockManagerReplicationBehavior extends SparkFunSuite
 
       // create 1 faulty block manager by injecting faulty memory manager
       val memManager = UnifiedMemoryManager(conf, numCores = 1)
-      val mockedMemoryManager = spy(memManager)
+      val mockedMemoryManager = spy[UnifiedMemoryManager](memManager)
       doAnswer(_ => false).when(mockedMemoryManager).acquireStorageMemory(any(), any(), any())
       val store2 = makeBlockManager(10000, "host-2", Some(mockedMemoryManager))
 
@@ -459,15 +460,21 @@ trait BlockManagerReplicationBehavior extends SparkFunSuite
 }
 
 class BlockManagerReplicationSuite extends BlockManagerReplicationBehavior {
-  val conf = new SparkConf(false).set("spark.app.id", "test")
-  conf.set(Kryo.KRYO_SERIALIZER_BUFFER_SIZE.key, "1m")
+  override def createConf(): SparkConf = {
+    new SparkConf(false)
+      .set("spark.app.id", "test")
+      .set(Kryo.KRYO_SERIALIZER_BUFFER_SIZE.key, "1m")
+  }
 }
 
 class BlockManagerProactiveReplicationSuite extends BlockManagerReplicationBehavior {
-  val conf = new SparkConf(false).set("spark.app.id", "test")
-  conf.set(Kryo.KRYO_SERIALIZER_BUFFER_SIZE.key, "1m")
-  conf.set(STORAGE_REPLICATION_PROACTIVE, true)
-  conf.set(STORAGE_EXCEPTION_PIN_LEAK, true)
+  override def createConf(): SparkConf = {
+    new SparkConf(false)
+      .set("spark.app.id", "test")
+      .set(Kryo.KRYO_SERIALIZER_BUFFER_SIZE.key, "1m")
+      .set(STORAGE_REPLICATION_PROACTIVE, true)
+      .set(STORAGE_EXCEPTION_PIN_LEAK, true)
+  }
 
   (2 to 5).foreach { i =>
     test(s"proactive block replication - $i replicas - ${i - 1} block manager deletions") {
@@ -539,14 +546,17 @@ class DummyTopologyMapper(conf: SparkConf) extends TopologyMapper(conf) with Log
 }
 
 class BlockManagerBasicStrategyReplicationSuite extends BlockManagerReplicationBehavior {
-  val conf: SparkConf = new SparkConf(false).set("spark.app.id", "test")
-  conf.set(Kryo.KRYO_SERIALIZER_BUFFER_SIZE.key, "1m")
-  conf.set(
-    STORAGE_REPLICATION_POLICY,
-    classOf[BasicBlockReplicationPolicy].getName)
-  conf.set(
-    STORAGE_REPLICATION_TOPOLOGY_MAPPER,
-    classOf[DummyTopologyMapper].getName)
+  override def createConf(): SparkConf = {
+    new SparkConf(false)
+      .set("spark.app.id", "test")
+      .set(Kryo.KRYO_SERIALIZER_BUFFER_SIZE.key, "1m")
+      .set(
+        STORAGE_REPLICATION_POLICY,
+        classOf[BasicBlockReplicationPolicy].getName)
+      .set(
+        STORAGE_REPLICATION_TOPOLOGY_MAPPER,
+        classOf[DummyTopologyMapper].getName)
+  }
 }
 
 // BlockReplicationPolicy to prioritize BlockManagers based on hostnames

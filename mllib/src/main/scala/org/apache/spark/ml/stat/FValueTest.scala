@@ -30,7 +30,7 @@ import org.apache.spark.sql.functions._
  * FValue test for continuous data.
  */
 @Since("3.1.0")
-object FValueTest {
+private[ml] object FValueTest {
 
   /** Used to construct output schema of tests */
   private  case class FValueResult(
@@ -76,8 +76,7 @@ object FValueTest {
     if (flatten) {
       resultDF
     } else {
-      resultDF.groupBy()
-        .agg(collect_list(struct("*")))
+      resultDF.agg(collect_list(struct("*")))
         .as[Seq[(Int, Double, Long, Double)]]
         .map { seq =>
           val results = seq.toArray.sortBy(_._1)
@@ -125,7 +124,7 @@ object FValueTest {
         if (iter.hasNext) {
           val array = Array.ofDim[Double](numFeatures)
           while (iter.hasNext) {
-            val (label, features) = iter.next
+            val (label, features) = iter.next()
             val yDiff = label - yMean
             if (yDiff != 0) {
               features.iterator.zip(xMeans.iterator)
@@ -136,7 +135,7 @@ object FValueTest {
         } else Iterator.empty
       }.reduceByKey(_ + _
       ).mapPartitions { iter =>
-        val fd = new FDistribution(1, degreesOfFreedom)
+        val fd = new FDistribution(1.0, degreesOfFreedom.toDouble)
         iter.map { case (col, sumForCov) =>
           // Cov(X,Y) = Sum(((Xi - Avg(X)) * ((Yi-Avg(Y))) / (N-1)
           val covariance = sumForCov / (numSamples - 1)

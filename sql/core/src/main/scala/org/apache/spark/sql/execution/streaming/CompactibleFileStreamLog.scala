@@ -24,10 +24,12 @@ import scala.io.{Source => IOSource}
 import scala.reflect.ClassTag
 
 import org.apache.hadoop.fs.Path
-import org.json4s.NoTypeHints
+import org.json4s.{Formats, NoTypeHints}
 import org.json4s.jackson.Serialization
 
+import org.apache.spark.internal.{LogKeys, MDC}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.util.Utils
 
 /**
@@ -48,9 +50,10 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 
   import CompactibleFileStreamLog._
 
-  private implicit val formats = Serialization.formats(NoTypeHints)
+  private implicit val formats: Formats = Serialization.formats(NoTypeHints)
 
   /** Needed to serialize type T into JSON when using Jackson */
+  @scala.annotation.nowarn
   private implicit val manifest = Manifest.classType[T](implicitly[ClassTag[T]].runtimeClass)
 
   protected val minBatchesToRetain = sparkSession.sessionState.conf.minBatchesToRetain
@@ -101,8 +104,9 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
         defaultCompactInterval, compactibleBatchIds(0).toInt)
     }
     assert(interval > 0, s"intervalValue = $interval not positive value.")
-    logInfo(s"Set the compact interval to $interval " +
-      s"[defaultCompactInterval: $defaultCompactInterval]")
+    logInfo(log"Set the compact interval to ${MDC(LogKeys.COMPACT_INTERVAL, interval)} " +
+      log"[defaultCompactInterval: " +
+      log"${MDC(LogKeys.DEFAULT_COMPACT_INTERVAL, defaultCompactInterval)}]")
     interval
   }
 
@@ -112,7 +116,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
    * Default implementation retains all log entries. Implementations should override the method
    * to change the behavior.
    */
-  def shouldRetain(log: T): Boolean = true
+  def shouldRetain(log: T, currentTime: Long): Boolean = true
 
   override def batchIdToPath(batchId: Long): Path = {
     if (isCompactionBatch(batchId, compactInterval)) {
@@ -176,11 +180,11 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
    * CompactibleFileStreamLog maintains logs by itself, and manual purging might break internal
    * state, specifically which latest compaction batch is purged.
    *
-   * To simplify the situation, this method just throws UnsupportedOperationException regardless
-   * of given parameter, and let CompactibleFileStreamLog handles purging by itself.
+   * To simplify the situation, this method just throws SparkUnsupportedOperationException
+   * regardless of given parameter, and let CompactibleFileStreamLog handles purging by itself.
    */
-  override def purge(thresholdBatchId: Long): Unit = throw new UnsupportedOperationException(
-    s"Cannot purge as it might break internal state.")
+  override def purge(thresholdBatchId: Long): Unit =
+    throw QueryExecutionErrors.cannotPurgeAsBreakInternalStateError()
 
   /**
    * Apply function on all entries in the specific batch. The method will throw
@@ -218,8 +222,9 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
    * corresponding `batchId` file. It will delete expired files as well if enabled.
    */
   private def compact(batchId: Long, logs: Array[T]): Boolean = {
+    val curTime = System.currentTimeMillis()
     def writeEntry(entry: T, output: OutputStream): Unit = {
-      if (shouldRetain(entry)) {
+      if (shouldRetain(entry, curTime)) {
         output.write('\n')
         serializeEntry(entry, output)
       }
@@ -237,7 +242,8 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     }
 
     if (elapsedMs >= COMPACT_LATENCY_WARN_THRESHOLD_MS) {
-      logWarning(s"Compacting took $elapsedMs ms for compact batch $batchId")
+      logWarning(log"Compacting took ${MDC(LogKeys.ELAPSED_TIME, elapsedMs)} ms for " +
+        log"compact batch ${MDC(LogKeys.BATCH_ID, batchId)}")
     } else {
       logDebug(s"Compacting took $elapsedMs ms for compact batch $batchId")
     }
@@ -249,6 +255,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
    * Returns all files except the deleted ones.
    */
   def allFiles(): Array[T] = {
+    val curTime = System.currentTimeMillis()
     var latestId = getLatestBatchId().getOrElse(-1L)
     // There is a race condition when `FileStreamSink` is deleting old files and `StreamFileIndex`
     // is calling this method. This loop will retry the reading to deal with the
@@ -258,7 +265,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
         try {
           val logs =
             getAllValidBatches(latestId, compactInterval).flatMap { id =>
-              filterInBatch(id)(shouldRetain).getOrElse {
+              filterInBatch(id)(shouldRetain(_, curTime)).getOrElse {
                 throw new IllegalStateException(
                   s"${batchIdToPath(id)} doesn't exist " +
                     s"(latestId: $latestId, compactInterval: $compactInterval)")
@@ -286,7 +293,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 
   /**
    * Delete expired log entries that proceed the currentBatchId and retain
-   * sufficient minimum number of batches (given by minBatchsToRetain). This
+   * sufficient minimum number of batches (given by minBatchesToRetain). This
    * equates to retaining the earliest compaction log that proceeds
    * batch id position currentBatchId + 1 - minBatchesToRetain. All log entries
    * prior to the earliest compaction log proceeding that position will be removed.
@@ -302,8 +309,9 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
       assert(isCompactionBatch(minCompactionBatchId, compactInterval),
         s"$minCompactionBatchId is not a compaction batch")
 
-      logInfo(s"Current compact batch id = $currentBatchId " +
-        s"min compaction batch id to delete = $minCompactionBatchId")
+      logInfo(log"Current compact batch id = ${MDC(LogKeys.CURRENT_BATCH_ID, currentBatchId)} " +
+        log"min compaction batch id to delete = " +
+        log"${MDC(LogKeys.MIN_COMPACTION_BATCH_ID, minCompactionBatchId)}")
 
       val expiredTime = System.currentTimeMillis() - fileCleanupDelayMs
       fileManager.list(metadataPath, (path: Path) => {
@@ -384,7 +392,7 @@ object CompactibleFileStreamLog {
     } else if (defaultInterval < (latestCompactBatchId + 1) / 2) {
       // Find the first divisor >= default compact interval
       def properDivisors(min: Int, n: Int) =
-        (min to n/2).view.filter(i => n % i == 0).toSeq :+ n
+        (min to n / 2).to(LazyList).filter(i => n % i == 0) :+ n
 
       properDivisors(defaultInterval, latestCompactBatchId + 1).head
     } else {

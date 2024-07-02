@@ -608,7 +608,7 @@ setMethod("cache",
 #'
 #' Persist this SparkDataFrame with the specified storage level. For details of the
 #' supported storage levels, refer to
-#' \url{http://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence}.
+#' \url{https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence}.
 #'
 #' @param x the SparkDataFrame to persist.
 #' @param newLevel storage level chosen for the persistence. See available options in
@@ -880,7 +880,7 @@ setMethod("toJSON",
 
 #' Save the contents of SparkDataFrame as a JSON file
 #'
-#' Save the contents of a SparkDataFrame as a JSON file (\href{http://jsonlines.org/}{
+#' Save the contents of a SparkDataFrame as a JSON file (\href{https://jsonlines.org/}{
 #' JSON Lines text format or newline-delimited JSON}). Files written out
 #' with this method can be read back in as a SparkDataFrame using read.json().
 #'
@@ -889,7 +889,10 @@ setMethod("toJSON",
 #' @param mode one of 'append', 'overwrite', 'error', 'errorifexists', 'ignore'
 #'             save mode (it is 'error' by default)
 #' @param ... additional argument(s) passed to the method.
-#'
+#'            You can find the JSON-specific options for writing JSON files in
+# nolint start
+#'            \url{https://spark.apache.org/docs/latest/sql-data-sources-json.html#data-source-option}{Data Source Option} in the version you use.
+# nolint end
 #' @family SparkDataFrame functions
 #' @rdname write.json
 #' @name write.json
@@ -920,7 +923,10 @@ setMethod("write.json",
 #' @param mode one of 'append', 'overwrite', 'error', 'errorifexists', 'ignore'
 #'             save mode (it is 'error' by default)
 #' @param ... additional argument(s) passed to the method.
-#'
+#'            You can find the ORC-specific options for writing ORC files in
+# nolint start
+#'            \url{https://spark.apache.org/docs/latest/sql-data-sources-orc.html#data-source-option}{Data Source Option} in the version you use.
+# nolint end
 #' @family SparkDataFrame functions
 #' @aliases write.orc,SparkDataFrame,character-method
 #' @rdname write.orc
@@ -951,7 +957,10 @@ setMethod("write.orc",
 #' @param mode one of 'append', 'overwrite', 'error', 'errorifexists', 'ignore'
 #'             save mode (it is 'error' by default)
 #' @param ... additional argument(s) passed to the method.
-#'
+#'            You can find the Parquet-specific options for writing Parquet files in
+# nolint start
+#'            \url{https://spark.apache.org/docs/latest/sql-data-sources-parquet.html#data-source-option}{Data Source Option} in the version you use.
+# nolint end
 #' @family SparkDataFrame functions
 #' @rdname write.parquet
 #' @name write.parquet
@@ -983,7 +992,10 @@ setMethod("write.parquet",
 #' @param mode one of 'append', 'overwrite', 'error', 'errorifexists', 'ignore'
 #'             save mode (it is 'error' by default)
 #' @param ... additional argument(s) passed to the method.
-#'
+#'            You can find the text-specific options for writing text files in
+# nolint start
+#'            \url{https://spark.apache.org/docs/latest/sql-data-sources-text.html#data-source-option}{Data Source Option} in the version you use.
+# nolint end
 #' @family SparkDataFrame functions
 #' @aliases write.text,SparkDataFrame,character-method
 #' @rdname write.text
@@ -2277,16 +2289,17 @@ setMethod("mutate",
 
             # For named arguments, use the names for arguments as the column names
             # For unnamed arguments, use the argument symbols as the column names
-            args <- sapply(substitute(list(...))[-1], deparse)
             ns <- names(cols)
-            if (!is.null(ns)) {
-              lapply(seq_along(args), function(i) {
-                if (ns[[i]] != "") {
-                  args[[i]] <<- ns[[i]]
-                }
+            if (is.null(ns)) ns <- rep("", length(cols))
+            named_idx <- nzchar(ns)
+            if (!all(named_idx)) {
+              # SPARK-31517: deparse uses width.cutoff on wide input and the
+              #   output is length>1, so need to collapse it to scalar
+              colsub <- substitute(list(...))[-1L]
+              ns[!named_idx] <- sapply(which(!named_idx), function(ii) {
+                paste(gsub("^\\s*|\\s*$", "", deparse(colsub[[ii]])), collapse = " ")
               })
             }
-            ns <- args
 
             # The last column of the same name in the specific columns takes effect
             deDupCols <- list()
@@ -2772,7 +2785,7 @@ setMethod("merge",
 #' Creates a list of columns by replacing the intersected ones with aliases
 #'
 #' Creates a list of columns by replacing the intersected ones with aliases.
-#' The name of the alias column is formed by concatanating the original column name and a suffix.
+#' The name of the alias column is formed by concatenating the original column name and a suffix.
 #'
 #' @param x a SparkDataFrame
 #' @param intersectedColNames a list of intersected column names of the SparkDataFrame
@@ -3231,7 +3244,7 @@ setMethod("describe",
 #' \item stddev
 #' \item min
 #' \item max
-#' \item arbitrary approximate percentiles specified as a percentage (eg, "75\%")
+#' \item arbitrary approximate percentiles specified as a percentage (e.g., "75\%")
 #' }
 #' If no statistics are given, this function computes count, mean, stddev, min,
 #' approximate quartiles (percentiles at 25\%, 50\%, and 75\%), and max.
@@ -3353,7 +3366,7 @@ setMethod("na.omit",
 setMethod("fillna",
           signature(x = "SparkDataFrame"),
           function(x, value, cols = NULL) {
-            if (!(class(value) %in% c("integer", "numeric", "character", "list"))) {
+            if (!(inherits(value, c("integer", "numeric", "character", "list")))) {
               stop("value should be an integer, numeric, character or named list.")
             }
 
@@ -3365,7 +3378,7 @@ setMethod("fillna",
               }
               # Check each item in the named list is of valid type
               lapply(value, function(v) {
-                if (!(class(v) %in% c("integer", "numeric", "character"))) {
+                if (!(inherits(v, c("integer", "numeric", "character")))) {
                   stop("Each item in value should be an integer, numeric or character.")
                 }
               })
@@ -3444,7 +3457,8 @@ setMethod("as.data.frame",
 #' @note attach since 1.6.0
 setMethod("attach",
           signature(what = "SparkDataFrame"),
-          function(what, pos = 2L, name = deparse(substitute(what), backtick = FALSE),
+          function(what, pos = 2L,
+                   name = paste(deparse(substitute(what), backtick = FALSE), collapse = " "),
                    warn.conflicts = TRUE) {
             args <- as.list(environment()) # capture all parameters - this must be the first line
             newEnv <- assignNewEnv(args$what)
@@ -3563,41 +3577,56 @@ setMethod("str",
 #' This is a no-op if schema doesn't contain column name(s).
 #'
 #' @param x a SparkDataFrame.
-#' @param col a character vector of column names or a Column.
-#' @param ... further arguments to be passed to or from other methods.
-#' @return A SparkDataFrame.
+#' @param col a list of columns or single Column or name.
+#' @param ... additional column(s) if only one column is specified in \code{col}.
+#'            If more than one column is assigned in \code{col}, \code{...}
+#'            should be left empty.
+#' @return A new SparkDataFrame with selected columns.
 #'
 #' @family SparkDataFrame functions
 #' @rdname drop
 #' @name drop
-#' @aliases drop,SparkDataFrame-method
+#' @aliases drop,SparkDataFrame,characterOrColumn-method
 #' @examples
-#'\dontrun{
+#' \dontrun{
 #' sparkR.session()
 #' path <- "path/to/file.json"
 #' df <- read.json(path)
 #' drop(df, "col1")
 #' drop(df, c("col1", "col2"))
 #' drop(df, df$col1)
+#' drop(df, "col1", "col2")
+#' drop(df, df$name, df$age)
 #' }
-#' @note drop since 2.0.0
+#' @note drop(SparkDataFrame, characterOrColumn, ...) since 3.4.0
 setMethod("drop",
-          signature(x = "SparkDataFrame"),
-          function(x, col) {
-            stopifnot(class(col) == "character" || class(col) == "Column")
-
-            if (class(col) == "Column") {
-              sdf <- callJMethod(x@sdf, "drop", col@jc)
+          signature(x = "SparkDataFrame", col = "characterOrColumn"),
+          function(x, col, ...) {
+            if (class(col) == "character" && length(col) > 1) {
+              if (length(list(...)) > 0) {
+                stop("To drop multiple columns, use a character vector or ... for character/Column")
+              }
+              cols <- as.list(col)
             } else {
-              sdf <- callJMethod(x@sdf, "drop", as.list(col))
+              cols <- list(col, ...)
             }
+
+            cols <- lapply(cols, function(c) {
+              if (class(c) == "Column") {
+                c@jc
+              } else {
+                col(c)@jc
+              }
+            })
+
+            sdf <- callJMethod(x@sdf, "drop", cols[[1]], cols[-1])
             dataFrame(sdf)
           })
 
 # Expose base::drop
 #' @name drop
 #' @rdname drop
-#' @aliases drop,ANY-method
+#' @aliases drop,ANY,ANY-method
 setMethod("drop",
           signature(x = "ANY"),
           function(x) {
@@ -3729,6 +3758,9 @@ setMethod("histogram",
 #'
 #' Save the content of the SparkDataFrame to an external database table via JDBC. Additional JDBC
 #' database connection properties can be set (...)
+#' You can find the JDBC-specific option and parameter documentation for writing tables via JDBC in
+#' \url{https://spark.apache.org/docs/latest/sql-data-sources-jdbc.html#data-source-option}{
+#' Data Source Option} in the version you use.
 #'
 #' Also, mode is used to specify the behavior of the save operation when
 #' data already exists in the data source. There are four modes:
@@ -3743,7 +3775,7 @@ setMethod("histogram",
 #'
 #' @param x a SparkDataFrame.
 #' @param url JDBC database url of the form \code{jdbc:subprotocol:subname}.
-#' @param tableName yhe name of the table in the external database.
+#' @param tableName the name of the table in the external database.
 #' @param mode one of 'append', 'overwrite', 'error', 'errorifexists', 'ignore'
 #'             save mode (it is 'error' by default)
 #' @param ... additional JDBC database connection properties.
@@ -3891,8 +3923,7 @@ setMethod("isStreaming",
 #' @aliases write.stream,SparkDataFrame-method
 #' @rdname write.stream
 #' @name write.stream
-#' @examples
-#'\dontrun{
+#' @examples \dontrun{
 #' sparkR.session()
 #' df <- read.stream("socket", host = "localhost", port = 9999)
 #' isStreaming(df)
@@ -3901,7 +3932,7 @@ setMethod("isStreaming",
 #' # console
 #' q <- write.stream(wordCounts, "console", outputMode = "complete")
 #' # text stream
-#' q <- write.stream(df, "text", path = "/home/user/out", checkpointLocation = "/home/user/cp"
+#' q <- write.stream(df, "text", path = "/home/user/out", checkpointLocation = "/home/user/cp",
 #'                   partitionBy = c("year", "month"), trigger.processingTime = "30 seconds")
 #' # memory stream
 #' q <- write.stream(wordCounts, "memory", queryName = "outs", outputMode = "complete")
@@ -4115,7 +4146,7 @@ setMethod("hint",
           function(x, name, ...) {
             parameters <- list(...)
             if (!all(sapply(parameters, function(y) {
-              if (is.character(y) || is.numeric(y)) {
+              if (is.character(y) || is.numeric(y) || is(class(y), "characterOrColumn")) {
                 TRUE
               } else if (is.list(y)) {
                 all(sapply(y, function(z) { is.character(z) || is.numeric(z) }))
@@ -4125,7 +4156,14 @@ setMethod("hint",
             }))) {
               stop("sql hint should be character, numeric, or list with character or numeric.")
             }
-            jdf <- callJMethod(x@sdf, "hint", name, parameters)
+            jparams <- lapply(parameters, function(c) {
+              if (is.character(c) || is.numeric(c) || is.list(c)) {
+                c
+              } else {
+                c@jc
+              }
+            })
+            jdf <- callJMethod(x@sdf, "hint", name, jparams)
             dataFrame(jdf)
           })
 
@@ -4222,3 +4260,76 @@ setMethod("withWatermark",
             sdf <- callJMethod(x@sdf, "withWatermark", eventTime, delayThreshold)
             dataFrame(sdf)
           })
+
+#' Unpivot a DataFrame from wide format to long format.
+#'
+#' This is the reverse to \code{groupBy(...).pivot(...).agg(...)},
+#' except for the aggregation, which cannot be reversed.
+#'
+#' @param x a SparkDataFrame.
+#' @param ids a character vector or a list of columns
+#' @param values a character vector, a list of columns or \code{NULL}.
+#'               If not NULL must not be empty. If \code{NULL}, uses all columns that
+#'               are not set as \code{ids}.
+#' @param variableColumnName character Name of the variable column.
+#' @param valueColumnName character Name of the value column.
+#' @return a SparkDataFrame.
+#' @aliases unpivot,SparkDataFrame,ANY,ANY,character,character-method
+#' @family SparkDataFrame functions
+#' @rdname unpivot
+#' @name unpivot
+#' @examples
+#' \dontrun{
+#' df <- createDataFrame(data.frame(
+#'   id = 1:3, x = c(1, 3, 5), y = c(2, 4, 6), z = c(-1, 0, 1)
+#' ))
+#'
+#' head(unpivot(df, "id", c("x", "y"), "var", "val"))
+#'
+#' head(unpivot(df, "id", NULL, "var", "val"))
+#' }
+#' @note unpivot since 3.4.0
+setMethod("unpivot",
+          signature(
+            x = "SparkDataFrame", ids = "ANY", values = "ANY",
+            variableColumnName = "character", valueColumnName = "character"
+          ),
+          function(x, ids, values, variableColumnName, valueColumnName) {
+            as_jcols <- function(xs) lapply(
+              xs,
+              function(x) {
+                 if (is.character(x)) {
+                   column(x)@jc
+                 } else {
+                   c@jc
+                 }
+              }
+            )
+
+            sdf <- if (is.null(values)) {
+              callJMethod(
+                x@sdf, "unpivotWithSeq", as_jcols(ids), variableColumnName, valueColumnName
+              )
+            } else {
+              callJMethod(
+                x@sdf, "unpivotWithSeq",
+                as_jcols(ids), as_jcols(values),
+                variableColumnName, valueColumnName
+              )
+            }
+            dataFrame(sdf)
+          })
+
+#' @rdname unpivot
+#' @name melt
+#' @aliases melt,SparkDataFrame,ANY,ANY,character,character-method
+#' @note melt since 3.4.0
+setMethod("melt",
+          signature(
+            x = "SparkDataFrame", ids = "ANY", values = "ANY",
+            variableColumnName = "character", valueColumnName = "character"
+          ),
+          function(x, ids, values, variableColumnName, valueColumnName) {
+            unpivot(x, ids, values, variableColumnName, valueColumnName)
+          }
+)

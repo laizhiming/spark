@@ -82,11 +82,24 @@ abstract class SQLImplicits extends LowPrioritySQLImplicits {
   /** @since 3.0.0 */
   implicit def newLocalDateEncoder: Encoder[java.time.LocalDate] = Encoders.LOCALDATE
 
+  /** @since 3.4.0 */
+  implicit def newLocalDateTimeEncoder: Encoder[java.time.LocalDateTime] = Encoders.LOCALDATETIME
+
   /** @since 2.2.0 */
   implicit def newTimeStampEncoder: Encoder[java.sql.Timestamp] = Encoders.TIMESTAMP
 
   /** @since 3.0.0 */
   implicit def newInstantEncoder: Encoder[java.time.Instant] = Encoders.INSTANT
+
+  /** @since 3.2.0 */
+  implicit def newDurationEncoder: Encoder[java.time.Duration] = Encoders.DURATION
+
+  /** @since 3.2.0 */
+  implicit def newPeriodEncoder: Encoder[java.time.Period] = Encoders.PERIOD
+
+  /** @since 3.2.0 */
+  implicit def newJavaEnumEncoder[A <: java.lang.Enum[_] : TypeTag]: Encoder[A] =
+    ExpressionEncoder()
 
   // Boxed primitives
 
@@ -117,54 +130,63 @@ abstract class SQLImplicits extends LowPrioritySQLImplicits {
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newIntSeqEncoder: Encoder[Seq[Int]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newLongSeqEncoder: Encoder[Seq[Long]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newDoubleSeqEncoder: Encoder[Seq[Double]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newFloatSeqEncoder: Encoder[Seq[Float]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newByteSeqEncoder: Encoder[Seq[Byte]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newShortSeqEncoder: Encoder[Seq[Short]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newBooleanSeqEncoder: Encoder[Seq[Boolean]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newStringSeqEncoder: Encoder[Seq[String]] = ExpressionEncoder()
 
   /**
    * @since 1.6.1
    * @deprecated use [[newSequenceEncoder]]
    */
+  @deprecated("Use newSequenceEncoder instead", "2.2.0")
   def newProductSeqEncoder[A <: Product : TypeTag]: Encoder[Seq[A]] = ExpressionEncoder()
 
   /** @since 2.2.0 */

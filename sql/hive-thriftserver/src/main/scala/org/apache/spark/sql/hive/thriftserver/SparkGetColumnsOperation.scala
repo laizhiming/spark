@@ -19,7 +19,7 @@ package org.apache.spark.sql.hive.thriftserver
 
 import java.util.regex.Pattern
 
-import scala.collection.JavaConverters.seqAsJavaListConverter
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.hive.ql.security.authorization.plugin.{HiveOperationType, HivePrivilegeObject}
 import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject.HivePrivilegeObjectType
@@ -27,7 +27,8 @@ import org.apache.hive.service.cli._
 import org.apache.hive.service.cli.operation.GetColumnsOperation
 import org.apache.hive.service.cli.session.HiveSession
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog
@@ -60,7 +61,14 @@ private[hive] class SparkGetColumnsOperation(
     // Do not change cmdStr. It's used for Hive auditing and authorization.
     val cmdStr = s"catalog : $catalogName, schemaPattern : $schemaName, tablePattern : $tableName"
     val logMsg = s"Listing columns '$cmdStr, columnName : $columnName'"
-    logInfo(s"$logMsg with $statementId")
+
+    val catalogNameStr = if (catalogName == null) "null" else catalogName
+    val schemaNameStr = if (schemaName == null) "null" else schemaName
+    logInfo(log"Listing columns 'catalog : ${MDC(CATALOG_NAME, catalogNameStr)}, " +
+      log"schemaPattern : ${MDC(DATABASE_NAME, schemaNameStr)}, " +
+      log"tablePattern : ${MDC(TABLE_NAME, tableName)}, " +
+      log"columnName : ${MDC(COLUMN_NAME, columnName)}' " +
+      log"with ${MDC(STATEMENT_ID, statementId)}")
 
     setState(OperationState.RUNNING)
     // Always use the latest class loader provided by executionHive's state.
@@ -87,7 +95,7 @@ private[hive] class SparkGetColumnsOperation(
     }.toMap
 
     if (isAuthV2Enabled) {
-      val privObjs = seqAsJavaListConverter(getPrivObjs(db2Tabs)).asJava
+      val privObjs = getPrivObjs(db2Tabs).asJava
       authorizeMetaGets(HiveOperationType.GET_COLUMNS, privObjs, cmdStr)
     }
 
@@ -101,20 +109,20 @@ private[hive] class SparkGetColumnsOperation(
       }
 
       // Global temporary views
-      val globalTempViewDb = catalog.globalTempViewManager.database
+      val globalTempViewDb = catalog.globalTempDatabase
       val databasePattern = Pattern.compile(CLIServiceUtils.patternToRegex(schemaName))
       if (databasePattern.matcher(globalTempViewDb).matches()) {
         catalog.globalTempViewManager.listViewNames(tablePattern).foreach { globalTempView =>
-          catalog.globalTempViewManager.get(globalTempView).foreach { plan =>
-            addToRowSet(columnPattern, globalTempViewDb, globalTempView, plan.schema)
+          catalog.getRawGlobalTempView(globalTempView).map(_.tableMeta.schema).foreach {
+            schema => addToRowSet(columnPattern, globalTempViewDb, globalTempView, schema)
           }
         }
       }
 
       // Temporary views
       catalog.listLocalTempViews(tablePattern).foreach { localTempView =>
-        catalog.getTempView(localTempView.table).foreach { plan =>
-          addToRowSet(columnPattern, null, localTempView.table, plan.schema)
+        catalog.getRawTempView(localTempView.table).map(_.tableMeta.schema).foreach {
+          schema => addToRowSet(columnPattern, null, localTempView.table, schema)
         }
       }
       setState(OperationState.FINISHED)
@@ -130,9 +138,10 @@ private[hive] class SparkGetColumnsOperation(
    * For array, map, string, and binaries, the column size is variable, return null as unknown.
    */
   private def getColumnSize(typ: DataType): Option[Int] = typ match {
-    case dt @ (BooleanType | _: NumericType | DateType | TimestampType |
-               CalendarIntervalType | NullType) =>
+    case dt @ (BooleanType | _: NumericType | DateType | TimestampType | TimestampNTZType |
+               CalendarIntervalType | NullType | _: AnsiIntervalType) =>
       Some(dt.defaultSize)
+    case CharType(n) => Some(n)
     case StructType(fields) =>
       val sizeArr = fields.map(f => getColumnSize(f.dataType))
       if (sizeArr.contains(None)) {
@@ -156,7 +165,7 @@ private[hive] class SparkGetColumnsOperation(
     case FloatType => Some(7)
     case DoubleType => Some(15)
     case d: DecimalType => Some(d.scale)
-    case TimestampType => Some(6)
+    case TimestampType | TimestampNTZType => Some(6)
     case _ => None
   }
 
@@ -176,14 +185,17 @@ private[hive] class SparkGetColumnsOperation(
     case DoubleType => java.sql.Types.DOUBLE
     case _: DecimalType => java.sql.Types.DECIMAL
     case StringType => java.sql.Types.VARCHAR
+    case VarcharType(_) => java.sql.Types.VARCHAR
+    case CharType(_) => java.sql.Types.CHAR
     case BinaryType => java.sql.Types.BINARY
     case DateType => java.sql.Types.DATE
-    case TimestampType => java.sql.Types.TIMESTAMP
+    case TimestampType | TimestampNTZType => java.sql.Types.TIMESTAMP
     case _: ArrayType => java.sql.Types.ARRAY
     case _: MapType => java.sql.Types.JAVA_OBJECT
     case _: StructType => java.sql.Types.STRUCT
     // Hive's year-month and day-time intervals are mapping to java.sql.Types.OTHER
-    case _: CalendarIntervalType => java.sql.Types.OTHER
+    case _: CalendarIntervalType | _: AnsiIntervalType =>
+      java.sql.Types.OTHER
     case _ => throw new IllegalArgumentException(s"Unrecognized type name: ${typ.sql}")
   }
 

@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,8 +28,11 @@ import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Multimap;
 import org.apache.hadoop.hive.metastore.TableType;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 
 /**
  * ClassicTableTypeMapping.
@@ -41,7 +43,7 @@ import org.slf4j.LoggerFactory;
  */
 public class ClassicTableTypeMapping implements TableTypeMapping {
 
-  private static final Logger LOG = LoggerFactory.getLogger(ClassicTableTypeMapping.class);
+  private static final SparkLogger LOG = SparkLoggerFactory.getLogger(ClassicTableTypeMapping.class);
 
   public enum ClassicTableTypes {
     TABLE,
@@ -70,7 +72,8 @@ public class ClassicTableTypeMapping implements TableTypeMapping {
   public String[] mapToHiveType(String clientTypeName) {
     Collection<String> hiveTableType = clientToHiveMap.get(clientTypeName.toUpperCase());
     if (hiveTableType == null) {
-      LOG.warn("Not supported client table type " + clientTypeName);
+      LOG.warn("Not supported client table type {}",
+        MDC.of(LogKeys.TABLE_TYPE$.MODULE$, clientTypeName));
       return new String[] {clientTypeName};
     }
     return Iterables.toArray(hiveTableType, String.class);
@@ -80,7 +83,8 @@ public class ClassicTableTypeMapping implements TableTypeMapping {
   public String mapToClientType(String hiveTypeName) {
     String clientTypeName = hiveToClientMap.get(hiveTypeName);
     if (clientTypeName == null) {
-      LOG.warn("Invalid hive table type " + hiveTypeName);
+      LOG.warn("Invalid hive table type {}",
+        MDC.of(LogKeys.TABLE_TYPE$.MODULE$, hiveTypeName));
       return hiveTypeName;
     }
     return clientTypeName;

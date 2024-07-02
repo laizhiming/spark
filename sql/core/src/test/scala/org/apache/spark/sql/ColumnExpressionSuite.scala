@@ -18,21 +18,27 @@
 package org.apache.spark.sql
 
 import java.sql.{Date, Timestamp}
+import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period}
+import java.time.temporal.ChronoUnit
 import java.util.Locale
 
 import org.apache.hadoop.io.{LongWritable, Text}
 import org.apache.hadoop.mapreduce.lib.input.{TextInputFormat => NewTextInputFormat}
 import org.scalatest.matchers.should.Matchers._
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkRuntimeException}
 import org.apache.spark.sql.UpdateFieldsBenchmark._
 import org.apache.spark.sql.catalyst.expressions.{InSet, Literal, NamedExpression}
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{outstandingTimezonesIds, outstandingZoneIds}
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.execution.ProjectExec
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.DayTimeIntervalType.DAY
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
 
 class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   import testImplicits._
@@ -132,6 +138,19 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
     assert(newCol.expr.asInstanceOf[NamedExpression].metadata.getString("key") === "value")
   }
 
+  test("SPARK-34805: as propagates metadata from nested column") {
+    val metadata = new MetadataBuilder
+    metadata.putString("key", "value")
+    val df = spark.createDataFrame(sparkContext.emptyRDD[Row],
+      StructType(Seq(
+        StructField("parent", StructType(Seq(
+          StructField("child", StringType, metadata = metadata.build())
+        ))))
+      ))
+    val newCol = df("parent.child")
+    assert(newCol.expr.asInstanceOf[NamedExpression].metadata.getString("key") === "value")
+  }
+
   test("collect on column produced by a binary operator") {
     val df = Seq((1, 2, 3)).toDF("a", "b", "c")
     checkAnswer(df.select(df("a") + df("b")), Seq(Row(3)))
@@ -143,7 +162,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   }
 
   test("star qualified by data frame object") {
-    val df = testData.toDF
+    val df = testData.toDF()
     val goldAnswer = df.collect().toSeq
     checkAnswer(df.select(df("*")), goldAnswer)
 
@@ -153,6 +172,28 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("star qualified by table name") {
     checkAnswer(testData.as("testData").select($"testData.*"), testData.collect().toSeq)
+  }
+
+  test("SPARK-34199: star can be qualified by table name inside a non-count function") {
+    checkAnswer(
+      testData.as("testData").selectExpr("hash(testData.*)"),
+      testData.as("testData").selectExpr("hash(testData.key, testData.value)")
+    )
+  }
+
+  test("SPARK-34199: star cannot be qualified by table name inside a count function") {
+    val e = intercept[AnalysisException] {
+      testData.as("testData").selectExpr("count(testData.*)").collect()
+    }
+    assert(e.getMessage.contains(
+      "count(testData.*) is not allowed. Please use count(*) or expand the columns manually"))
+  }
+
+  test("SPARK-34199: table star can be qualified inside a count function with multiple arguments") {
+    checkAnswer(
+      testData.as("testData").selectExpr("count(testData.*, testData.key)"),
+      testData.as("testData").selectExpr("count(testData.key, testData.value, testData.key)")
+    )
   }
 
   test("+") {
@@ -220,7 +261,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("isNull") {
     checkAnswer(
-      nullStrings.toDF.where($"s".isNull),
+      nullStrings.toDF().where($"s".isNull),
       nullStrings.collect().toSeq.filter(r => r.getString(1) eq null))
 
     checkAnswer(
@@ -230,7 +271,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("isNotNull") {
     checkAnswer(
-      nullStrings.toDF.where($"s".isNotNull),
+      nullStrings.toDF().where($"s".isNotNull),
       nullStrings.collect().toSeq.filter(r => r.getString(1) ne null))
 
     checkAnswer(
@@ -254,9 +295,11 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
       testData.select(isnan($"a"), isnan($"b")),
       Row(true, true) :: Row(true, true) :: Row(false, false) :: Row(false, false) :: Nil)
 
-    checkAnswer(
-      sql("select isnan(15), isnan('invalid')"),
-      Row(false, false))
+    if (!conf.ansiEnabled) {
+      checkAnswer(
+        sql("select isnan(15), isnan('invalid')"),
+        Row(false, false))
+    }
   }
 
   test("nanvl") {
@@ -408,14 +451,17 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
       df.collect().toSeq.filter(r => r.getInt(0) == 3 || r.getInt(0) == 1))
 
     val df2 = Seq((1, Seq(1)), (2, Seq(2)), (3, Seq(3))).toDF("a", "b")
-
-    val e = intercept[AnalysisException] {
-      df2.filter($"a".isin($"b"))
-    }
-    Seq("cannot resolve", "due to data type mismatch: Arguments must be same type but were")
-      .foreach { s =>
-        assert(e.getMessage.toLowerCase(Locale.ROOT).contains(s.toLowerCase(Locale.ROOT)))
-      }
+    checkError(
+      exception = intercept[AnalysisException] {
+        df2.filter($"a".isin($"b"))
+      },
+      errorClass = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
+      parameters = Map(
+        "functionName" -> "`in`",
+        "dataType" -> "[\"INT\", \"ARRAY<INT>\"]",
+        "sqlExpr" -> "\"(a IN (b))\""),
+      context = ExpectedContext(fragment = "isin", callSitePattern = getCurrentClassCallSitePattern)
+    )
   }
 
   test("IN/INSET with bytes, shorts, ints, dates") {
@@ -473,14 +519,19 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             df.collect().toSeq.filter(r => r.getInt(0) == 3 || r.getInt(0) == 1))
 
           val df2 = Seq((1, Seq(1)), (2, Seq(2)), (3, Seq(3))).toDF("a", "b")
-
-          val e = intercept[AnalysisException] {
-            df2.filter($"a".isInCollection(Seq($"b")))
-          }
-          Seq("cannot resolve", "due to data type mismatch: Arguments must be same type but were")
-            .foreach { s =>
-              assert(e.getMessage.toLowerCase(Locale.ROOT).contains(s.toLowerCase(Locale.ROOT)))
-            }
+          checkError(
+            exception = intercept[AnalysisException] {
+              df2.filter($"a".isInCollection(Seq($"b")))
+            },
+            errorClass = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
+            parameters = Map(
+              "functionName" -> "`in`",
+              "dataType" -> "[\"INT\", \"ARRAY<INT>\"]",
+              "sqlExpr" -> "\"(a IN (b))\""),
+            context = ExpectedContext(
+              fragment = "isInCollection",
+              callSitePattern = getCurrentClassCallSitePattern)
+          )
         }
       }
     }
@@ -493,41 +544,41 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
         withSQLConf(
           SQLConf.OPTIMIZER_INSET_CONVERSION_THRESHOLD.key -> optThreshold.toString,
           SQLConf.OPTIMIZER_INSET_SWITCH_THRESHOLD.key -> switchThreshold.toString) {
-          checkAnswer(Seq(0).toDS.select($"value".isInCollection(Seq(null))), Seq(Row(null)))
+          checkAnswer(Seq(0).toDS().select($"value".isInCollection(Seq(null))), Seq(Row(null)))
           checkAnswer(
-            Seq(true).toDS.select($"value".isInCollection(Seq(true, false))),
+            Seq(true).toDS().select($"value".isInCollection(Seq(true, false))),
             Seq(Row(true)))
           checkAnswer(
-            Seq(0.toByte, 1.toByte).toDS.select($"value".isInCollection(Seq(0.toByte, 2.toByte))),
+            Seq(0.toByte, 1.toByte).toDS().select($"value".isInCollection(Seq(0.toByte, 2.toByte))),
             expected)
           checkAnswer(
-            Seq(0.toShort, 1.toShort).toDS
+            Seq(0.toShort, 1.toShort).toDS()
               .select($"value".isInCollection(Seq(0.toShort, 2.toShort))),
             expected)
-          checkAnswer(Seq(0, 1).toDS.select($"value".isInCollection(Seq(0, 2))), expected)
-          checkAnswer(Seq(0L, 1L).toDS.select($"value".isInCollection(Seq(0L, 2L))), expected)
-          checkAnswer(Seq(0.0f, 1.0f).toDS
+          checkAnswer(Seq(0, 1).toDS().select($"value".isInCollection(Seq(0, 2))), expected)
+          checkAnswer(Seq(0L, 1L).toDS().select($"value".isInCollection(Seq(0L, 2L))), expected)
+          checkAnswer(Seq(0.0f, 1.0f).toDS()
             .select($"value".isInCollection(Seq(0.0f, 2.0f))), expected)
-          checkAnswer(Seq(0.0D, 1.0D).toDS
+          checkAnswer(Seq(0.0D, 1.0D).toDS()
             .select($"value".isInCollection(Seq(0.0D, 2.0D))), expected)
           checkAnswer(
-            Seq(BigDecimal(0), BigDecimal(2)).toDS
+            Seq(BigDecimal(0), BigDecimal(2)).toDS()
               .select($"value".isInCollection(Seq(BigDecimal(0), BigDecimal(1)))),
             expected)
           checkAnswer(
-            Seq("abc", "def").toDS.select($"value".isInCollection(Seq("abc", "xyz"))),
+            Seq("abc", "def").toDS().select($"value".isInCollection(Seq("abc", "xyz"))),
             expected)
           checkAnswer(
-            Seq(Date.valueOf("2020-04-29"), Date.valueOf("2020-05-01")).toDS
+            Seq(Date.valueOf("2020-04-29"), Date.valueOf("2020-05-01")).toDS()
               .select($"value".isInCollection(
                 Seq(Date.valueOf("2020-04-29"), Date.valueOf("2020-04-30")))),
             expected)
           checkAnswer(
-            Seq(new Timestamp(0), new Timestamp(2)).toDS
+            Seq(new Timestamp(0), new Timestamp(2)).toDS()
               .select($"value".isInCollection(Seq(new Timestamp(0), new Timestamp(1)))),
             expected)
           checkAnswer(
-            Seq(Array("a", "b"), Array("c", "d")).toDS
+            Seq(Array("a", "b"), Array("c", "d")).toDS()
               .select($"value".isInCollection(Seq(Array("a", "b"), Array("x", "z")))),
             expected)
         }
@@ -552,7 +603,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("||") {
     checkAnswer(
       booleanData.filter($"a" || true),
-      booleanData.collect())
+      booleanData.collect().toImmutableArraySeq)
 
     checkAnswer(
       booleanData.filter($"a" || false),
@@ -675,11 +726,21 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
         data.write.saveAsTable("tab1")
         data.write.saveAsTable("tab2")
         data.createOrReplaceTempView("tempView1")
-        Seq("input_file_name", "input_file_block_start", "input_file_block_length").foreach { f =>
-          val e = intercept[AnalysisException] {
-            sql(s"SELECT *, $f() FROM tab1 JOIN tab2 ON tab1.id = tab2.id")
-          }.getMessage
-          assert(e.contains(s"'$f' does not support more than one source"))
+        Seq(
+          ("input_file_name", 26),
+          ("input_file_block_start", 33),
+          ("input_file_block_length", 34)).foreach { case (f, e) =>
+          checkError(
+            exception = intercept[AnalysisException] {
+              sql(s"SELECT *, $f() FROM tab1 JOIN tab2 ON tab1.id = tab2.id")
+            },
+            errorClass = "MULTI_SOURCES_UNSUPPORTED_FOR_EXPRESSION",
+            parameters = Map("expr" -> s""""$f()""""),
+            context = ExpectedContext(
+              fragment = s"$f()",
+              start = 10,
+              stop = e)
+          )
         }
 
         def checkResult(
@@ -688,8 +749,17 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             numExpectedRows: Int = 0): Unit = {
           val stmt = s"SELECT *, input_file_name() FROM ($fromClause)"
           if (exceptionExpected) {
-            val e = intercept[AnalysisException](sql(stmt)).getMessage
-            assert(e.contains("'input_file_name' does not support more than one source"))
+            checkError(
+              exception = intercept[AnalysisException] {
+                sql(stmt)
+              },
+              errorClass = "MULTI_SOURCES_UNSUPPORTED_FOR_EXPRESSION",
+              parameters = Map("expr" -> """"input_file_name()""""),
+              context = ExpectedContext(
+                fragment = s"input_file_name()",
+                start = 10,
+                stop = 26)
+            )
           } else {
             assert(sql(stmt).count() == numExpectedRows)
           }
@@ -905,7 +975,19 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
       testData2.collect().toSeq.map(r => Row(r.getInt(0) ^ r.getInt(1) ^ 39)))
   }
 
+  test("SPARK-37646: lit") {
+    assert(lit($"foo") == $"foo")
+    assert(lit($"foo") == $"foo")
+    assert(lit(1) == Column(Literal(1)))
+    assert(lit(null) == Column(Literal(null, NullType)))
+  }
+
   test("typedLit") {
+    assert(typedLit($"foo") == $"foo")
+    assert(typedLit($"foo") == $"foo")
+    assert(typedLit(1) == Column(Literal(1)))
+    assert(typedLit[String](null) == Column(Literal(null, StringType)))
+
     val df = Seq(Tuple1(0)).toDF("a")
     // Only check the types `lit` cannot handle
     checkAnswer(
@@ -969,9 +1051,21 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
         nullable = false))))
 
   test("withField should throw an exception if called on a non-StructType column") {
-    intercept[AnalysisException] {
-      testData.withColumn("key", $"key".withField("a", lit(2)))
-    }.getMessage should include("struct argument should be struct type, got: int")
+    checkError(
+      exception = intercept[AnalysisException] {
+        testData.withColumn("key", $"key".withField("a", lit(2)))
+      },
+      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"update_fields(key, WithField(2))\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"key\"",
+        "inputType" -> "\"INT\"",
+        "requiredType" -> "\"STRUCT\""),
+      context = ExpectedContext(
+        fragment = "withField",
+        callSitePattern = getCurrentClassCallSitePattern)
+    )
   }
 
   test("withField should throw an exception if either fieldName or col argument are null") {
@@ -989,33 +1083,56 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   }
 
   test("withField should throw an exception if any intermediate structs don't exist") {
-    intercept[AnalysisException] {
-      structLevel2.withColumn("a", 'a.withField("x.b", lit(2)))
-    }.getMessage should include("No such struct field x in a")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel2.withColumn("a", $"a".withField("x.b", lit(2)))
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`x`", "fields" -> "`a`"))
 
-    intercept[AnalysisException] {
-      structLevel3.withColumn("a", 'a.withField("a.x.b", lit(2)))
-    }.getMessage should include("No such struct field x in a")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel3.withColumn("a", $"a".withField("a.x.b", lit(2)))
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`x`", "fields" -> "`a`"))
   }
 
   test("withField should throw an exception if intermediate field is not a struct") {
-    intercept[AnalysisException] {
-      structLevel1.withColumn("a", 'a.withField("b.a", lit(2)))
-    }.getMessage should include("struct argument should be struct type, got: int")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel1.withColumn("a", $"a".withField("b.a", lit(2)))
+      },
+      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"update_fields(a.b, WithField(2))\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"a.b\"",
+        "inputType" -> "\"INT\"",
+        "requiredType" -> "\"STRUCT\""),
+      context = ExpectedContext(
+        fragment = "withField",
+        callSitePattern = getCurrentClassCallSitePattern)
+    )
   }
 
   test("withField should throw an exception if intermediate field reference is ambiguous") {
-    intercept[AnalysisException] {
-      val structLevel2: DataFrame = spark.createDataFrame(
-        sparkContext.parallelize(Row(Row(Row(1, null, 3), 4)) :: Nil),
-        StructType(Seq(
-          StructField("a", StructType(Seq(
-            StructField("a", structType, nullable = false),
-            StructField("a", structType, nullable = false))),
-            nullable = false))))
+    checkError(
+      exception = intercept[AnalysisException] {
+        val structLevel2: DataFrame = spark.createDataFrame(
+          sparkContext.parallelize(Row(Row(Row(1, null, 3), 4)) :: Nil),
+          StructType(Seq(
+            StructField("a", StructType(Seq(
+              StructField("a", structType, nullable = false),
+              StructField("a", structType, nullable = false))),
+              nullable = false))))
 
-      structLevel2.withColumn("a", 'a.withField("a.b", lit(2)))
-    }.getMessage should include("Ambiguous reference to fields")
+        structLevel2.withColumn("a", $"a".withField("a.b", lit(2)))
+      },
+      errorClass = "AMBIGUOUS_REFERENCE_TO_FIELDS",
+      sqlState = "42000",
+      parameters = Map("field" -> "`a`", "count" -> "2")
+    )
   }
 
   test("withField should add field with no name") {
@@ -1033,7 +1150,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add field to struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("d", lit(4))),
+      structLevel1.withColumn("a", $"a".withField("d", lit(4))),
       Row(Row(1, null, 3, 4)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1074,7 +1191,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add null field to struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("d", lit(null).cast(IntegerType))),
+      structLevel1.withColumn("a", $"a".withField("d", lit(null).cast(IntegerType))),
       Row(Row(1, null, 3, null)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1087,7 +1204,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add multiple fields to struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("d", lit(4)).withField("e", lit(5))),
+      structLevel1.withColumn("a", $"a".withField("d", lit(4)).withField("e", lit(5))),
       Row(Row(1, null, 3, 4, 5)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1101,7 +1218,8 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add multiple fields to nullable struct") {
     checkAnswer(
-      nullableStructLevel1.withColumn("a", 'a.withField("d", lit(4)).withField("e", lit(5))),
+      nullableStructLevel1.withColumn("a", $"a"
+        .withField("d", lit(4)).withField("e", lit(5))),
       Row(null) :: Row(Row(1, null, 3, 4, 5)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1115,8 +1233,8 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add field to nested struct") {
     Seq(
-      structLevel2.withColumn("a", 'a.withField("a.d", lit(4))),
-      structLevel2.withColumn("a", 'a.withField("a", $"a.a".withField("d", lit(4))))
+      structLevel2.withColumn("a", $"a".withField("a.d", lit(4))),
+      structLevel2.withColumn("a", $"a".withField("a", $"a.a".withField("d", lit(4))))
     ).foreach { df =>
       checkAnswer(
         df,
@@ -1177,7 +1295,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add field to deeply nested struct") {
     checkAnswer(
-      structLevel3.withColumn("a", 'a.withField("a.a.d", lit(4))),
+      structLevel3.withColumn("a", $"a".withField("a.a.d", lit(4))),
       Row(Row(Row(Row(1, null, 3, 4)))) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1194,7 +1312,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should replace field in struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("b", lit(2))),
+      structLevel1.withColumn("a", $"a".withField("b", lit(2))),
       Row(Row(1, 2, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1206,7 +1324,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should replace field in nullable struct") {
     checkAnswer(
-      nullableStructLevel1.withColumn("a", 'a.withField("b", lit("foo"))),
+      nullableStructLevel1.withColumn("a", $"a".withField("b", lit("foo"))),
       Row(null) :: Row(Row(1, "foo", 3)) ::  Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1232,7 +1350,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should replace field with null value in struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("c", lit(null).cast(IntegerType))),
+      structLevel1.withColumn("a", $"a".withField("c", lit(null).cast(IntegerType))),
       Row(Row(1, null, null)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1244,7 +1362,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should replace multiple fields in struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("a", lit(10)).withField("b", lit(20))),
+      structLevel1.withColumn("a", $"a".withField("a", lit(10)).withField("b", lit(20))),
       Row(Row(10, 20, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1256,7 +1374,8 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should replace multiple fields in nullable struct") {
     checkAnswer(
-      nullableStructLevel1.withColumn("a", 'a.withField("a", lit(10)).withField("b", lit(20))),
+      nullableStructLevel1.withColumn("a", $"a".withField("a", lit(10))
+        .withField("b", lit(20))),
       Row(null) :: Row(Row(10, 20, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1269,7 +1388,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("withField should replace field in nested struct") {
     Seq(
       structLevel2.withColumn("a", $"a".withField("a.b", lit(2))),
-      structLevel2.withColumn("a", 'a.withField("a", $"a.a".withField("b", lit(2))))
+      structLevel2.withColumn("a", $"a".withField("a", $"a.a".withField("b", lit(2))))
     ).foreach { df =>
       checkAnswer(
         df,
@@ -1350,7 +1469,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
           nullable = false))))
 
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("b", lit(100))),
+      structLevel1.withColumn("a", $"a".withField("b", lit(100))),
       Row(Row(1, 100, 100)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1362,7 +1481,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should replace fields in struct in given order") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("b", lit(2)).withField("b", lit(20))),
+      structLevel1.withColumn("a", $"a".withField("b", lit(2)).withField("b", lit(20))),
       Row(Row(1, 20, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1374,7 +1493,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should add field and then replace same field in struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.withField("d", lit(4)).withField("d", lit(5))),
+      structLevel1.withColumn("a", $"a".withField("d", lit(4)).withField("d", lit(5))),
       Row(Row(1, null, 3, 5)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1398,7 +1517,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
           nullable = false))))
 
     checkAnswer(
-      df.withColumn("a", 'a.withField("`a.b`.`e.f`", lit(2))),
+      df.withColumn("a", $"a".withField("`a.b`.`e.f`", lit(2))),
       Row(Row(Row(1, 2, 3))) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1409,9 +1528,12 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))),
           nullable = false))))
 
-    intercept[AnalysisException] {
-      df.withColumn("a", 'a.withField("a.b.e.f", lit(2)))
-    }.getMessage should include("No such struct field a in a.b")
+    checkError(
+      exception = intercept[AnalysisException] {
+        df.withColumn("a", $"a".withField("a.b.e.f", lit(2)))
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`a`", "fields" -> "`a`.`b`"))
   }
 
   private lazy val mixedCaseStructLevel1: DataFrame = spark.createDataFrame(
@@ -1425,7 +1547,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("withField should replace field in struct even if casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.withField("A", lit(2))),
+        mixedCaseStructLevel1.withColumn("a", $"a".withField("A", lit(2))),
         Row(Row(2, 1)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1434,7 +1556,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))))
 
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.withField("b", lit(2))),
+        mixedCaseStructLevel1.withColumn("a", $"a".withField("b", lit(2))),
         Row(Row(1, 2)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1447,7 +1569,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("withField should add field to struct because casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.withField("A", lit(2))),
+        mixedCaseStructLevel1.withColumn("a", $"a".withField("A", lit(2))),
         Row(Row(1, 1, 2)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1457,7 +1579,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))))
 
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.withField("b", lit(2))),
+        mixedCaseStructLevel1.withColumn("a", $"a".withField("b", lit(2))),
         Row(Row(1, 1, 2)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1485,7 +1607,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("withField should replace nested field in struct even if casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
       checkAnswer(
-        mixedCaseStructLevel2.withColumn("a", 'a.withField("A.a", lit(2))),
+        mixedCaseStructLevel2.withColumn("a", $"a".withField("A.a", lit(2))),
         Row(Row(Row(2, 1), Row(1, 1))) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1500,7 +1622,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))))
 
       checkAnswer(
-        mixedCaseStructLevel2.withColumn("a", 'a.withField("b.a", lit(2))),
+        mixedCaseStructLevel2.withColumn("a", $"a".withField("b.a", lit(2))),
         Row(Row(Row(1, 1), Row(2, 1))) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1518,13 +1640,19 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("withField should throw an exception because casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
-      intercept[AnalysisException] {
-        mixedCaseStructLevel2.withColumn("a", 'a.withField("A.a", lit(2)))
-      }.getMessage should include("No such struct field A in a, B")
+      checkError(
+        exception = intercept[AnalysisException] {
+          mixedCaseStructLevel2.withColumn("a", $"a".withField("A.a", lit(2)))
+        },
+        errorClass = "FIELD_NOT_FOUND",
+        parameters = Map("fieldName" -> "`A`", "fields" -> "`a`, `B`"))
 
-      intercept[AnalysisException] {
-        mixedCaseStructLevel2.withColumn("a", 'a.withField("b.a", lit(2)))
-      }.getMessage should include("No such struct field b in a, B")
+      checkError(
+        exception = intercept[AnalysisException] {
+          mixedCaseStructLevel2.withColumn("a", $"a".withField("b.a", lit(2)))
+        },
+        errorClass = "FIELD_NOT_FOUND",
+        parameters = Map("fieldName" -> "`b`", "fields" -> "`a`, `B`"))
     }
   }
 
@@ -1554,10 +1682,15 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
         .select($"struct_col".withField("a.c", lit(3))),
       Row(Row(Row(1, 2, 3))))
 
-    intercept[AnalysisException] {
-      sql("SELECT named_struct('a', named_struct('b', 1), 'a', named_struct('c', 2)) struct_col")
-        .select($"struct_col".withField("a.c", lit(3)))
-    }.getMessage should include("Ambiguous reference to fields")
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("SELECT named_struct('a', named_struct('b', 1), 'a', named_struct('c', 2)) struct_col")
+          .select($"struct_col".withField("a.c", lit(3)))
+      },
+      errorClass = "AMBIGUOUS_REFERENCE_TO_FIELDS",
+      sqlState = "42000",
+      parameters = Map("field" -> "`a`", "count" -> "2")
+    )
 
     checkAnswer(
       sql("SELECT named_struct('a', named_struct('a', 1, 'b', 2)) struct_col")
@@ -1660,11 +1793,78 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
       StructType(Seq(StructField("a", IntegerType, nullable = true))))
   }
 
+  test("SPARK-35213: chained withField operations should have correct schema for new columns") {
+    val df = spark.createDataFrame(
+      sparkContext.parallelize(Row(null) :: Nil),
+      StructType(Seq(StructField("data", NullType))))
+
+    checkAnswer(
+      df.withColumn("data", struct()
+        .withField("a", struct())
+        .withField("b", struct())
+        .withField("a.aa", lit("aa1"))
+        .withField("b.ba", lit("ba1"))
+        .withField("a.ab", lit("ab1"))),
+        Row(Row(Row("aa1", "ab1"), Row("ba1"))) :: Nil,
+        StructType(Seq(
+          StructField("data", StructType(Seq(
+            StructField("a", StructType(Seq(
+              StructField("aa", StringType, nullable = false),
+              StructField("ab", StringType, nullable = false)
+            )), nullable = false),
+            StructField("b", StructType(Seq(
+              StructField("ba", StringType, nullable = false)
+            )), nullable = false)
+          )), nullable = false)
+        ))
+    )
+  }
+
+  test("SPARK-35213: optimized withField operations should maintain correct nested struct " +
+    "ordering") {
+    val df = spark.createDataFrame(
+      sparkContext.parallelize(Row(null) :: Nil),
+      StructType(Seq(StructField("data", NullType))))
+
+    checkAnswer(
+      df.withColumn("data", struct()
+          .withField("a", struct().withField("aa", lit("aa1")))
+          .withField("b", struct().withField("ba", lit("ba1")))
+        )
+        .withColumn("data", col("data").withField("b.bb", lit("bb1")))
+        .withColumn("data", col("data").withField("a.ab", lit("ab1"))),
+        Row(Row(Row("aa1", "ab1"), Row("ba1", "bb1"))) :: Nil,
+        StructType(Seq(
+          StructField("data", StructType(Seq(
+            StructField("a", StructType(Seq(
+              StructField("aa", StringType, nullable = false),
+              StructField("ab", StringType, nullable = false)
+            )), nullable = false),
+            StructField("b", StructType(Seq(
+              StructField("ba", StringType, nullable = false),
+              StructField("bb", StringType, nullable = false)
+            )), nullable = false)
+          )), nullable = false)
+        ))
+    )
+  }
 
   test("dropFields should throw an exception if called on a non-StructType column") {
-    intercept[AnalysisException] {
-      testData.withColumn("key", $"key".dropFields("a"))
-    }.getMessage should include("struct argument should be struct type, got: int")
+    checkError(
+      exception = intercept[AnalysisException] {
+        testData.withColumn("key", $"key".dropFields("a"))
+      },
+      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"update_fields(key, dropfield())\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"key\"",
+        "inputType" -> "\"INT\"",
+        "requiredType" -> "\"STRUCT\""),
+      context = ExpectedContext(
+        fragment = "dropFields",
+        callSitePattern = getCurrentClassCallSitePattern)
+    )
   }
 
   test("dropFields should throw an exception if fieldName argument is null") {
@@ -1674,38 +1874,61 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   }
 
   test("dropFields should throw an exception if any intermediate structs don't exist") {
-    intercept[AnalysisException] {
-      structLevel2.withColumn("a", 'a.dropFields("x.b"))
-    }.getMessage should include("No such struct field x in a")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel2.withColumn("a", $"a".dropFields("x.b"))
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`x`", "fields" -> "`a`"))
 
-    intercept[AnalysisException] {
-      structLevel3.withColumn("a", 'a.dropFields("a.x.b"))
-    }.getMessage should include("No such struct field x in a")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel3.withColumn("a", $"a".dropFields("a.x.b"))
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`x`", "fields" -> "`a`"))
   }
 
   test("dropFields should throw an exception if intermediate field is not a struct") {
-    intercept[AnalysisException] {
-      structLevel1.withColumn("a", 'a.dropFields("b.a"))
-    }.getMessage should include("struct argument should be struct type, got: int")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel1.withColumn("a", $"a".dropFields("b.a"))
+      },
+      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"update_fields(a.b, dropfield())\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"a.b\"",
+        "inputType" -> "\"INT\"",
+        "requiredType" -> "\"STRUCT\""),
+      context = ExpectedContext(
+        fragment = "dropFields",
+        callSitePattern = getCurrentClassCallSitePattern)
+    )
   }
 
   test("dropFields should throw an exception if intermediate field reference is ambiguous") {
-    intercept[AnalysisException] {
-      val structLevel2: DataFrame = spark.createDataFrame(
-        sparkContext.parallelize(Row(Row(Row(1, null, 3), 4)) :: Nil),
-        StructType(Seq(
-          StructField("a", StructType(Seq(
-            StructField("a", structType, nullable = false),
-            StructField("a", structType, nullable = false))),
-            nullable = false))))
+    checkError(
+      exception = intercept[AnalysisException] {
+        val structLevel2: DataFrame = spark.createDataFrame(
+          sparkContext.parallelize(Row(Row(Row(1, null, 3), 4)) :: Nil),
+          StructType(Seq(
+            StructField("a", StructType(Seq(
+              StructField("a", structType, nullable = false),
+              StructField("a", structType, nullable = false))),
+              nullable = false))))
 
-      structLevel2.withColumn("a", 'a.dropFields("a.b"))
-    }.getMessage should include("Ambiguous reference to fields")
+        structLevel2.withColumn("a", $"a".dropFields("a.b"))
+      },
+      errorClass = "AMBIGUOUS_REFERENCE_TO_FIELDS",
+      sqlState = "42000",
+      parameters = Map("field" -> "`a`", "count" -> "2")
+    )
   }
 
   test("dropFields should drop field in struct") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.dropFields("b")),
+      structLevel1.withColumn("a", $"a".dropFields("b")),
       Row(Row(1, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1728,7 +1951,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("dropFields should drop multiple fields in struct") {
     Seq(
       structLevel1.withColumn("a", $"a".dropFields("b", "c")),
-      structLevel1.withColumn("a", 'a.dropFields("b").dropFields("c"))
+      structLevel1.withColumn("a", $"a".dropFields("b").dropFields("c"))
     ).foreach { df =>
       checkAnswer(
         df,
@@ -1741,9 +1964,16 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   }
 
   test("dropFields should throw an exception if no fields will be left in struct") {
-    intercept[AnalysisException] {
-      structLevel1.withColumn("a", 'a.dropFields("a", "b", "c"))
-    }.getMessage should include("cannot drop all fields in struct")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel1.withColumn("a", $"a".dropFields("a", "b", "c"))
+      },
+      errorClass = "DATATYPE_MISMATCH.CANNOT_DROP_ALL_FIELDS",
+      parameters = Map("sqlExpr" -> "\"update_fields(a, dropfield(), dropfield(), dropfield())\""),
+      context = ExpectedContext(
+        fragment = "dropFields",
+        callSitePattern = getCurrentClassCallSitePattern)
+    )
   }
 
   test("dropFields should drop field with no name in struct") {
@@ -1766,7 +1996,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("dropFields should drop field in nested struct") {
     checkAnswer(
-      structLevel2.withColumn("a", 'a.dropFields("a.b")),
+      structLevel2.withColumn("a", $"a".dropFields("a.b")),
       Row(Row(Row(1, 3))) :: Nil,
       StructType(
         Seq(StructField("a", StructType(Seq(
@@ -1779,7 +2009,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("dropFields should drop multiple fields in nested struct") {
     checkAnswer(
-      structLevel2.withColumn("a", 'a.dropFields("a.b", "a.c")),
+      structLevel2.withColumn("a", $"a".dropFields("a.b", "a.c")),
       Row(Row(Row(1))) :: Nil,
       StructType(
         Seq(StructField("a", StructType(Seq(
@@ -1816,7 +2046,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("dropFields should drop field in deeply nested struct") {
     checkAnswer(
-      structLevel3.withColumn("a", 'a.dropFields("a.a.b")),
+      structLevel3.withColumn("a", $"a".dropFields("a.a.b")),
       Row(Row(Row(Row(1, 3)))) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1840,7 +2070,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
           nullable = false))))
 
     checkAnswer(
-      structLevel1.withColumn("a", 'a.dropFields("b")),
+      structLevel1.withColumn("a", $"a".dropFields("b")),
       Row(Row(1)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1851,7 +2081,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("dropFields should drop field in struct even if casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.dropFields("A")),
+        mixedCaseStructLevel1.withColumn("a", $"a".dropFields("A")),
         Row(Row(1)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1859,7 +2089,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))))
 
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.dropFields("b")),
+        mixedCaseStructLevel1.withColumn("a", $"a".dropFields("b")),
         Row(Row(1)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1871,7 +2101,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("dropFields should not drop field in struct because casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.dropFields("A")),
+        mixedCaseStructLevel1.withColumn("a", $"a".dropFields("A")),
         Row(Row(1, 1)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1880,7 +2110,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))))
 
       checkAnswer(
-        mixedCaseStructLevel1.withColumn("a", 'a.dropFields("b")),
+        mixedCaseStructLevel1.withColumn("a", $"a".dropFields("b")),
         Row(Row(1, 1)) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1893,7 +2123,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   test("dropFields should drop nested field in struct even if casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
       checkAnswer(
-        mixedCaseStructLevel2.withColumn("a", 'a.dropFields("A.a")),
+        mixedCaseStructLevel2.withColumn("a", $"a".dropFields("A.a")),
         Row(Row(Row(1), Row(1, 1))) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1907,7 +2137,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             nullable = false))))
 
       checkAnswer(
-        mixedCaseStructLevel2.withColumn("a", 'a.dropFields("b.a")),
+        mixedCaseStructLevel2.withColumn("a", $"a".dropFields("b.a")),
         Row(Row(Row(1, 1), Row(1))) :: Nil,
         StructType(Seq(
           StructField("a", StructType(Seq(
@@ -1924,19 +2154,25 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
   test("dropFields should throw an exception because casing is different") {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
-      intercept[AnalysisException] {
-        mixedCaseStructLevel2.withColumn("a", 'a.dropFields("A.a"))
-      }.getMessage should include("No such struct field A in a, B")
+      checkError(
+        exception = intercept[AnalysisException] {
+          mixedCaseStructLevel2.withColumn("a", $"a".dropFields("A.a"))
+        },
+        errorClass = "FIELD_NOT_FOUND",
+        parameters = Map("fieldName" -> "`A`", "fields" -> "`a`, `B`"))
 
-      intercept[AnalysisException] {
-        mixedCaseStructLevel2.withColumn("a", 'a.dropFields("b.a"))
-      }.getMessage should include("No such struct field b in a, B")
+      checkError(
+        exception = intercept[AnalysisException] {
+          mixedCaseStructLevel2.withColumn("a", $"a".dropFields("b.a"))
+        },
+        errorClass = "FIELD_NOT_FOUND",
+        parameters = Map("fieldName" -> "`b`", "fields" -> "`a`, `B`"))
     }
   }
 
   test("dropFields should drop only fields that exist") {
     checkAnswer(
-      structLevel1.withColumn("a", 'a.dropFields("d")),
+      structLevel1.withColumn("a", $"a".dropFields("d")),
       Row(Row(1, null, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -1946,7 +2182,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
           nullable = false))))
 
     checkAnswer(
-      structLevel1.withColumn("a", 'a.dropFields("b", "d")),
+      structLevel1.withColumn("a", $"a".dropFields("b", "d")),
       Row(Row(1, 3)) :: Nil,
       StructType(Seq(
         StructField("a", StructType(Seq(
@@ -2002,10 +2238,17 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
         .select($"struct_col".dropFields("b", "c")),
       Row(Row(1)))
 
-    intercept[AnalysisException] {
-      sql("SELECT named_struct('a', 1, 'b', 2) struct_col")
-        .select($"struct_col".dropFields("a", "b"))
-    }.getMessage should include("cannot drop all fields in struct")
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("SELECT named_struct('a', 1, 'b', 2) struct_col")
+          .select($"struct_col".dropFields("a", "b"))
+      },
+      errorClass = "DATATYPE_MISMATCH.CANNOT_DROP_ALL_FIELDS",
+      parameters = Map("sqlExpr" -> "\"update_fields(struct_col, dropfield(), dropfield())\""),
+      context = ExpectedContext(
+        fragment = "dropFields",
+        callSitePattern = getCurrentClassCallSitePattern)
+    )
 
     checkAnswer(
       sql("SELECT CAST(NULL AS struct<a:int,b:int>) struct_col")
@@ -2022,10 +2265,15 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
         .select($"struct_col".dropFields("a.b")),
       Row(Row(Row(1))))
 
-    intercept[AnalysisException] {
-      sql("SELECT named_struct('a', named_struct('b', 1), 'a', named_struct('c', 2)) struct_col")
-        .select($"struct_col".dropFields("a.c"))
-    }.getMessage should include("Ambiguous reference to fields")
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("SELECT named_struct('a', named_struct('b', 1), 'a', named_struct('c', 2)) struct_col")
+          .select($"struct_col".dropFields("a.c"))
+      },
+      errorClass = "AMBIGUOUS_REFERENCE_TO_FIELDS",
+      sqlState = "42000",
+      parameters = Map("field" -> "`a`", "count" -> "2")
+    )
 
     checkAnswer(
       sql("SELECT named_struct('a', named_struct('a', 1, 'b', 2, 'c', 3)) struct_col")
@@ -2168,9 +2416,15 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
   }
 
   test("should be able to refer to newly added nested column") {
-    intercept[AnalysisException] {
-      structLevel1.select($"a".withField("d", lit(4)).withField("e", $"a.d" + 1).as("a"))
-    }.getMessage should include("No such struct field d in a, b, c")
+    checkError(
+      exception = intercept[AnalysisException] {
+        structLevel1.select($"a".withField("d", lit(4)).withField("e", $"a.d" + 1).as("a"))
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`d`", "fields" -> "`a`, `b`, `c`"),
+      context = ExpectedContext(
+        fragment = "$",
+        callSitePattern = getCurrentClassCallSitePattern))
 
     checkAnswer(
       structLevel1
@@ -2216,11 +2470,17 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
 
     // we can't access the nested column in subsequent select statement after dropping it in a
     // previous select statement
-    intercept[AnalysisException]{
-      structLevel1
-        .select($"a".dropFields("c").as("a"))
-        .select($"a".withField("z", $"a.c")).as("a")
-    }.getMessage should include("No such struct field c in a, b;")
+    checkError(
+      exception = intercept[AnalysisException]{
+        structLevel1
+          .select($"a".dropFields("c").as("a"))
+          .select($"a".withField("z", $"a.c")).as("a")
+      },
+      errorClass = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`c`", "fields" -> "`a`, `b`"),
+      context = ExpectedContext(
+        fragment = "$",
+        callSitePattern = getCurrentClassCallSitePattern))
   }
 
   test("nestedDf should generate nested DataFrames") {
@@ -2299,7 +2559,7 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
             StructType(Seq(StructField(nestedColName(0, 0), nestedColumnDataType, nullable))))
         }
 
-        checkAnswer(resultDf, expectedDf.collect(), expectedDf.schema)
+        checkAnswer(resultDf, expectedDf.collect().toImmutableArraySeq, expectedDf.schema)
       }
     }
   }
@@ -2311,46 +2571,578 @@ class ColumnExpressionSuite extends QueryTest with SharedSparkSession {
       booleanDf.filter("cond = true").select(assert_true($"cond")),
       Row(null) :: Nil
     )
-    val e1 = intercept[SparkException] {
-      booleanDf.select(assert_true($"cond", lit(null.asInstanceOf[String]))).collect()
-    }
-    assert(e1.getCause.isInstanceOf[RuntimeException])
-    assert(e1.getCause.getMessage == null)
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        booleanDf.select(assert_true($"cond", lit(null.asInstanceOf[String]))).collect()
+      },
+      errorClass = "USER_RAISED_EXCEPTION",
+      parameters = Map("errorMessage" -> "null"))
 
     val nullDf = Seq(("first row", None), ("second row", Some(true))).toDF("n", "cond")
     checkAnswer(
       nullDf.filter("cond = true").select(assert_true($"cond", $"cond")),
       Row(null) :: Nil
     )
-    val e2 = intercept[SparkException] {
-      nullDf.select(assert_true($"cond", $"n")).collect()
-    }
-    assert(e2.getCause.isInstanceOf[RuntimeException])
-    assert(e2.getCause.getMessage == "first row")
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        nullDf.select(assert_true($"cond", $"n")).collect()
+      },
+      errorClass = "USER_RAISED_EXCEPTION",
+      parameters = Map("errorMessage" -> "first row"))
 
     // assert_true(condition)
     val intDf = Seq((0, 1)).toDF("a", "b")
     checkAnswer(intDf.select(assert_true($"a" < $"b")), Row(null) :: Nil)
-    val e3 = intercept[SparkException] {
+    val e3 = intercept[SparkRuntimeException] {
       intDf.select(assert_true($"a" > $"b")).collect()
     }
-    assert(e3.getCause.isInstanceOf[RuntimeException])
-    assert(e3.getCause.getMessage == "'('a > 'b)' is not true!")
+    assert(e3.getMessage.matches(
+      "\\[USER_RAISED_EXCEPTION\\] '\\(a#\\d+ > b#\\d+\\)' is not true! SQLSTATE: P0001"))
   }
 
   test("raise_error") {
     val strDf = Seq(("hello")).toDF("a")
 
-    val e1 = intercept[SparkException] {
-      strDf.select(raise_error(lit(null.asInstanceOf[String]))).collect()
-    }
-    assert(e1.getCause.isInstanceOf[RuntimeException])
-    assert(e1.getCause.getMessage == null)
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        strDf.select(raise_error(lit(null.asInstanceOf[String]))).collect()
+      },
+      errorClass = "USER_RAISED_EXCEPTION",
+      parameters = Map("errorMessage" -> "null"))
 
-    val e2 = intercept[SparkException] {
-      strDf.select(raise_error($"a")).collect()
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        strDf.select(raise_error($"a")).collect()
+      },
+      errorClass = "USER_RAISED_EXCEPTION",
+      parameters = Map("errorMessage" -> "hello"))
+  }
+
+  test("SPARK-34677: negate/add/subtract year-month and day-time intervals") {
+    import testImplicits._
+    val df = Seq((Period.ofMonths(10), Duration.ofDays(10), Period.ofMonths(1), Duration.ofDays(1)))
+      .toDF("year-month-A", "day-time-A", "year-month-B", "day-time-B")
+    val negatedDF = df.select(-$"year-month-A", -$"day-time-A")
+    checkAnswer(negatedDF, Row(Period.ofMonths(-10), Duration.ofDays(-10)))
+    val addDF = df.select($"year-month-A" + $"year-month-B", $"day-time-A" + $"day-time-B")
+    checkAnswer(addDF, Row(Period.ofMonths(11), Duration.ofDays(11)))
+    val subDF = df.select($"year-month-A" - $"year-month-B", $"day-time-A" - $"day-time-B")
+    checkAnswer(subDF, Row(Period.ofMonths(9), Duration.ofDays(9)))
+  }
+
+  test("SPARK-34721: add a year-month interval to a date") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      outstandingTimezonesIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid) {
+          Seq(
+            (LocalDate.of(1900, 10, 1), Period.ofMonths(0)) -> LocalDate.of(1900, 10, 1),
+            (LocalDate.of(1970, 1, 1), Period.ofMonths(-1)) -> LocalDate.of(1969, 12, 1),
+            (LocalDate.of(2021, 3, 11), Period.ofMonths(1)) -> LocalDate.of(2021, 4, 11),
+            (LocalDate.of(2020, 12, 31), Period.ofMonths(2)) -> LocalDate.of(2021, 2, 28),
+            (LocalDate.of(2021, 5, 31), Period.ofMonths(-3)) -> LocalDate.of(2021, 2, 28),
+            (LocalDate.of(2020, 2, 29), Period.ofYears(1)) -> LocalDate.of(2021, 2, 28),
+            (LocalDate.of(1, 1, 1), Period.ofYears(2020)) -> LocalDate.of(2021, 1, 1)
+          ).foreach { case ((date, period), result) =>
+            val df = Seq((date, period)).toDF("date", "interval")
+            checkAnswer(
+              df.select($"date" + $"interval", $"interval" + $"date"),
+              Row(result, result))
+          }
+        }
+      }
+
+      val e = intercept[ArithmeticException] {
+        Seq((LocalDate.of(2021, 3, 11), Period.ofMonths(Int.MaxValue)))
+          .toDF("date", "interval")
+          .select($"date" + $"interval")
+          .collect()
+      }
+      assert(e.getMessage.contains("integer overflow"))
     }
-    assert(e2.getCause.isInstanceOf[RuntimeException])
-    assert(e2.getCause.getMessage == "hello")
+  }
+
+  test("SPARK-34721: subtract a year-month interval from a date") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      outstandingTimezonesIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid) {
+          Seq(
+            (LocalDate.of(1582, 10, 4), Period.ofMonths(0)) -> LocalDate.of(1582, 10, 4),
+            (LocalDate.of(1582, 10, 15), Period.ofMonths(1)) -> LocalDate.of(1582, 9, 15),
+            (LocalDate.of(1, 1, 1), Period.ofMonths(-1)) -> LocalDate.of(1, 2, 1),
+            (LocalDate.of(9999, 10, 31), Period.ofMonths(-2)) -> LocalDate.of(9999, 12, 31),
+            (LocalDate.of(2021, 5, 31), Period.ofMonths(3)) -> LocalDate.of(2021, 2, 28),
+            (LocalDate.of(2021, 2, 28), Period.ofYears(1)) -> LocalDate.of(2020, 2, 28),
+            (LocalDate.of(2020, 2, 29), Period.ofYears(4)) -> LocalDate.of(2016, 2, 29)
+          ).foreach { case ((date, period), result) =>
+            val df = Seq((date, period)).toDF("date", "interval")
+            checkAnswer(df.select($"date" - $"interval"), Row(result))
+          }
+        }
+      }
+
+      val e = intercept[ArithmeticException] {
+        Seq((LocalDate.of(2021, 3, 11), Period.ofMonths(Int.MaxValue)))
+          .toDF("date", "interval")
+          .select($"date" - $"interval")
+          .collect()
+      }
+      assert(e.getMessage.contains("integer overflow"))
+    }
+  }
+
+  test("SPARK-34739: add a year-month interval to a timestamp") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      outstandingZoneIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid.getId) {
+          Seq(
+            (LocalDateTime.of(1900, 1, 1, 0, 0, 0, 123456000), Period.ofMonths(0)) ->
+              LocalDateTime.of(1900, 1, 1, 0, 0, 0, 123456000),
+            (LocalDateTime.of(1970, 1, 1, 0, 0, 0, 1000), Period.ofMonths(-1)) ->
+              LocalDateTime.of(1969, 12, 1, 0, 0, 0, 1000),
+            (LocalDateTime.of(2021, 3, 14, 1, 2, 3, 0), Period.ofMonths(1)) ->
+              LocalDateTime.of(2021, 4, 14, 1, 2, 3, 0),
+            (LocalDateTime.of(2020, 12, 31, 23, 59, 59, 999999000), Period.ofMonths(2)) ->
+              LocalDateTime.of(2021, 2, 28, 23, 59, 59, 999999000),
+            (LocalDateTime.of(2021, 5, 31, 0, 0, 1, 0), Period.ofMonths(-3)) ->
+              LocalDateTime.of(2021, 2, 28, 0, 0, 1, 0),
+            (LocalDateTime.of(2020, 2, 29, 12, 13, 14), Period.ofYears(1)) ->
+              LocalDateTime.of(2021, 2, 28, 12, 13, 14),
+            (LocalDateTime.of(1, 1, 1, 1, 1, 1, 1000), Period.ofYears(2020)) ->
+              LocalDateTime.of(2021, 1, 1, 1, 1, 1, 1000)
+          ).foreach { case ((ldt, period), expected) =>
+            val df = Seq((ldt.atZone(zid).toInstant, period)).toDF("ts", "interval")
+            val result = expected.atZone(zid).toInstant
+            checkAnswer(df.select($"ts" + $"interval", $"interval" + $"ts"), Row(result, result))
+          }
+        }
+      }
+
+      val e = intercept[SparkException] {
+        Seq((Instant.parse("2021-03-14T18:55:00Z"), Period.ofMonths(Int.MaxValue)))
+          .toDF("ts", "interval")
+          .select($"ts" + $"interval")
+          .collect()
+      }.getCause
+      assert(e.isInstanceOf[ArithmeticException])
+      assert(e.getMessage.contains("long overflow"))
+    }
+  }
+
+  test("SPARK-34739: subtract a year-month interval from a timestamp") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      outstandingZoneIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid.getId) {
+          Seq(
+            (LocalDateTime.of(1582, 10, 4, 0, 0, 0), Period.ofMonths(0)) ->
+              LocalDateTime.of(1582, 10, 4, 0, 0, 0),
+            (LocalDateTime.of(1582, 10, 15, 23, 59, 59, 999999000), Period.ofMonths(1)) ->
+              LocalDateTime.of(1582, 9, 15, 23, 59, 59, 999999000),
+            (LocalDateTime.of(1, 1, 1, 1, 1, 1, 1000), Period.ofMonths(-1)) ->
+              LocalDateTime.of(1, 2, 1, 1, 1, 1, 1000),
+            (LocalDateTime.of(9999, 10, 31, 23, 59, 59, 999000000), Period.ofMonths(-2)) ->
+              LocalDateTime.of(9999, 12, 31, 23, 59, 59, 999000000),
+            (LocalDateTime.of(2021, 5, 31, 0, 0, 0, 1000), Period.ofMonths(3)) ->
+              LocalDateTime.of(2021, 2, 28, 0, 0, 0, 1000),
+            (LocalDateTime.of(2021, 2, 28, 11, 12, 13, 123456000), Period.ofYears(1)) ->
+              LocalDateTime.of(2020, 2, 28, 11, 12, 13, 123456000),
+            (LocalDateTime.of(2020, 2, 29, 1, 2, 3, 5000), Period.ofYears(4)) ->
+              LocalDateTime.of(2016, 2, 29, 1, 2, 3, 5000)
+          ).foreach { case ((ldt, period), expected) =>
+            val df = Seq((ldt.atZone(zid).toInstant, period)).toDF("ts", "interval")
+            checkAnswer(df.select($"ts" - $"interval"), Row(expected.atZone(zid).toInstant))
+          }
+        }
+      }
+
+      val e = intercept[SparkException] {
+        Seq((Instant.parse("2021-03-14T18:55:00Z"), Period.ofMonths(Int.MaxValue)))
+          .toDF("ts", "interval")
+          .select($"ts" - $"interval")
+          .collect()
+      }.getCause
+      assert(e.isInstanceOf[ArithmeticException])
+      assert(e.getMessage.contains("long overflow"))
+    }
+  }
+
+  test("SPARK-34761, SPARK-34903: add/subtract a day-time interval to/from a timestamp") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      outstandingZoneIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid.getId) {
+          Seq(
+            (LocalDateTime.of(1900, 1, 1, 0, 0, 0, 123456000), Duration.ofDays(0)) ->
+              LocalDateTime.of(1900, 1, 1, 0, 0, 0, 123456000),
+            (LocalDateTime.of(1970, 1, 1, 0, 0, 0, 100000000), Duration.ofDays(-1)) ->
+              LocalDateTime.of(1969, 12, 31, 0, 0, 0, 100000000),
+            (LocalDateTime.of(2021, 3, 14, 1, 2, 3), Duration.ofDays(1)) ->
+              LocalDateTime.of(2021, 3, 15, 1, 2, 3),
+            (LocalDateTime.of(2020, 12, 31, 23, 59, 59, 999000000),
+              Duration.ofDays(2 * 30).plusMillis(1)) -> LocalDateTime.of(2021, 3, 2, 0, 0, 0),
+            (LocalDateTime.of(2020, 3, 16, 0, 0, 0, 1000), Duration.of(-1, ChronoUnit.MICROS)) ->
+              LocalDateTime.of(2020, 3, 16, 0, 0, 0),
+            (LocalDateTime.of(2020, 2, 29, 12, 13, 14), Duration.ofDays(365)) ->
+              LocalDateTime.of(2021, 2, 28, 12, 13, 14),
+            (LocalDateTime.of(1582, 10, 4, 1, 2, 3, 40000000),
+              Duration.ofDays(10).plusMillis(60)) ->
+              LocalDateTime.of(1582, 10, 14, 1, 2, 3, 100000000)
+          ).foreach { case ((ldt, duration), expected) =>
+            val ts = ldt.atZone(zid).toInstant
+            val result = expected.atZone(zid).toInstant
+            val df = Seq((ts, duration, result)).toDF("ts", "interval", "result")
+            checkAnswer(
+              df.select($"ts" + $"interval", $"interval" + $"ts", $"result" - $"interval",
+                $"result" - $"ts"),
+              Row(result, result, ts, duration))
+          }
+        }
+      }
+
+      Seq(
+        "2021-03-16T18:56:00Z" -> "ts + i",
+        "1900-03-16T18:56:00Z" -> "ts - i").foreach { case (instant, op) =>
+        val e = intercept[SparkException] {
+          Seq(
+            (Instant.parse(instant), Duration.of(Long.MaxValue, ChronoUnit.MICROS)))
+            .toDF("ts", "i")
+            .selectExpr(op)
+            .collect()
+        }.getCause
+        assert(e.isInstanceOf[ArithmeticException])
+        assert(e.getMessage.contains("long overflow"))
+      }
+    }
+  }
+
+  test("SPARK-34824: multiply year-month interval by numeric") {
+    checkAnswer(
+      Seq((Period.ofYears(0), 0)).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofYears(0)))
+    checkAnswer(
+      Seq((Period.ofMonths(0), 10.toByte)).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofMonths(0)))
+    checkAnswer(
+      Seq((Period.ofMonths(5), 3.toShort)).toDF("i", "n").select($"n" * $"i"),
+      Row(Period.ofYears(1).plusMonths(3)))
+    checkAnswer(
+      Seq((Period.ofYears(1000), "2")).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofYears(2000)))
+    checkAnswer(
+      Seq((Period.ofMonths(1), 12L)).toDF("i", "n").select($"n" * $"i"),
+      Row(Period.ofYears(1)))
+    checkAnswer(
+      Seq((Period.ofYears(100).plusMonths(11), Short.MaxValue)).toDF("i", "n").select($"n" * $"i"),
+      Row(Period.ofYears(100).plusMonths(11).multipliedBy(Short.MaxValue).normalized()))
+    checkAnswer(
+      Seq((Period.ofMonths(-1), 0.499f)).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofMonths(0)))
+    checkAnswer(
+      Seq((Period.ofMonths(10000000), 0.0000001d)).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofMonths(1)))
+    checkAnswer(
+      Seq((Period.ofMonths(-10000000), BigDecimal(0.0000001d))).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofMonths(-1)))
+    checkAnswer(
+      Seq((Period.ofMonths(-1), BigDecimal(0.5))).toDF("i", "n").select($"i" * $"n"),
+      Row(Period.ofMonths(-1)))
+
+    val e = intercept[SparkException] {
+      Seq((Period.ofYears(9999), Long.MinValue)).toDF("i", "n").select($"n" * $"i").collect()
+    }.getCause
+    assert(e.isInstanceOf[ArithmeticException])
+    assert(e.getMessage.contains("overflow"))
+  }
+
+  test("SPARK-34850: multiply day-time interval by numeric") {
+    checkAnswer(
+      Seq((Duration.ofDays(0), 0)).toDF("i", "n").select($"i" * $"n"),
+      Row(Duration.ofDays(0)))
+    checkAnswer(
+      Seq((Duration.ofDays(0), 10.toByte)).toDF("i", "n").select($"i" * $"n"),
+      Row(Duration.ofDays(0)))
+    checkAnswer(
+      Seq((Duration.ofHours(12), 3.toShort)).toDF("i", "n").select($"n" * $"i"),
+      Row(Duration.ofDays(1).plusHours(12)))
+    checkAnswer(
+      Seq((Duration.ofMinutes(1000), "2")).toDF("i", "n").select($"i" * $"n"),
+      Row(Duration.ofMinutes(2000)))
+    checkAnswer(
+      Seq((Duration.ofSeconds(1), 60L)).toDF("i", "n").select($"n" * $"i"),
+      Row(Duration.ofMinutes(1)))
+    checkAnswer(
+      Seq((Duration.of(-1, ChronoUnit.MICROS), 0.499f)).toDF("i", "n").select($"i" * $"n"),
+      Row(Duration.of(0, ChronoUnit.MICROS)))
+    checkAnswer(
+      Seq((Duration.of(-1, ChronoUnit.MICROS), 0.51d)).toDF("i", "n").select($"i" * $"n"),
+      Row(Duration.of(-1, ChronoUnit.MICROS)))
+    checkAnswer(
+      Seq((Duration.of(-10000000, ChronoUnit.MICROS), BigDecimal(0.0000001d)))
+        .toDF("i", "n").select($"i" * $"n"),
+      Row(Duration.of(-1, ChronoUnit.MICROS)))
+
+    val e = intercept[SparkException] {
+      Seq((Duration.ofDays(9999), Long.MinValue)).toDF("i", "n").select($"n" * $"i").collect()
+    }.getCause
+    assert(e.isInstanceOf[ArithmeticException])
+    assert(e.getMessage.contains("overflow"))
+  }
+
+  test("SPARK-34868: divide year-month interval by numeric") {
+    checkAnswer(
+      Seq((Period.ofYears(0), 10.toByte)).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofYears(0)))
+    checkAnswer(
+      Seq((Period.ofYears(10), 3.toShort)).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofYears(3).plusMonths(4)))
+    checkAnswer(
+      Seq((Period.ofYears(1000), "2")).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofYears(500)))
+    checkAnswer(
+      Seq((Period.ofMonths(1).multipliedBy(Int.MaxValue), Int.MaxValue))
+        .toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofMonths(1)))
+    checkAnswer(
+      Seq((Period.ofYears(-1), 12L)).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofMonths(-1)))
+    checkAnswer(
+      Seq((Period.ofMonths(-1), 0.499f)).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofMonths(-2)))
+    checkAnswer(
+      Seq((Period.ofMonths(10000000), 10000000d)).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofMonths(1)))
+    checkAnswer(
+      Seq((Period.ofMonths(-1), BigDecimal(0.5))).toDF("i", "n").select($"i" / $"n"),
+      Row(Period.ofMonths(-2)))
+
+    val e = intercept[ArithmeticException] {
+      Seq((Period.ofYears(9999), 0)).toDF("i", "n").select($"i" / $"n").collect()
+    }
+    assert(e.getMessage.contains("Division by zero"))
+
+    val e2 = intercept[ArithmeticException] {
+      Seq((Period.ofYears(9999), 0d)).toDF("i", "n").select($"i" / $"n").collect()
+    }
+    assert(e2.getMessage.contains("Division by zero"))
+
+    val e3 = intercept[ArithmeticException] {
+      Seq((Period.ofYears(9999), BigDecimal(0))).toDF("i", "n").select($"i" / $"n").collect()
+    }
+    assert(e3.getMessage.contains("Division by zero"))
+  }
+
+  test("SPARK-34875: divide day-time interval by numeric") {
+    checkAnswer(
+      Seq((Duration.ZERO, 10.toByte)).toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.ZERO))
+    checkAnswer(
+      Seq((Duration.ofDays(10), 3.toShort)).toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.ofDays(10).dividedBy(3)))
+    checkAnswer(
+      Seq((Duration.ofHours(1000), "2")).toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.ofHours(500)))
+    checkAnswer(
+      Seq((Duration.of(1, ChronoUnit.MICROS).multipliedBy(Long.MaxValue), Long.MaxValue))
+        .toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.of(1, ChronoUnit.MICROS)))
+    checkAnswer(
+      Seq((Duration.ofMinutes(-1), 60L)).toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.ofSeconds(-1)))
+    checkAnswer(
+      Seq((Duration.ofDays(-1), 0.5f)).toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.ofDays(-2)))
+    checkAnswer(
+      Seq((Duration.ofMillis(10000000), 10000000d)).toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.ofMillis(1)))
+    checkAnswer(
+      Seq((Duration.of(-1, ChronoUnit.MICROS), BigDecimal(10000.0001)))
+        .toDF("i", "n").select($"i" / $"n"),
+      Row(Duration.of(-1, ChronoUnit.MICROS).multipliedBy(10000).dividedBy(100000001)))
+
+    val e = intercept[ArithmeticException] {
+      Seq((Duration.ofDays(9999), 0)).toDF("i", "n").select($"i" / $"n").collect()
+    }
+    assert(e.getMessage.contains("Division by zero"))
+
+    val e2 = intercept[ArithmeticException] {
+      Seq((Duration.ofDays(9999), 0d)).toDF("i", "n").select($"i" / $"n").collect()
+    }
+    assert(e2.getMessage.contains("Division by zero"))
+
+    val e3 = intercept[ArithmeticException] {
+      Seq((Duration.ofDays(9999), BigDecimal(0))).toDF("i", "n").select($"i" / $"n").collect()
+    }
+    assert(e3.getMessage.contains("Division by zero"))
+  }
+
+  test("SPARK-34896: return day-time interval from dates subtraction") {
+    withSQLConf(
+      SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true",
+      SQLConf.LEGACY_INTERVAL_ENABLED.key -> "false") {
+      outstandingTimezonesIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid) {
+          Seq(
+            (LocalDate.of(1582, 10, 15), LocalDate.of(1582, 10, 4)),
+            (LocalDate.of(1900, 10, 1), LocalDate.of(1900, 10, 1)),
+            (LocalDate.of(1969, 12, 1), LocalDate.of(1970, 1, 1)),
+            (LocalDate.of(2021, 3, 1), LocalDate.of(2020, 2, 29)),
+            (LocalDate.of(2021, 3, 15), LocalDate.of(2021, 3, 14)),
+            (LocalDate.of(1, 1, 1), LocalDate.of(2021, 3, 29))
+          ).foreach { case (end, start) =>
+            val df = Seq((end, start)).toDF("end", "start")
+            val daysBetween = Duration.ofDays(ChronoUnit.DAYS.between(start, end))
+            val r = df.select($"end" - $"start").toDF("diff")
+            checkAnswer(r, Row(daysBetween))
+            assert(r.schema === new StructType().add("diff", DayTimeIntervalType(DAY)))
+          }
+        }
+      }
+
+      val e = intercept[SparkException] {
+        Seq((LocalDate.ofEpochDay(0), LocalDate.of(500000, 1, 1)))
+          .toDF("start", "end")
+          .select($"end" - $"start")
+          .collect()
+      }.getCause
+      assert(e.isInstanceOf[ArithmeticException])
+      assert(e.getMessage.contains("long overflow"))
+    }
+  }
+
+  test("SPARK-34903: Return day-time interval from timestamps subtraction") {
+    outstandingTimezonesIds.foreach { tz =>
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> tz) {
+        checkAnswer(
+          sql("select timestamp '2021-03-31 19:11:10' - timestamp '2021-03-01 19:11:10'"),
+          Row(Duration.ofDays(30)))
+        checkAnswer(
+          Seq((Instant.parse("2021-03-31T00:01:02Z"), Instant.parse("2021-04-01T00:00:00Z")))
+            .toDF("start", "end").select($"end" - $"start" < Duration.ofDays(1)),
+          Row(true))
+        checkAnswer(
+          Seq((Instant.parse("2021-03-31T00:01:02.777Z"), Duration.ofMillis(333)))
+            .toDF("ts", "i")
+            .select(($"ts" + $"i") - $"ts"),
+          Row(Duration.ofMillis(333)))
+        checkAnswer(
+          Seq((LocalDateTime.of(2021, 3, 31, 10, 0, 0)
+              .atZone(DateTimeUtils.getZoneId(tz)).toInstant, LocalDate.of(2020, 3, 31)))
+            .toDF("ts", "d")
+          .select($"ts" - $"d"),
+          Row(Duration.ofDays(365).plusHours(10)))
+      }
+    }
+  }
+
+  test("SPARK-35051: add/subtract a day-time interval to/from a date") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      outstandingZoneIds.foreach { zid =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid.getId) {
+          Seq(
+            (LocalDate.of(1, 1, 1), Duration.ofDays(31)) -> LocalDateTime.of(1, 2, 1, 0, 0, 0),
+            (LocalDate.of(1582, 9, 15), Duration.ofDays(30).plus(1, ChronoUnit.MICROS)) ->
+              LocalDateTime.of(1582, 10, 15, 0, 0, 0, 1000),
+            (LocalDate.of(1900, 1, 1), Duration.ofDays(0).plusHours(1)) ->
+              LocalDateTime.of(1900, 1, 1, 1, 0, 0),
+            (LocalDate.of(1970, 1, 1), Duration.ofDays(-1).minusMinutes(1)) ->
+              LocalDateTime.of(1969, 12, 30, 23, 59, 0),
+            (LocalDate.of(2021, 3, 14), Duration.ofDays(1)) ->
+              LocalDateTime.of(2021, 3, 15, 0, 0, 0),
+            (LocalDate.of(2020, 12, 31), Duration.ofDays(4 * 30).plusMinutes(30)) ->
+              LocalDateTime.of(2021, 4, 30, 0, 30, 0),
+            (LocalDate.of(2020, 2, 29), Duration.ofDays(365).plusSeconds(59)) ->
+              LocalDateTime.of(2021, 2, 28, 0, 0, 59),
+            (LocalDate.of(10000, 1, 1), Duration.ofDays(-2)) ->
+              LocalDateTime.of(9999, 12, 30, 0, 0, 0)
+          ).foreach { case ((date, duration), expected) =>
+            val result = expected.atZone(zid).toInstant
+            val ts = date.atStartOfDay(zid).toInstant
+            val df = Seq((date, duration, result)).toDF("date", "interval", "result")
+            checkAnswer(
+              df.select($"date" + $"interval", $"interval" + $"date", $"result" - $"interval",
+                $"result" - $"date"),
+              Row(result, result, ts, duration))
+          }
+        }
+      }
+
+      Seq(
+        "2021-04-14" -> "date + i",
+        "1900-04-14" -> "date - i").foreach { case (date, op) =>
+        val e = intercept[SparkException] {
+          Seq(
+            (LocalDate.parse(date), Duration.of(Long.MaxValue, ChronoUnit.MICROS)))
+            .toDF("date", "i")
+            .selectExpr(op)
+            .collect()
+        }.getCause
+        assert(e.isInstanceOf[ArithmeticException])
+        assert(e.getMessage.contains("long overflow"))
+      }
+    }
+  }
+
+  test("SPARK-35852: add/subtract a interval day to/from a date") {
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      Seq(
+        (LocalDate.of(1, 1, 1), Duration.ofDays(31)),
+        (LocalDate.of(1582, 9, 15), Duration.ofDays(30)),
+        (LocalDate.of(1900, 1, 1), Duration.ofDays(0)),
+        (LocalDate.of(1970, 1, 1), Duration.ofDays(-1)),
+        (LocalDate.of(2021, 3, 14), Duration.ofDays(1)),
+        (LocalDate.of(2020, 12, 31), Duration.ofDays(4 * 30)),
+        (LocalDate.of(2020, 2, 29), Duration.ofDays(365)),
+        (LocalDate.of(10000, 1, 1), Duration.ofDays(-2))
+      ).foreach { case (date, duration) =>
+        val days = duration.toDays
+        val add = date.plusDays(days)
+        val sub = date.minusDays(days)
+        val df = Seq((date, duration)).toDF("start", "diff")
+          .select($"start", $"diff" cast DayTimeIntervalType(DAY) as "diff")
+          .select($"start" + $"diff", $"diff" + $"start", $"start" - $"diff")
+        checkAnswer(df, Row(add, add, sub))
+      }
+    }
+  }
+
+  test("SPARK-36778: add ilike API for scala") {
+    // scalastyle:off
+    // non ascii characters are not allowed in the code, so we disable the scalastyle here.
+    // null handling
+    val nullDf = Seq("a", null).toDF("src")
+    checkAnswer(nullDf.filter($"src".ilike("A")), Row("a"))
+    checkAnswer(nullDf.filter($"src".ilike(null)), spark.emptyDataFrame)
+    // simple pattern
+    val simpleDf = Seq("a", "A", "abdef", "a_%b", "addb", "abC", "a\nb").toDF("src")
+    checkAnswer(simpleDf.filter($"src".ilike("a")), Seq("a", "A").toDF())
+    checkAnswer(simpleDf.filter($"src".ilike("A")), Seq("a", "A").toDF())
+    checkAnswer(simpleDf.filter($"src".ilike("b")), spark.emptyDataFrame)
+    checkAnswer(simpleDf.filter($"src".ilike("aBdef")), Seq("abdef").toDF())
+    checkAnswer(simpleDf.filter($"src".ilike("a\\__b")), Seq("a_%b").toDF())
+    checkAnswer(simpleDf.filter($"src".ilike("A_%b")), Seq("a_%b", "addb", "a\nb").toDF())
+    checkAnswer(simpleDf.filter($"src".ilike("a%")), simpleDf)
+    checkAnswer(simpleDf.filter($"src".ilike("a_b")), Seq("a\nb").toDF())
+    // double-escaping backslash
+    val dEscDf = Seq("""\__""", """\\__""").toDF("src")
+    checkAnswer(dEscDf.filter($"src".ilike("""\\\__""")), Seq("""\__""").toDF())
+    checkAnswer(dEscDf.filter($"src".ilike("""%\\%\%""")), spark.emptyDataFrame)
+    // unicode
+    val uncDf = Seq("a\u20ACA", "A€a", "a€AA", "a\u20ACaz", "ЀЁЂѺΏỀ").toDF("src")
+    checkAnswer(uncDf.filter($"src".ilike("_\u20AC_")), Seq("a\u20ACA", "A€a").toDF())
+    checkAnswer(uncDf.filter($"src".ilike("_€_")), Seq("a\u20ACA", "A€a").toDF())
+    checkAnswer(uncDf.filter($"src".ilike("_\u20AC_a")), Seq("a€AA").toDF())
+    checkAnswer(uncDf.filter($"src".ilike("_€_Z")), Seq("a\u20ACaz").toDF())
+    checkAnswer(uncDf.filter($"src".ilike("ѐёђѻώề")), Seq("ЀЁЂѺΏỀ").toDF())
+    // scalastyle:on
+  }
+
+  test("SPARK-39093: divide period by integral expression") {
+    val df = Seq(((Period.ofMonths(10)), 2)).toDF("pd", "num")
+    checkAnswer(df.select($"pd" / ($"num" + 3)),
+      Seq((Period.ofMonths(2))).toDF())
+  }
+
+  test("SPARK-39093: divide duration by integral expression") {
+    val df = Seq(((Duration.ofDays(10)), 2)).toDF("dd", "num")
+    checkAnswer(df.select($"dd" / ($"num" + 3)),
+      Seq((Duration.ofDays(2))).toDF())
   }
 }

@@ -77,7 +77,7 @@ private[feature] trait SelectorParams extends Params
    * @group param
    */
   @Since("3.1.0")
-  final val fpr = new DoubleParam(this, "fpr", "The higest p-value for features to be kept.",
+  final val fpr = new DoubleParam(this, "fpr", "The highest p-value for features to be kept.",
     ParamValidators.inRange(0, 1))
 
   /** @group getParam */
@@ -133,10 +133,6 @@ private[feature] trait SelectorParams extends Params
  * Super class for feature selectors.
  * 1. Chi-Square Selector
  * This feature selector is for categorical features and categorical labels.
- * 2. ANOVA F-value Classification Selector
- * This feature selector is for continuous features and categorical labels.
- * 3. Regression F-value Selector
- * This feature selector is for continuous features and continuous labels.
  * The selector supports different selection methods: `numTopFeatures`, `percentile`, `fpr`,
  * `fdr`, `fwe`.
  *  - `numTopFeatures` chooses a fixed number of top features according to a hypothesis.
@@ -210,8 +206,8 @@ private[ml] abstract class Selector[T <: SelectorModel[T]]
     val spark = dataset.sparkSession
     import spark.implicits._
 
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
-    val resultDF = getSelectionTestResult(dataset.toDF)
+    val numFeatures = DatasetUtils.getNumFeatures(dataset, $(featuresCol))
+    val resultDF = getSelectionTestResult(dataset.toDF())
 
     def getTopIndices(k: Int): Array[Int] = {
       resultDF.sort("pValue", "featureIndex")
@@ -237,7 +233,7 @@ private[ml] abstract class Selector[T <: SelectorModel[T]]
         val maxIndex = resultDF.sort("pValue", "featureIndex")
           .select("pValue")
           .as[Double].rdd
-          .zipWithIndex
+          .zipWithIndex()
           .flatMap { case (pValue, index) =>
             if (pValue <= f * (index + 1)) {
               Iterator.single(index.toInt)
@@ -251,7 +247,7 @@ private[ml] abstract class Selector[T <: SelectorModel[T]]
           .where(col("pValue") < $(fwe) / numFeatures)
           .as[Int].collect()
       case errorType =>
-        throw new IllegalStateException(s"Unknown Selector Type: $errorType")
+        throw new IllegalArgumentException(s"Unknown Selector Type: $errorType")
     }
 
     copyValues(createSelectorModel(uid, indices.sorted)
@@ -279,11 +275,6 @@ private[ml] abstract class SelectorModel[T <: SelectorModel[T]] (
   extends Model[T] with SelectorParams with MLWritable {
   self: T =>
 
-  if (selectedFeatures.length >= 2) {
-    require(selectedFeatures.sliding(2).forall(l => l(0) < l(1)),
-      "Index should be strictly increasing.")
-  }
-
   /** @group setParam */
   @Since("3.1.0")
   def setFeaturesCol(value: String): this.type = set(featuresCol, value)
@@ -298,7 +289,8 @@ private[ml] abstract class SelectorModel[T <: SelectorModel[T]] (
   override def transform(dataset: Dataset[_]): DataFrame = {
     val outputSchema = transformSchema(dataset.schema, logging = true)
 
-    SelectorModel.transform(dataset, selectedFeatures, outputSchema, $(outputCol), $(featuresCol))
+    SelectorModel.transform(dataset, selectedFeatures.sorted, outputSchema,
+      $(outputCol), $(featuresCol))
   }
 
   @Since("3.1.0")

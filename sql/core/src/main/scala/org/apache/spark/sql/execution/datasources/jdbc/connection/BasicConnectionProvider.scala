@@ -20,6 +20,8 @@ package org.apache.spark.sql.execution.datasources.jdbc.connection
 import java.sql.{Connection, Driver}
 import java.util.Properties
 
+import scala.jdk.CollectionConverters._
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 import org.apache.spark.sql.jdbc.JdbcConnectionProvider
@@ -40,10 +42,19 @@ private[jdbc] class BasicConnectionProvider extends JdbcConnectionProvider with 
   override def getConnection(driver: Driver, options: Map[String, String]): Connection = {
     val jdbcOptions = new JDBCOptions(options)
     val properties = getAdditionalProperties(jdbcOptions)
-    options.foreach { case(k, v) =>
+    jdbcOptions.asConnectionProperties.asScala.foreach { case(k, v) =>
       properties.put(k, v)
     }
-    logDebug(s"JDBC connection initiated with URL: ${jdbcOptions.url} and properties: $properties")
+    logDebug(s"JDBC connection initiated with URL: ${jdbcOptions.getRedactUrl()} " +
+      s"and properties: $properties")
     driver.connect(jdbcOptions.url, properties)
+  }
+
+  override def modifiesSecurityContext(
+    driver: Driver,
+    options: Map[String, String]
+  ): Boolean = {
+    // BasicConnectionProvider is the default unsecure connection provider, so just return false
+    false
   }
 }

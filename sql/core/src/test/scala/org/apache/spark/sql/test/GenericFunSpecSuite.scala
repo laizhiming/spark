@@ -19,8 +19,6 @@ package org.apache.spark.sql.test
 
 import org.scalatest.funspec.AnyFunSpec
 
-import org.apache.spark.sql.Dataset
-
 /**
  * The purpose of this suite is to make sure that generic FunSpec-based scala
  * tests work with a shared spark session
@@ -28,22 +26,22 @@ import org.apache.spark.sql.Dataset
 class GenericFunSpecSuite extends AnyFunSpec with SharedSparkSessionBase {
   import testImplicits._
 
-  private def ds = Seq((1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 4), (8, 4)).toDS
+  private def ds = Seq((1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 4), (8, 4)).toDS()
 
   describe("Simple Dataset") {
     it("should have the specified number of elements") {
-      assert(8 === ds.count)
+      assert(8 === ds.count())
     }
     it("should have the specified number of unique elements") {
-      assert(8 === ds.distinct.count)
+      assert(8 === ds.distinct().count())
     }
     it("should have the specified number of elements in each column") {
-      assert(8 === ds.select("_1").count)
-      assert(8 === ds.select("_2").count)
+      assert(8 === ds.select("_1").count())
+      assert(8 === ds.select("_2").count())
     }
     it("should have the correct number of distinct elements in each column") {
-      assert(8 === ds.select("_1").distinct.count)
-      assert(4 === ds.select("_2").distinct.count)
+      assert(8 === ds.select("_1").distinct().count())
+      assert(4 === ds.select("_2").distinct().count())
     }
   }
 }

@@ -17,26 +17,71 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.expressions.UpdateFields
+import java.util.Locale
+
+import scala.collection.mutable
+
+import org.apache.spark.sql.catalyst.expressions.{Expression, UpdateFields, WithField}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern.UPDATE_FIELDS
 
 
 /**
- * Combines all adjacent [[UpdateFields]] expression into a single [[UpdateFields]] expression.
+ * Optimizes [[UpdateFields]] expression chains.
  */
-object CombineUpdateFields extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
+object OptimizeUpdateFields extends Rule[LogicalPlan] {
+  private def canOptimize(names: Seq[String]): Boolean = {
+    if (conf.caseSensitiveAnalysis) {
+      names.distinct.length != names.length
+    } else {
+      names.map(_.toLowerCase(Locale.ROOT)).distinct.length != names.length
+    }
+  }
+
+  val optimizeUpdateFields: PartialFunction[Expression, Expression] = {
+    case UpdateFields(structExpr, fieldOps)
+      if fieldOps.forall(_.isInstanceOf[WithField]) &&
+        canOptimize(fieldOps.map(_.asInstanceOf[WithField].name)) =>
+      val caseSensitive = conf.caseSensitiveAnalysis
+
+      val withFields = fieldOps.map(_.asInstanceOf[WithField])
+      val names = withFields.map(_.name)
+      val values = withFields.map(_.valExpr)
+
+      val newNames = mutable.ArrayBuffer.empty[String]
+      val newValues = mutable.HashMap.empty[String, Expression]
+      // Used to remember the casing of the last instance
+      val nameMap = mutable.HashMap.empty[String, String]
+
+      names.zip(values).foreach { case (name, value) =>
+        val normalizedName = if (caseSensitive) name else name.toLowerCase(Locale.ROOT)
+        if (nameMap.contains(normalizedName)) {
+          newValues += normalizedName -> value
+        } else {
+          newNames += normalizedName
+          newValues += normalizedName -> value
+        }
+        nameMap += normalizedName -> name
+      }
+
+      val newWithFields = newNames.map(n => WithField(nameMap(n), newValues(n)))
+      UpdateFields(structExpr, newWithFields.toSeq)
+
     case UpdateFields(UpdateFields(struct, fieldOps1), fieldOps2) =>
       UpdateFields(struct, fieldOps1 ++ fieldOps2)
   }
+
+  def apply(plan: LogicalPlan): LogicalPlan = plan.resolveExpressionsWithPruning(
+    _.containsPattern(UPDATE_FIELDS), ruleId)(optimizeUpdateFields)
 }
 
 /**
  * Replaces [[UpdateFields]] expression with an evaluable expression.
  */
 object ReplaceUpdateFieldsExpression extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsPattern(UPDATE_FIELDS)) {
     case u: UpdateFields => u.evalExpr
   }
 }

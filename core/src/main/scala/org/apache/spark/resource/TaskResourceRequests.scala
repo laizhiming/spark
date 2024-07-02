@@ -20,7 +20,7 @@ package org.apache.spark.resource
 import java.util.{Map => JMap}
 import java.util.concurrent.ConcurrentHashMap
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.annotation.{Evolving, Since}
 import org.apache.spark.resource.ResourceProfile._
@@ -36,12 +36,19 @@ class TaskResourceRequests() extends Serializable {
 
   private val _taskResources = new ConcurrentHashMap[String, TaskResourceRequest]()
 
+  /**
+   * Returns all the resource requests for the task.
+   */
   def requests: Map[String, TaskResourceRequest] = _taskResources.asScala.toMap
 
+  /**
+   * (Java-specific) Returns all the resource requests for the task.
+   */
   def requestsJMap: JMap[String, TaskResourceRequest] = requests.asJava
 
   /**
    * Specify number of cpus per Task.
+   * This is a convenient API to add [[TaskResourceRequest]] for cpus.
    *
    * @param amount Number of cpus to allocate per Task.
    */
@@ -52,7 +59,8 @@ class TaskResourceRequests() extends Serializable {
   }
 
   /**
-   *  Amount of a particular custom resource(GPU, FPGA, etc) to use.
+   * Amount of a particular custom resource(GPU, FPGA, etc) to use.
+   * This is a convenient API to add [[TaskResourceRequest]] for custom resources.
    *
    * @param resourceName Name of the resource.
    * @param amount Amount requesting as a Double to support fractional resource requests.
@@ -66,6 +74,9 @@ class TaskResourceRequests() extends Serializable {
     this
   }
 
+  /**
+   * Add a certain [[TaskResourceRequest]] to the request set.
+   */
   def addRequest(treq: TaskResourceRequest): this.type = {
     _taskResources.put(treq.resourceName, treq)
     this

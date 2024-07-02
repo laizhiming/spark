@@ -17,10 +17,10 @@
 
 package org.apache.spark.sql.streaming.ui
 
-import java.text.SimpleDateFormat
-import java.util.Locale
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 
-import org.apache.spark.sql.catalyst.util.DateTimeUtils.getTimeZone
+import org.apache.spark.sql.catalyst.util.DateTimeUtils.getZoneId
 
 private[ui] object UIUtils {
 
@@ -47,31 +47,28 @@ private[ui] object UIUtils {
     }
   }
 
-  def getQueryName(query: StreamingQueryUIData): String = {
-    if (query.name == null || query.name.isEmpty) {
+  def getQueryName(uiData: StreamingQueryUIData): String = {
+    if (uiData.summary.name == null || uiData.summary.name.isEmpty) {
       "<no name>"
     } else {
-      query.name
+      uiData.summary.name
     }
   }
 
-  def getQueryStatus(query: StreamingQueryUIData): String = {
-    if (query.isActive) {
+  def getQueryStatus(uiData: StreamingQueryUIData): String = {
+    if (uiData.summary.isActive) {
       "RUNNING"
     } else {
-      query.exception.map(_ => "FAILED").getOrElse("FINISHED")
+      uiData.summary.exception.map(_ => "FAILED").getOrElse("FINISHED")
     }
   }
 
-  private val progressTimestampFormat = new ThreadLocal[SimpleDateFormat]() {
-    override def initialValue(): SimpleDateFormat = {
-      val format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
-      format.setTimeZone(getTimeZone("UTC"))
-      format
-    }
-  }
+  private val progressTimestampFormat = DateTimeFormatter
+    .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
+    .withZone(getZoneId("UTC"))
 
   def parseProgressTimestamp(timestamp: String): Long = {
-    progressTimestampFormat.get.parse(timestamp).getTime
+    val zonedDateTime = ZonedDateTime.parse(timestamp, progressTimestampFormat)
+    zonedDateTime.toInstant.toEpochMilli
   }
 }

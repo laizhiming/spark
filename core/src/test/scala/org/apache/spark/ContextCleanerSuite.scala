@@ -42,7 +42,7 @@ import org.apache.spark.storage._
 abstract class ContextCleanerSuiteBase(val shuffleManager: Class[_] = classOf[SortShuffleManager])
   extends SparkFunSuite with BeforeAndAfter with LocalSparkContext
 {
-  implicit val defaultTimeout = timeout(10.seconds)
+  implicit val defaultTimeout: PatienceConfiguration.Timeout = timeout(10.seconds)
   val conf = new SparkConf()
     .setMaster("local[2]")
     .setAppName("ContextCleanerSuite")
@@ -89,7 +89,7 @@ abstract class ContextCleanerSuiteBase(val shuffleManager: Class[_] = classOf[So
     val rdd: RDD[_] = Random.nextInt(3) match {
       case 0 => newRDD()
       case 1 => newShuffleRDD()
-      case 2 => newPairRDD.join(newPairRDD())
+      case 2 => newPairRDD().join(newPairRDD())
     }
     if (Random.nextBoolean()) rdd.persist()
     rdd.count()
@@ -288,7 +288,7 @@ class ContextCleanerSuite extends ContextCleanerSuiteBase {
     val rddBuffer = (1 to numRdds).map(i => randomRdd()).toBuffer
     val broadcastBuffer = (1 to numBroadcasts).map(i => newBroadcast()).toBuffer
     val rddIds = sc.persistentRdds.keys.toSeq
-    val shuffleIds = 0 until sc.newShuffleId
+    val shuffleIds = 0 until sc.newShuffleId()
     val broadcastIds = broadcastBuffer.map(_.id)
 
     val preGCTester = new CleanerTester(sc, rddIds, shuffleIds, broadcastIds.toSeq)
@@ -328,7 +328,7 @@ class ContextCleanerSuite extends ContextCleanerSuiteBase {
     val rddBuffer = (1 to numRdds).map(i => randomRdd()).toBuffer
     val broadcastBuffer = (1 to numBroadcasts).map(i => newBroadcast()).toBuffer
     val rddIds = sc.persistentRdds.keys.toSeq
-    val shuffleIds = 0 until sc.newShuffleId
+    val shuffleIds = 0 until sc.newShuffleId()
     val broadcastIds = broadcastBuffer.map(_.id)
 
     val preGCTester = new CleanerTester(sc, rddIds, shuffleIds, broadcastIds.toSeq)
@@ -368,7 +368,7 @@ class CleanerTester(
 
   val toBeCleanedRDDIds = new HashSet[Int] ++= rddIds
   val toBeCleanedShuffleIds = new HashSet[Int] ++= shuffleIds
-  val toBeCleanedBroadcstIds = new HashSet[Long] ++= broadcastIds
+  val toBeCleanedBroadcastIds = new HashSet[Long] ++= broadcastIds
   val toBeCheckpointIds = new HashSet[Long] ++= checkpointIds
   val isDistributed = !sc.isLocal
 
@@ -384,7 +384,7 @@ class CleanerTester(
     }
 
     def broadcastCleaned(broadcastId: Long): Unit = {
-      toBeCleanedBroadcstIds.synchronized { toBeCleanedBroadcstIds -= broadcastId }
+      toBeCleanedBroadcastIds.synchronized { toBeCleanedBroadcastIds -= broadcastId }
       logInfo("Broadcast " + broadcastId + " cleaned")
     }
 
@@ -508,8 +508,8 @@ class CleanerTester(
     val s2 = toBeCleanedShuffleIds.synchronized {
       toBeCleanedShuffleIds.toSeq.sorted.mkString("[", ", ", "]")
     }
-    val s3 = toBeCleanedBroadcstIds.synchronized {
-      toBeCleanedBroadcstIds.toSeq.sorted.mkString("[", ", ", "]")
+    val s3 = toBeCleanedBroadcastIds.synchronized {
+      toBeCleanedBroadcastIds.toSeq.sorted.mkString("[", ", ", "]")
     }
     s"""
        |\tRDDs = $s1
@@ -521,7 +521,7 @@ class CleanerTester(
   private def isAllCleanedUp =
     toBeCleanedRDDIds.synchronized { toBeCleanedRDDIds.isEmpty } &&
     toBeCleanedShuffleIds.synchronized { toBeCleanedShuffleIds.isEmpty } &&
-    toBeCleanedBroadcstIds.synchronized { toBeCleanedBroadcstIds.isEmpty } &&
+    toBeCleanedBroadcastIds.synchronized { toBeCleanedBroadcastIds.isEmpty } &&
     toBeCheckpointIds.synchronized { toBeCheckpointIds.isEmpty }
 
   private def getRDDBlocks(rddId: Int): Seq[BlockId] = {

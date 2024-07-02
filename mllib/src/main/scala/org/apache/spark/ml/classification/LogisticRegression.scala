@@ -27,8 +27,10 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkException
 import org.apache.spark.annotation.Since
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, LogKeys, MDC}
+import org.apache.spark.internal.LogKeys.{COUNT, RANGE}
 import org.apache.spark.ml.feature._
+import org.apache.spark.ml.impl.Utils
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.optim.aggregator._
 import org.apache.spark.ml.optim.loss.{L2Regularization, RDDLossFunction}
@@ -36,10 +38,11 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.stat._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Dataset, Row}
+import org.apache.spark.sql._
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.VersionUtils
@@ -50,7 +53,7 @@ import org.apache.spark.util.VersionUtils
 private[classification] trait LogisticRegressionParams extends ProbabilisticClassifierParams
   with HasRegParam with HasElasticNetParam with HasMaxIter with HasFitIntercept with HasTol
   with HasStandardization with HasWeightCol with HasThreshold with HasAggregationDepth
-  with HasBlockSize {
+  with HasMaxBlockSizeInMB {
 
   import org.apache.spark.ml.classification.LogisticRegression.supportedFamilyNames
 
@@ -245,7 +248,7 @@ private[classification] trait LogisticRegressionParams extends ProbabilisticClas
 
   setDefault(regParam -> 0.0, elasticNetParam -> 0.0, maxIter -> 100, tol -> 1E-6,
     fitIntercept -> true, family -> "auto", standardization -> true, threshold -> 0.5,
-    aggregationDepth -> 2, blockSize -> 1)
+    aggregationDepth -> 2, maxBlockSizeInMB -> 0.0)
 
   protected def usingBoundConstrainedOptimization: Boolean = {
     isSet(lowerBoundsOnCoefficients) || isSet(upperBoundsOnCoefficients) ||
@@ -276,6 +279,10 @@ private[classification] trait LogisticRegressionParams extends ProbabilisticClas
  *
  * This class supports fitting traditional logistic regression model by LBFGS/OWLQN and
  * bound (box) constrained logistic regression model by LBFGSB.
+ *
+ * Since 3.1.0, it supports stacking instances into blocks and using GEMV/GEMM for
+ * better performance.
+ * The block size will be 1.0 MB, if param maxBlockSizeInMB is set 0.0 by default.
  */
 @Since("1.2.0")
 class LogisticRegression @Since("1.2.0") (
@@ -426,22 +433,13 @@ class LogisticRegression @Since("1.2.0") (
   def setUpperBoundsOnIntercepts(value: Vector): this.type = set(upperBoundsOnIntercepts, value)
 
   /**
-   * Set block size for stacking input data in matrices.
-   * If blockSize == 1, then stacking will be skipped, and each vector is treated individually;
-   * If blockSize &gt; 1, then vectors will be stacked to blocks, and high-level BLAS routines
-   * will be used if possible (for example, GEMV instead of DOT, GEMM instead of GEMV).
-   * Recommended size is between 10 and 1000. An appropriate choice of the block size depends
-   * on the sparsity and dim of input datasets, the underlying BLAS implementation (for example,
-   * f2jBLAS, OpenBLAS, intel MKL) and its configuration (for example, number of threads).
-   * Note that existing BLAS implementations are mainly optimized for dense matrices, if the
-   * input dataset is sparse, stacking may bring no performance gain, the worse is possible
-   * performance regression.
-   * Default is 1.
+   * Sets the value of param [[maxBlockSizeInMB]].
+   * Default is 0.0, then 1.0 MB will be chosen.
    *
    * @group expertSetParam
    */
   @Since("3.1.0")
-  def setBlockSize(value: Int): this.type = set(blockSize, value)
+  def setMaxBlockSizeInMB(value: Double): this.type = set(maxBlockSizeInMB, value)
 
   private def assertBoundConstrainedOptimizationParamsValid(
       numCoefficientSets: Int,
@@ -490,36 +488,34 @@ class LogisticRegression @Since("1.2.0") (
 
   private var optInitialModel: Option[LogisticRegressionModel] = None
 
-  private[spark] def setInitialModel(model: LogisticRegressionModel): this.type = {
+  @Since("3.3.0")
+  def setInitialModel(model: LogisticRegressionModel): this.type = {
     this.optInitialModel = Some(model)
     this
   }
 
-  override protected[spark] def train(dataset: Dataset[_]): LogisticRegressionModel = {
-    val handlePersistence = dataset.storageLevel == StorageLevel.NONE
-    train(dataset, handlePersistence)
-  }
-
   protected[spark] def train(
-      dataset: Dataset[_],
-      handlePersistence: Boolean): LogisticRegressionModel = instrumented { instr =>
+      dataset: Dataset[_]): LogisticRegressionModel = instrumented { instr =>
     instr.logPipelineStage(this)
     instr.logDataset(dataset)
     instr.logParams(this, labelCol, weightCol, featuresCol, predictionCol, rawPredictionCol,
       probabilityCol, regParam, elasticNetParam, standardization, threshold, thresholds, maxIter,
-      tol, fitIntercept, blockSize)
+      tol, fitIntercept, maxBlockSizeInMB)
 
-    val instances = extractInstances(dataset)
-      .setName("training instances")
-
-    if (handlePersistence && $(blockSize) == 1) {
-      instances.persist(StorageLevel.MEMORY_AND_DISK)
+    if (dataset.storageLevel != StorageLevel.NONE) {
+      instr.logWarning("Input instances will be standardized, blockified to blocks, and " +
+        "then cached during training. Be careful of double caching!")
     }
 
-    var requestedMetrics = Seq("mean", "std", "count")
-    if ($(blockSize) != 1) requestedMetrics +:= "numNonZeros"
+    val instances = dataset.select(
+      checkClassificationLabels($(labelCol), None),
+      checkNonNegativeWeights(get(weightCol)),
+      checkNonNanVectors($(featuresCol))
+    ).rdd.map { case Row(l: Double, w: Double, v: Vector) => Instance(l, w, v)
+    }.setName("training instances")
+
     val (summarizer, labelSummarizer) = Summarizer
-      .getClassificationSummarizers(instances, $(aggregationDepth), requestedMetrics)
+      .getClassificationSummarizers(instances, $(aggregationDepth), Seq("mean", "std", "count"))
 
     val numFeatures = summarizer.mean.size
     val histogram = labelSummarizer.histogram
@@ -535,10 +531,11 @@ class LogisticRegression @Since("1.2.0") (
     }
 
     if (numInvalid != 0) {
-      val msg = s"Classification labels should be in [0 to ${numClasses - 1}]. " +
-        s"Found $numInvalid invalid labels."
+      val msg = log"Classification labels should be in " +
+        log"${MDC(RANGE, s"[0 to ${numClasses - 1}]")}. " +
+        log"Found ${MDC(COUNT, numInvalid)} invalid labels."
       instr.logError(msg)
-      throw new SparkException(msg)
+      throw new SparkException(msg.message)
     }
 
     instr.logNumClasses(numClasses)
@@ -547,14 +544,13 @@ class LogisticRegression @Since("1.2.0") (
     instr.logNamedValue("lowestLabelWeight", labelSummarizer.histogram.min.toString)
     instr.logNamedValue("highestLabelWeight", labelSummarizer.histogram.max.toString)
     instr.logSumOfWeights(summarizer.weightSum)
-    if ($(blockSize) > 1) {
-      val scale = 1.0 / summarizer.count / numFeatures
-      val sparsity = 1 - summarizer.numNonzeros.toArray.map(_ * scale).sum
-      instr.logNamedValue("sparsity", sparsity.toString)
-      if (sparsity > 0.5) {
-        instr.logWarning(s"sparsity of input dataset is $sparsity, " +
-          s"which may hurt performance in high-level BLAS.")
-      }
+
+    var actualBlockSizeInMB = $(maxBlockSizeInMB)
+    if (actualBlockSizeInMB == 0) {
+      // TODO: for Multinomial logistic regression, take numClasses into account
+      actualBlockSizeInMB = InstanceBlock.DefaultBlockSizeInMB
+      require(actualBlockSizeInMB > 0, "inferred actual BlockSizeInMB must > 0")
+      instr.logNamedValue("actualBlockSizeInMB", actualBlockSizeInMB.toString)
     }
 
     val isMultinomial = checkMultinomial(numClasses)
@@ -573,8 +569,8 @@ class LogisticRegression @Since("1.2.0") (
 
     val isConstantLabel = histogram.count(_ != 0.0) == 1
     if ($(fitIntercept) && isConstantLabel && !usingBoundConstrainedOptimization) {
-      instr.logWarning(s"All labels are the same value and fitIntercept=true, so the " +
-        s"coefficients will be zeros. Training is not needed.")
+      instr.logWarning("All labels are the same value and fitIntercept=true, so the " +
+        "coefficients will be zeros. Training is not needed.")
       val constantLabelIndex = Vectors.dense(histogram).argmax
       val coefMatrix = new SparseMatrix(numCoefficientSets, numFeatures,
         new Array[Int](numCoefficientSets + 1), Array.emptyIntArray, Array.emptyDoubleArray,
@@ -584,13 +580,12 @@ class LogisticRegression @Since("1.2.0") (
       } else {
         Vectors.dense(if (numClasses == 2) Double.PositiveInfinity else Double.NegativeInfinity)
       }
-      if (instances.getStorageLevel != StorageLevel.NONE) instances.unpersist()
       return createModel(dataset, numClasses, coefMatrix, interceptVec, Array(0.0))
     }
 
     if (!$(fitIntercept) && isConstantLabel) {
-      instr.logWarning(s"All labels belong to a single class and fitIntercept=false. It's a " +
-        s"dangerous ground, so the algorithm may not converge.")
+      instr.logWarning("All labels belong to a single class and fitIntercept=false. It's a " +
+        "dangerous ground, so the algorithm may not converge.")
     }
 
     val featuresMean = summarizer.mean.toArray
@@ -622,7 +617,7 @@ class LogisticRegression @Since("1.2.0") (
       The coefficients are laid out in column major order during training. Here we initialize
       a column major matrix of initial coefficients.
      */
-    val initialCoefWithInterceptMatrix = createInitCoefWithInterceptMatrix(
+    val initialSolution = createInitialSolution(
       numClasses, numFeatures, histogram, featuresStd, lowerBounds, upperBounds, instr)
 
     /*
@@ -636,19 +631,12 @@ class LogisticRegression @Since("1.2.0") (
        Note that the intercept in scaled space and original space is the same;
        as a result, no scaling is needed.
      */
-    val (allCoefficients, objectiveHistory) = if ($(blockSize) == 1) {
-      trainOnRows(instances, featuresStd, numClasses, initialCoefWithInterceptMatrix,
-        regularization, optimizer)
-    } else {
-      trainOnBlocks(instances, featuresStd, numClasses, initialCoefWithInterceptMatrix,
-        regularization, optimizer)
-    }
-    if (instances.getStorageLevel != StorageLevel.NONE) instances.unpersist()
+    val (allCoefficients, objectiveHistory) =
+      trainImpl(instances, actualBlockSizeInMB, featuresStd, featuresMean, numClasses,
+        initialSolution.toArray, regularization, optimizer)
 
     if (allCoefficients == null) {
-      val msg = s"${optimizer.getClass.getName} failed."
-      instr.logError(msg)
-      throw new SparkException(msg)
+      MLUtils.optimizerFailed(instr, optimizer.getClass)
     }
 
     val allCoefMatrix = new DenseMatrix(numCoefficientSets, numFeaturesPlusIntercept,
@@ -684,7 +672,7 @@ class LogisticRegression @Since("1.2.0") (
       denseCoefficientMatrix.foreachActive { case (i, j, v) =>
         centers(j) += v
       }
-      centers.transform(_ / numCoefficientSets)
+      centers.mapInPlace(_ / numCoefficientSets)
       denseCoefficientMatrix.foreachActive { case (i, j, v) =>
         denseCoefficientMatrix.update(i, j, v - centers(j))
       }
@@ -836,7 +824,7 @@ class LogisticRegression @Since("1.2.0") (
    * The coefficients are laid out in column major order during training. Here we initialize
    * a column major matrix of initial coefficients.
    */
-  private def createInitCoefWithInterceptMatrix(
+  private def createInitialSolution(
       numClasses: Int,
       numFeatures: Int,
       histogram: Array[Double],
@@ -859,9 +847,11 @@ class LogisticRegression @Since("1.2.0") (
           (_initialModel.interceptVector.size == numCoefficientSets) &&
           (_initialModel.getFitIntercept == $(fitIntercept))
         if (!modelIsValid) {
-          instr.logWarning(s"Initial coefficients will be ignored! Its dimensions " +
-            s"(${providedCoefs.numRows}, ${providedCoefs.numCols}) did not match the " +
-            s"expected size ($numCoefficientSets, $numFeatures)")
+          instr.logWarning(log"Initial coefficients will be ignored! Its dimensions " +
+            log"(${MDC(LogKeys.NUM_ROWS, providedCoefs.numRows)}}, " +
+            log"${MDC(LogKeys.NUM_COLUMNS, providedCoefs.numCols)}) did not match the " +
+            log"expected size (${MDC(LogKeys.NUM_COEFFICIENTS, numCoefficientSets)}, " +
+            log"${MDC(LogKeys.NUM_FEATURES, numFeatures)})")
         }
         modelIsValid
       case None => false
@@ -949,64 +939,72 @@ class LogisticRegression @Since("1.2.0") (
     initialCoefWithInterceptMatrix
   }
 
-  private def trainOnRows(
+  private def trainImpl(
       instances: RDD[Instance],
+      actualBlockSizeInMB: Double,
       featuresStd: Array[Double],
+      featuresMean: Array[Double],
       numClasses: Int,
-      initialCoefWithInterceptMatrix: Matrix,
+      initialSolution: Array[Double],
       regularization: Option[L2Regularization],
       optimizer: FirstOrderMinimizer[BDV[Double], DiffFunction[BDV[Double]]]) = {
-    val bcFeaturesStd = instances.context.broadcast(featuresStd)
-    val getAggregatorFunc = new LogisticAggregator(bcFeaturesStd, numClasses, $(fitIntercept),
-      checkMultinomial(numClasses))(_)
+    val multinomial = checkMultinomial(numClasses)
 
-    val costFun = new RDDLossFunction(instances, getAggregatorFunc,
-      regularization, $(aggregationDepth))
-    val states = optimizer.iterations(new CachedDiffFunction(costFun),
-      new BDV[Double](initialCoefWithInterceptMatrix.toArray))
+    // for LR, we can center the input vector, if and only if:
+    // 1, fitIntercept is true;
+    // 2, no penalty on the intercept, which is always true in existing impl;
+    // 3, no bounds on the intercept.
+    val fitWithMean = $(fitIntercept) &&
+      (!isSet(lowerBoundsOnIntercepts) ||
+        $(lowerBoundsOnIntercepts).toArray.forall(_.isNegInfinity)) &&
+      (!isSet(upperBoundsOnIntercepts) ||
+        $(upperBoundsOnIntercepts).toArray.forall(_.isPosInfinity))
 
-    /*
-       Note that in Logistic Regression, the objective history (loss + regularization)
-       is log-likelihood which is invariant under feature standardization. As a result,
-       the objective history from optimizer is the same as the one in the original space.
-     */
-    val arrayBuilder = mutable.ArrayBuilder.make[Double]
-    var state: optimizer.State = null
-    while (states.hasNext) {
-      state = states.next()
-      arrayBuilder += state.adjustedValue
-    }
-    bcFeaturesStd.destroy()
-
-    (if (state == null) null else state.x.toArray, arrayBuilder.result)
-  }
-
-  private def trainOnBlocks(
-      instances: RDD[Instance],
-      featuresStd: Array[Double],
-      numClasses: Int,
-      initialCoefWithInterceptMatrix: Matrix,
-      regularization: Option[L2Regularization],
-      optimizer: FirstOrderMinimizer[BDV[Double], DiffFunction[BDV[Double]]]) = {
     val numFeatures = featuresStd.length
-    val bcFeaturesStd = instances.context.broadcast(featuresStd)
+    val inverseStd = featuresStd.map(std => if (std != 0) 1.0 / std else 0.0)
+    val scaledMean = Array.tabulate(numFeatures)(i => inverseStd(i) * featuresMean(i))
+    val bcInverseStd = instances.context.broadcast(inverseStd)
+    val bcScaledMean = instances.context.broadcast(scaledMean)
 
-    val standardized = instances.mapPartitions { iter =>
-      val inverseStd = bcFeaturesStd.value.map { std => if (std != 0) 1.0 / std else 0.0 }
-      val func = StandardScalerModel.getTransformFunc(Array.empty, inverseStd, false, true)
+    val scaled = instances.mapPartitions { iter =>
+      val func = StandardScalerModel.getTransformFunc(Array.empty, bcInverseStd.value, false, true)
       iter.map { case Instance(label, weight, vec) => Instance(label, weight, func(vec)) }
     }
-    val blocks = InstanceBlock.blokify(standardized, $(blockSize))
+
+    val maxMemUsage = (actualBlockSizeInMB * 1024L * 1024L).ceil.toLong
+    val blocks = InstanceBlock.blokifyWithMaxMemUsage(scaled, maxMemUsage)
       .persist(StorageLevel.MEMORY_AND_DISK)
-      .setName(s"training blocks (blockSize=${$(blockSize)})")
+      .setName(s"$uid: training blocks (blockSizeInMB=$actualBlockSizeInMB)")
 
-    val getAggregatorFunc = new BlockLogisticAggregator(numFeatures, numClasses, $(fitIntercept),
-      checkMultinomial(numClasses))(_)
+    val costFun = if (multinomial) {
+      val getAggregatorFunc = new MultinomialLogisticBlockAggregator(bcInverseStd, bcScaledMean,
+         $(fitIntercept), fitWithMean)(_)
+      new RDDLossFunction(blocks, getAggregatorFunc, regularization, $(aggregationDepth))
+    } else {
+      val getAggregatorFunc = new BinaryLogisticBlockAggregator(bcInverseStd, bcScaledMean,
+         $(fitIntercept), fitWithMean)(_)
+      new RDDLossFunction(blocks, getAggregatorFunc, regularization, $(aggregationDepth))
+    }
 
-    val costFun = new RDDLossFunction(blocks, getAggregatorFunc,
-      regularization, $(aggregationDepth))
+    if (fitWithMean) {
+      if (multinomial) {
+        val adapt = Array.ofDim[Double](numClasses)
+        BLAS.javaBLAS.dgemv("N", numClasses, numFeatures, 1.0,
+          initialSolution, numClasses, scaledMean, 1, 0.0, adapt, 1)
+        BLAS.javaBLAS.daxpy(numClasses, 1.0, adapt, 0, 1,
+          initialSolution, numClasses * numFeatures, 1)
+      } else {
+        // original `initialSolution` is for problem:
+        // y = f(w1 * x1 / std_x1, w2 * x2 / std_x2, ..., intercept)
+        // we should adjust it to the initial solution for problem:
+        // y = f(w1 * (x1 - avg_x1) / std_x1, w2 * (x2 - avg_x2) / std_x2, ..., intercept)
+        val adapt = BLAS.javaBLAS.ddot(numFeatures, initialSolution, 1, scaledMean, 1)
+        initialSolution(numFeatures) += adapt
+      }
+    }
+
     val states = optimizer.iterations(new CachedDiffFunction(costFun),
-      new BDV[Double](initialCoefWithInterceptMatrix.toArray))
+      new BDV[Double](initialSolution))
 
     /*
        Note that in Logistic Regression, the objective history (loss + regularization)
@@ -1020,9 +1018,27 @@ class LogisticRegression @Since("1.2.0") (
       arrayBuilder += state.adjustedValue
     }
     blocks.unpersist()
-    bcFeaturesStd.destroy()
+    bcInverseStd.destroy()
+    bcScaledMean.destroy()
 
-    (if (state == null) null else state.x.toArray, arrayBuilder.result)
+    val solution = if (state == null) null else state.x.toArray
+    if (fitWithMean && solution != null) {
+      if (multinomial) {
+        val adapt = Array.ofDim[Double](numClasses)
+        BLAS.javaBLAS.dgemv("N", numClasses, numFeatures, 1.0,
+          solution, numClasses, scaledMean, 1, 0.0, adapt, 1)
+        BLAS.javaBLAS.daxpy(numClasses, -1.0, adapt, 0, 1,
+          solution, numClasses * numFeatures, 1)
+      } else {
+        // the final solution is for problem:
+        // y = f(w1 * (x1 - avg_x1) / std_x1, w2 * (x2 - avg_x2) / std_x2, ..., intercept)
+        // we should adjust it back for original problem:
+        // y = f(w1 * x1 / std_x1, w2 * x2 / std_x2, ..., intercept)
+        val adapt = BLAS.javaBLAS.ddot(numFeatures, solution, 1, scaledMean, 1)
+        solution(numFeatures) -= adapt
+      }
+    }
+    (solution, arrayBuilder.result())
   }
 
   @Since("1.4.0")
@@ -1098,46 +1114,36 @@ class LogisticRegressionModel private[spark] (
     _intercept
   }
 
-  private lazy val _intercept = interceptVector(0)
-  private lazy val _interceptVector = interceptVector.toDense
-  private lazy val _binaryThresholdArray = {
-    val array = Array(Double.NaN, Double.NaN)
-    updateBinaryThresholds(array)
-    array
-  }
-  private def _threshold: Double = _binaryThresholdArray(0)
-  private def _rawThreshold: Double = _binaryThresholdArray(1)
+  private val _interceptVector = if (isMultinomial) interceptVector.toDense else null
+  private val _intercept = if (!isMultinomial) interceptVector(0) else Double.NaN
+  // Array(0.5, 0.0) is the value for default threshold (0.5) and thresholds (unset)
+  private var _binaryThresholds: Array[Double] = if (!isMultinomial) Array(0.5, 0.0) else null
 
-  private def updateBinaryThresholds(array: Array[Double]): Unit = {
-    if (!isMultinomial) {
-      val _threshold = getThreshold
-      array(0) = _threshold
-      if (_threshold == 0.0) {
-        array(1) = Double.NegativeInfinity
-      } else if (_threshold == 1.0) {
-        array(1) = Double.PositiveInfinity
+  private[ml] override def onParamChange(param: Param[_]): Unit = {
+    if (!isMultinomial && (param.name == "threshold" || param.name == "thresholds")) {
+      if (isDefined(threshold) || isDefined(thresholds)) {
+        val _threshold = getThreshold
+        if (_threshold == 0.0) {
+          _binaryThresholds = Array(_threshold, Double.NegativeInfinity)
+        } else if (_threshold == 1.0) {
+          _binaryThresholds = Array(_threshold, Double.PositiveInfinity)
+        } else {
+          _binaryThresholds = Array(_threshold, math.log(_threshold / (1.0 - _threshold)))
+        }
       } else {
-        array(1) = math.log(_threshold / (1.0 - _threshold))
+        _binaryThresholds = null
       }
     }
   }
 
   @Since("1.5.0")
-  override def setThreshold(value: Double): this.type = {
-    super.setThreshold(value)
-    updateBinaryThresholds(_binaryThresholdArray)
-    this
-  }
+  override def setThreshold(value: Double): this.type = super.setThreshold(value)
 
   @Since("1.5.0")
   override def getThreshold: Double = super.getThreshold
 
   @Since("1.5.0")
-  override def setThresholds(value: Array[Double]): this.type = {
-    super.setThresholds(value)
-    updateBinaryThresholds(_binaryThresholdArray)
-    this
-  }
+  override def setThresholds(value: Array[Double]): this.type = super.setThresholds(value)
 
   @Since("1.5.0")
   override def getThresholds: Array[Double] = super.getThresholds
@@ -1209,7 +1215,7 @@ class LogisticRegressionModel private[spark] (
     super.predict(features)
   } else {
     // Note: We should use _threshold instead of $(threshold) since getThreshold is overridden.
-    if (score(features) > _threshold) 1 else 0
+    if (score(features) > _binaryThresholds(0)) 1 else 0
   }
 
   override protected def raw2probabilityInPlace(rawPrediction: Vector): Vector = {
@@ -1217,36 +1223,12 @@ class LogisticRegressionModel private[spark] (
       case dv: DenseVector =>
         val values = dv.values
         if (isMultinomial) {
-          // get the maximum margin
-          val maxMarginIndex = rawPrediction.argmax
-          val maxMargin = rawPrediction(maxMarginIndex)
-
-          if (maxMargin == Double.PositiveInfinity) {
-            var k = 0
-            while (k < numClasses) {
-              values(k) = if (k == maxMarginIndex) 1.0 else 0.0
-              k += 1
-            }
-          } else {
-            var sum = 0.0
-            var k = 0
-            while (k < numClasses) {
-              values(k) = if (maxMargin > 0) {
-                math.exp(values(k) - maxMargin)
-              } else {
-                math.exp(values(k))
-              }
-              sum += values(k)
-              k += 1
-            }
-            BLAS.scal(1 / sum, dv)
-          }
-          dv
+          Utils.softmax(values)
         } else {
           values(0) = 1.0 / (1.0 + math.exp(-values(0)))
           values(1) = 1.0 - values(0)
-          dv
         }
+        dv
       case sv: SparseVector =>
         throw new RuntimeException("Unexpected error in LogisticRegressionModel:" +
           " raw2probabilitiesInPlace encountered SparseVector")
@@ -1275,7 +1257,7 @@ class LogisticRegressionModel private[spark] (
       super.raw2prediction(rawPrediction)
     } else {
       // Note: We should use _threshold instead of $(threshold) since getThreshold is overridden.
-      if (rawPrediction(1) > _rawThreshold) 1.0 else 0.0
+      if (rawPrediction(1) > _binaryThresholds(1)) 1.0 else 0.0
     }
   }
 
@@ -1284,7 +1266,7 @@ class LogisticRegressionModel private[spark] (
       super.probability2prediction(probability)
     } else {
       // Note: We should use _threshold instead of $(threshold) since getThreshold is overridden.
-      if (probability(1) > _threshold) 1.0 else 0.0
+      if (probability(1) > _binaryThresholds(0)) 1.0 else 0.0
     }
   }
 
@@ -1349,7 +1331,7 @@ object LogisticRegressionModel extends MLReadable[LogisticRegressionModel] {
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.format("parquet").load(dataPath)
 
-      val model = if (major.toInt < 2 || (major.toInt == 2 && minor.toInt == 0)) {
+      val model = if (major < 2 || (major == 2 && minor == 0)) {
         // 2.0 and before
         val Row(numClasses: Int, numFeatures: Int, intercept: Double, coefficients: Vector) =
           MLUtils.convertVectorColumnsToML(data, "coefficients")

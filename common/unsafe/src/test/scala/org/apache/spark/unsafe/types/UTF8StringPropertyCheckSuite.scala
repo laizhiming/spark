@@ -80,7 +80,9 @@ class UTF8StringPropertyCheckSuite extends AnyFunSuite with ScalaCheckDrivenProp
 
   test("compare") {
     forAll { (s1: String, s2: String) =>
-      assert(Math.signum(toUTF8(s1).compareTo(toUTF8(s2))) === Math.signum(s1.compareTo(s2)))
+      assert(Math.signum {
+        toUTF8(s1).binaryCompare(toUTF8(s2)).toFloat
+      } === Math.signum(s1.compareTo(s2).toFloat))
     }
   }
 
@@ -192,7 +194,7 @@ class UTF8StringPropertyCheckSuite extends AnyFunSuite with ScalaCheckDrivenProp
     }
   }
 
-  val nullalbeSeq = Gen.listOf(Gen.oneOf[String](null: String, randomString))
+  val nullableSeq = Gen.listOf(Gen.oneOf[String](null: String, randomString))
 
   test("concat") {
     def concat(origin: Seq[String]): String =
@@ -201,7 +203,7 @@ class UTF8StringPropertyCheckSuite extends AnyFunSuite with ScalaCheckDrivenProp
     forAll { (inputs: Seq[String]) =>
       assert(UTF8String.concat(inputs.map(toUTF8): _*) === toUTF8(inputs.mkString))
     }
-    forAll (nullalbeSeq) { (inputs: Seq[String]) =>
+    forAll (nullableSeq) { (inputs: Seq[String]) =>
       assert(UTF8String.concat(inputs.map(toUTF8): _*) === toUTF8(concat(inputs)))
     }
   }
@@ -216,7 +218,7 @@ class UTF8StringPropertyCheckSuite extends AnyFunSuite with ScalaCheckDrivenProp
       assert(UTF8String.concatWs(toUTF8(sep), inputs.map(toUTF8): _*) ===
         toUTF8(inputs.mkString(sep)))
     }
-    forAll(randomString, nullalbeSeq) {(sep: String, inputs: Seq[String]) =>
+    forAll(randomString, nullableSeq) {(sep: String, inputs: Seq[String]) =>
       assert(UTF8String.concatWs(toUTF8(sep), inputs.map(toUTF8): _*) ===
         toUTF8(concatWs(sep, inputs)))
     }

@@ -30,7 +30,7 @@ private[streaming] object HdfsUtils {
     val dfs = getFileSystemForPath(dfsPath, conf)
     // If the file exists and we have append support, append instead of creating a new file
     val stream: FSDataOutputStream = {
-      if (dfs.isFile(dfsPath)) {
+      if (SparkHadoopUtil.isFile(dfs, dfsPath)) {
         if (conf.getBoolean("dfs.support.append", true) ||
             conf.getBoolean("hdfs.append.support", false) ||
             dfs.isInstanceOf[RawLocalFileSystem]) {
@@ -39,7 +39,7 @@ private[streaming] object HdfsUtils {
           throw new IllegalStateException("File exists and there is no append support!")
         }
       } else {
-        // we dont' want to use hdfs erasure coding, as that lacks support for append and hflush
+        // we don't want to use hdfs erasure coding, as that lacks support for append and hflush
         SparkHadoopUtil.createFile(dfs, dfsPath, false)
       }
     }

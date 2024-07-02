@@ -26,7 +26,8 @@ import org.apache.hive.service.cli.OperationState
 import org.apache.hive.service.cli.operation.GetTypeInfoOperation
 import org.apache.hive.service.cli.session.HiveSession
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.SQLContext
 
 /**
@@ -45,7 +46,7 @@ private[hive] class SparkGetTypeInfoOperation(
   override def runInternal(): Unit = {
     statementId = UUID.randomUUID().toString
     val logMsg = "Listing type info"
-    logInfo(s"$logMsg with $statementId")
+    logInfo(log"Listing type info with ${MDC(STATEMENT_ID, statementId)}")
     setState(OperationState.RUNNING)
     // Always use the latest class loader provided by executionHive's state.
     val executionHiveClassLoader = sqlContext.sharedState.jarClassLoader
@@ -99,6 +100,7 @@ private[hive] object SparkGetTypeInfoUtil {
       TINYINT_TYPE, SMALLINT_TYPE, INT_TYPE, BIGINT_TYPE,
       FLOAT_TYPE, DOUBLE_TYPE, DECIMAL_TYPE,
       DATE_TYPE, TIMESTAMP_TYPE,
-      ARRAY_TYPE, MAP_TYPE, STRUCT_TYPE)
+      ARRAY_TYPE, MAP_TYPE, STRUCT_TYPE, CHAR_TYPE, VARCHAR_TYPE,
+      INTERVAL_YEAR_MONTH_TYPE, INTERVAL_DAY_TIME_TYPE)
   }
 }

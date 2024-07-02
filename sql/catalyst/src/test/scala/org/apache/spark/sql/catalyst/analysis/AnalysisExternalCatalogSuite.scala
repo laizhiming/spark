@@ -27,13 +27,11 @@ import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogStorageFormat, CatalogTable, CatalogTableType, ExternalCatalog, InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, Project}
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 class AnalysisExternalCatalogSuite extends AnalysisTest with Matchers {
   private def getAnalyzer(externCatalog: ExternalCatalog, databasePath: File): Analyzer = {
-    val conf = new SQLConf()
-    val catalog = new SessionCatalog(externCatalog, FunctionRegistry.builtin, conf)
+    val catalog = new SessionCatalog(externCatalog, FunctionRegistry.builtin)
     catalog.createDatabase(
       CatalogDatabase("default", "", databasePath.toURI, Map.empty),
       ignoreIfExists = false)
@@ -44,13 +42,13 @@ class AnalysisExternalCatalogSuite extends AnalysisTest with Matchers {
         CatalogStorageFormat.empty,
         StructType(Seq(StructField("a", IntegerType, nullable = true)))),
       ignoreIfExists = false)
-    new Analyzer(catalog, conf)
+    new Analyzer(catalog)
   }
 
   test("query builtin functions don't call the external catalog") {
     withTempDir { tempDir =>
       val inMemoryCatalog = new InMemoryCatalog
-      val catalog = spy(inMemoryCatalog)
+      val catalog = spy[InMemoryCatalog](inMemoryCatalog)
       val analyzer = getAnalyzer(catalog, tempDir)
       reset(catalog)
       val testRelation = LocalRelation(AttributeReference("a", IntegerType, nullable = true)())
@@ -65,8 +63,8 @@ class AnalysisExternalCatalogSuite extends AnalysisTest with Matchers {
   test("check the existence of builtin functions don't call the external catalog") {
     withTempDir { tempDir =>
       val inMemoryCatalog = new InMemoryCatalog
-      val externCatalog = spy(inMemoryCatalog)
-      val catalog = new SessionCatalog(externCatalog, FunctionRegistry.builtin, conf)
+      val externCatalog = spy[InMemoryCatalog](inMemoryCatalog)
+      val catalog = new SessionCatalog(externCatalog, FunctionRegistry.builtin)
       catalog.createDatabase(
         CatalogDatabase("default", "", new URI(tempDir.toString), Map.empty),
         ignoreIfExists = false)

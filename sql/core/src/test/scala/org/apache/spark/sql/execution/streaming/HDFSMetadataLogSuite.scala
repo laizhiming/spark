@@ -33,6 +33,18 @@ class HDFSMetadataLogSuite extends SharedSparkSession {
 
   private implicit def toOption[A](a: A): Option[A] = Option(a)
 
+  test("SPARK-46339: Directory with number name should not be treated as metadata log") {
+    withTempDir { temp =>
+      val dir = new File(temp, "dir")
+      val metadataLog = new HDFSMetadataLog[String](spark, dir.getAbsolutePath)
+      assert(metadataLog.metadataPath.toString.endsWith("/dir"))
+
+      // Create a directory with batch id 0
+      new File(dir, "0").mkdir()
+      assert(metadataLog.getLatest() === None)
+    }
+  }
+
   test("HDFSMetadataLog: basic") {
     withTempDir { temp =>
       val dir = new File(temp, "dir") // use non-existent directory to test whether log make the dir
@@ -199,7 +211,7 @@ class HDFSMetadataLogSuite extends SharedSparkSession {
     intercept[IllegalStateException](verifyBatchIds(Seq(2, 3, 4), Some(1L), Some(5L)))
     intercept[IllegalStateException](verifyBatchIds(Seq(1, 2, 4, 5), Some(1L), Some(5L)))
 
-    // Related to SPARK-26629, this capatures the behavior for verifyBatchIds when startId > endId
+    // Related to SPARK-26629, this captures the behavior for verifyBatchIds when startId > endId
     intercept[IllegalStateException](verifyBatchIds(Seq(), Some(2L), Some(1L)))
     intercept[AssertionError](verifyBatchIds(Seq(2), Some(2L), Some(1L)))
     intercept[AssertionError](verifyBatchIds(Seq(1), Some(2L), Some(1L)))

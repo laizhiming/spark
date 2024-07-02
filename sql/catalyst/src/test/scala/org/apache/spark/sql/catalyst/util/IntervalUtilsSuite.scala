@@ -17,15 +17,17 @@
 
 package org.apache.spark.sql.catalyst.util
 
+import java.time.{Duration, Period}
 import java.util.concurrent.TimeUnit
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException}
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeUtils.millisToMicros
+import org.apache.spark.sql.catalyst.util.IntervalStringStyles.{ANSI_STYLE, HIVE_STYLE}
 import org.apache.spark.sql.catalyst.util.IntervalUtils._
-import org.apache.spark.sql.catalyst.util.IntervalUtils.IntervalUnit._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.DayTimeIntervalType
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
@@ -35,8 +37,144 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     assert(safeStringToInterval(UTF8String.fromString(input)) === expected)
   }
 
-  private def checkFromInvalidString(input: String, errorMsg: String): Unit = {
-    failFuncWithInvalidInput(input, errorMsg, s => stringToInterval(UTF8String.fromString(s)))
+  private def checkFromInvalidStringNull(input: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INPUT_IS_NULL",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null")))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringEmpty(input: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INPUT_IS_EMPTY",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null")))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringInvalidPrefix(input: String, prefix: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INVALID_PREFIX",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "prefix" -> prefix))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringUnrecognizedNumber(input: String, number: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.UNRECOGNIZED_NUMBER",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "number" -> number))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringArithmeticException(input: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.ARITHMETIC_EXCEPTION",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null")))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringInvalidValue(input: String, value: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INVALID_VALUE",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "value" -> value))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringInvalidPrecision(input: String, value: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INVALID_PRECISION",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "value" -> value))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringInvalidFraction(input: String, unit: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INVALID_FRACTION",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "unit" -> unit))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringInvalidUnit(input: String, unit: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.INVALID_UNIT",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "unit" -> unit))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringMissingNumber(input: String, word: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.MISSING_NUMBER",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "word" -> word))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringMissingUnit(input: String, word: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.MISSING_UNIT",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "word" -> word))
+    assert(safeStringToInterval(UTF8String.fromString(input)) === null)
+  }
+
+  private def checkFromInvalidStringUnknownError(input: String, word: String): Unit = {
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        stringToInterval(UTF8String.fromString(input))
+      },
+      errorClass = "INVALID_INTERVAL_FORMAT.UNKNOWN_PARSING_ERROR",
+      parameters = Map(
+        "input" -> Option(input).map(_.toString).getOrElse("null"),
+        "word" -> word))
     assert(safeStringToInterval(UTF8String.fromString(input)) === null)
   }
 
@@ -70,24 +208,24 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     testSingleUnit("MilliSecond", 3, 0, 0, millisToMicros(3))
     testSingleUnit("MicroSecond", 3, 0, 0, 3)
 
-    checkFromInvalidString(null, "cannot be null")
-
-    for (input <- Seq("", "interval", "foo", "foo 1 day")) {
-      checkFromInvalidString(input, "Error parsing")
-    }
+    checkFromInvalidStringNull(null)
+    checkFromInvalidStringEmpty("")
+    checkFromInvalidStringEmpty("interval")
+    checkFromInvalidStringUnrecognizedNumber("foo", "foo")
+    checkFromInvalidStringUnrecognizedNumber("foo 1 day", "foo")
   }
 
   test("string to interval: interval with dangling parts should not results null") {
-    checkFromInvalidString("+", "expect a number after '+' but hit EOL")
-    checkFromInvalidString("-", "expect a number after '-' but hit EOL")
-    checkFromInvalidString("+ 2", "expect a unit name after '2' but hit EOL")
-    checkFromInvalidString("- 1", "expect a unit name after '1' but hit EOL")
-    checkFromInvalidString("1", "expect a unit name after '1' but hit EOL")
-    checkFromInvalidString("1.2", "expect a unit name after '1.2' but hit EOL")
-    checkFromInvalidString("1 day 2", "expect a unit name after '2' but hit EOL")
-    checkFromInvalidString("1 day 2.2", "expect a unit name after '2.2' but hit EOL")
-    checkFromInvalidString("1 day -", "expect a number after '-' but hit EOL")
-    checkFromInvalidString("-.", "expect a unit name after '-.' but hit EOL")
+    checkFromInvalidStringMissingNumber("+", "+")
+    checkFromInvalidStringMissingNumber("-", "-")
+    checkFromInvalidStringMissingUnit("+ 2", "2")
+    checkFromInvalidStringMissingUnit("- 1", "1")
+    checkFromInvalidStringMissingUnit("1", "1")
+    checkFromInvalidStringMissingUnit("1.2", "1.2")
+    checkFromInvalidStringMissingUnit("1 day 2", "2")
+    checkFromInvalidStringMissingUnit("1 day 2.2", "2.2")
+    checkFromInvalidStringMissingNumber("1 day -", "-")
+    checkFromInvalidStringMissingUnit("-.", "-.")
   }
 
   test("string to interval: multiple units") {
@@ -109,32 +247,32 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     // Allow duplicated units and summarize their values
     checkFromString("1 day 10 day", new CalendarInterval(0, 11, 0))
     // Only the seconds units can have the fractional part
-    checkFromInvalidString("1.5 days", "'days' cannot have fractional part")
-    checkFromInvalidString("1. hour", "'hour' cannot have fractional part")
-    checkFromInvalidString("1 hourX", "invalid unit 'hourx'")
-    checkFromInvalidString("~1 hour", "unrecognized number '~1'")
-    checkFromInvalidString("1 Mour", "invalid unit 'mour'")
-    checkFromInvalidString("1 aour", "invalid unit 'aour'")
-    checkFromInvalidString("1a1 hour", "invalid value '1a1'")
-    checkFromInvalidString("1.1a1 seconds", "invalid value '1.1a1'")
-    checkFromInvalidString("2234567890 days", "integer overflow")
-    checkFromInvalidString(". seconds", "invalid value '.'")
+    checkFromInvalidStringInvalidFraction("1.5 days", "days")
+    checkFromInvalidStringInvalidFraction("1. hour", "hour")
+    checkFromInvalidStringInvalidUnit("1 hourX", "hourx")
+    checkFromInvalidStringUnrecognizedNumber("~1 hour", "~1")
+    checkFromInvalidStringInvalidUnit("1 Mour", "mour")
+    checkFromInvalidStringInvalidUnit("1 aour", "aour")
+    checkFromInvalidStringInvalidValue("1a1 hour", "1a1")
+    checkFromInvalidStringInvalidValue("1.1a1 seconds", "1.1a1")
+    checkFromInvalidStringArithmeticException("2234567890 days")
+    checkFromInvalidStringInvalidValue(". seconds", ".")
   }
 
   test("string to interval: whitespaces") {
-    checkFromInvalidString(" ", "Error parsing ' ' to interval")
-    checkFromInvalidString("\n", "Error parsing '\n' to interval")
-    checkFromInvalidString("\t", "Error parsing '\t' to interval")
+    checkFromInvalidStringEmpty(" ")
+    checkFromInvalidStringEmpty("\n")
+    checkFromInvalidStringEmpty("\t")
     checkFromString("1 \t day \n 2 \r hour", new CalendarInterval(0, 1, 2 * MICROS_PER_HOUR))
-    checkFromInvalidString("interval1 \t day \n 2 \r hour", "invalid interval prefix interval1")
+    checkFromInvalidStringInvalidPrefix("interval1 \t day \n 2 \r hour", "interval1")
     checkFromString("interval\r1\tday", new CalendarInterval(0, 1, 0))
     // scalastyle:off nonascii
-    checkFromInvalidString("中国 interval 1 day", "unrecognized number '中国'")
-    checkFromInvalidString("interval浙江 1 day", "invalid interval prefix interval浙江")
-    checkFromInvalidString("interval 1杭州 day", "invalid value '1杭州'")
-    checkFromInvalidString("interval 1 滨江day", "invalid unit '滨江day'")
-    checkFromInvalidString("interval 1 day长河", "invalid unit 'day长河'")
-    checkFromInvalidString("interval 1 day 网商路", "unrecognized number '网商路'")
+    checkFromInvalidStringUnrecognizedNumber("中国 interval 1 day", "中国")
+    checkFromInvalidStringInvalidPrefix("interval浙江 1 day", "interval浙江")
+    checkFromInvalidStringInvalidValue("interval 1杭州 day", "1杭州")
+    checkFromInvalidStringInvalidUnit("interval 1 滨江day", "滨江day")
+    checkFromInvalidStringInvalidUnit("interval 1 day长河", "day长河")
+    checkFromInvalidStringUnrecognizedNumber("interval 1 day 网商路", "网商路")
     // scalastyle:on nonascii
   }
 
@@ -148,7 +286,7 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     // truncate nanoseconds to microseconds
     checkFromString("0.999999999 seconds", new CalendarInterval(0, 0, 999999))
     checkFromString(".999999999 seconds", new CalendarInterval(0, 0, 999999))
-    checkFromInvalidString("0.123456789123 seconds", "'0.123456789123' is out of range")
+    checkFromInvalidStringInvalidPrecision("0.123456789123 seconds", "0.123456789123")
   }
 
   test("from year-month string") {
@@ -167,6 +305,19 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
       fromYearMonthString)
     failFuncWithInvalidInput("-\t99-15", "Interval string does not match year-month format",
       fromYearMonthString)
+
+    assert(fromYearMonthString("178956970-6") == new CalendarInterval(Int.MaxValue - 1, 0, 0))
+    assert(fromYearMonthString("178956970-7") == new CalendarInterval(Int.MaxValue, 0, 0))
+
+    val e1 = intercept[IllegalArgumentException]{
+      assert(fromYearMonthString("178956970-8") == new CalendarInterval(Int.MinValue, 0, 0))
+    }.getMessage
+    assert(e1.contains("integer overflow"))
+    assert(fromYearMonthString("-178956970-8") == new CalendarInterval(Int.MinValue, 0, 0))
+    val e2 = intercept[IllegalArgumentException]{
+      assert(fromYearMonthString("-178956970-9") == new CalendarInterval(Int.MinValue, 0, 0))
+    }.getMessage
+    assert(e2.contains("integer overflow"))
   }
 
   test("from day-time string - legacy") {
@@ -187,8 +338,6 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
 
       failFuncWithInvalidInput("5 30:12:20", "hour 30 outside range", fromDayTimeString)
       failFuncWithInvalidInput("5 30-12", "must match day-time format", fromDayTimeString)
-      failFuncWithInvalidInput("5 1:12:20", "Cannot support (interval",
-        s => fromDayTimeString(s, HOUR, MICROSECOND))
     }
   }
 
@@ -203,7 +352,7 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     assert(duration("1 month -30 days", TimeUnit.DAYS, 31) === 1)
 
     val e = intercept[ArithmeticException] {
-      duration(Integer.MAX_VALUE + " month", TimeUnit.SECONDS, 31)
+      duration(s"${Integer.MAX_VALUE} month", TimeUnit.SECONDS, 31)
     }
     assert(e.getMessage.contains("overflow"))
   }
@@ -294,58 +443,59 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     interval = new CalendarInterval(123, 456, 789)
     assert(divide(interval, 0) === null)
     val e2 = intercept[ArithmeticException](divideExact(interval, 0))
-    assert(e2.getMessage.contains("divide by zero"))
+    assert(e2.getMessage.contains("Division by zero"))
   }
 
   test("from day-time string") {
-    def check(input: String, from: IntervalUnit, to: IntervalUnit, expected: String): Unit = {
+    import org.apache.spark.sql.types.DayTimeIntervalType._
+    def check(input: String, from: Byte, to: Byte, expected: String): Unit = {
       withClue(s"from = $from, to = $to") {
         val expectedUtf8 = UTF8String.fromString(expected)
         assert(fromDayTimeString(input, from, to) === safeStringToInterval(expectedUtf8))
       }
     }
-    def checkFail(input: String, from: IntervalUnit, to: IntervalUnit, errMsg: String): Unit = {
+    def checkFail(input: String, from: Byte, to: Byte, errMsg: String): Unit = {
       failFuncWithInvalidInput(input, errMsg, s => fromDayTimeString(s, from, to))
     }
 
     check("12:40", HOUR, MINUTE, "12 hours 40 minutes")
     check("+12:40", HOUR, MINUTE, "12 hours 40 minutes")
     check("-12:40", HOUR, MINUTE, "-12 hours -40 minutes")
-    checkFail("5 12:40", HOUR, MINUTE, "must match day-time format")
+    checkFail("5 12:40", HOUR, MINUTE, "Interval string does not match day-time format")
 
     check("12:40:30.999999999", HOUR, SECOND, "12 hours 40 minutes 30.999999 seconds")
     check("+12:40:30.123456789", HOUR, SECOND, "12 hours 40 minutes 30.123456 seconds")
     check("-12:40:30.123456789", HOUR, SECOND, "-12 hours -40 minutes -30.123456 seconds")
-    checkFail("5 12:40:30", HOUR, SECOND, "must match day-time format")
-    checkFail("12:40:30.0123456789", HOUR, SECOND, "must match day-time format")
+    checkFail("5 12:40:30", HOUR, SECOND, "Interval string does not match day-time format")
+    checkFail("12:40:30.0123456789", HOUR, SECOND,
+      "Interval string does not match day-time format")
 
     check("40:30.123456789", MINUTE, SECOND, "40 minutes 30.123456 seconds")
     check("+40:30.123456789", MINUTE, SECOND, "40 minutes 30.123456 seconds")
     check("-40:30.123456789", MINUTE, SECOND, "-40 minutes -30.123456 seconds")
-    checkFail("12:40:30", MINUTE, SECOND, "must match day-time format")
+    checkFail("12:40:30", MINUTE, SECOND, "Interval string does not match day-time format")
 
     check("5 12", DAY, HOUR, "5 days 12 hours")
     check("+5 12", DAY, HOUR, "5 days 12 hours")
     check("-5 12", DAY, HOUR, "-5 days -12 hours")
-    checkFail("5 12:30", DAY, HOUR, "must match day-time format")
+    checkFail("5 12:30", DAY, HOUR, "Interval string does not match day-time format")
 
     check("5 12:40", DAY, MINUTE, "5 days 12 hours 40 minutes")
     check("+5 12:40", DAY, MINUTE, "5 days 12 hours 40 minutes")
     check("-5 12:40", DAY, MINUTE, "-5 days -12 hours -40 minutes")
-    checkFail("5 12", DAY, MINUTE, "must match day-time format")
+    checkFail("5 12", DAY, MINUTE, "Interval string does not match day-time format")
 
     check("5 12:40:30.123", DAY, SECOND, "5 days 12 hours 40 minutes 30.123 seconds")
     check("+5 12:40:30.123456", DAY, SECOND, "5 days 12 hours 40 minutes 30.123456 seconds")
     check("-5 12:40:30.123456789", DAY, SECOND, "-5 days -12 hours -40 minutes -30.123456 seconds")
-    checkFail("5 12", DAY, SECOND, "must match day-time format")
+    checkFail("5 12", DAY, SECOND, "Interval string does not match day-time format")
 
     checkFail("5 30:12:20", DAY, SECOND, "hour 30 outside range")
-    checkFail("5 30-12", DAY, SECOND, "must match day-time format")
-    checkFail("5 1:12:20", HOUR, MICROSECOND, "Cannot support (interval")
+    checkFail("5 30-12", DAY, SECOND, "Interval string does not match day-time format")
 
     // whitespaces
     check("\t +5 12:40\t ", DAY, MINUTE, "5 days 12 hours 40 minutes")
-    checkFail("+5\t 12:40", DAY, MINUTE, "must match day-time format")
+    checkFail("+5\t 12:40", DAY, MINUTE, "Interval string does not match day-time format")
 
   }
 
@@ -378,5 +528,295 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
 
     intercept[ArithmeticException](multiplyExact(maxMonth, 2))
     intercept[ArithmeticException](divideExact(maxDay, 0.5))
+  }
+
+  test("SPARK-34605: microseconds to duration") {
+    assert(microsToDuration(0).isZero)
+    assert(microsToDuration(-1).toNanos === -1000)
+    assert(microsToDuration(1).toNanos === 1000)
+    assert(microsToDuration(Long.MaxValue).toDays === 106751991)
+    assert(microsToDuration(Long.MinValue).toDays === -106751991)
+  }
+
+  test("SPARK-34605: duration to microseconds") {
+    assert(durationToMicros(Duration.ZERO) === 0)
+    assert(durationToMicros(Duration.ofSeconds(-1)) === -1000000)
+    assert(durationToMicros(Duration.ofNanos(123456)) === 123)
+    assert(durationToMicros(Duration.ofDays(106751991)) ===
+      (Long.MaxValue / MICROS_PER_DAY) * MICROS_PER_DAY)
+
+    val errMsg = intercept[ArithmeticException] {
+      durationToMicros(Duration.ofDays(106751991 + 1))
+    }.getMessage
+    assert(errMsg.contains("long overflow"))
+  }
+
+  test("SPARK-34615: period to months") {
+    assert(periodToMonths(Period.ZERO) === 0)
+    assert(periodToMonths(Period.of(0, -1, 0)) === -1)
+    assert(periodToMonths(Period.of(-1, 0, 10)) === -12) // ignore days
+    assert(periodToMonths(Period.of(178956970, 7, 0)) === Int.MaxValue)
+    assert(periodToMonths(Period.of(-178956970, -8, 123)) === Int.MinValue)
+    assert(periodToMonths(Period.of(0, Int.MaxValue, Int.MaxValue)) === Int.MaxValue)
+
+    val errMsg = intercept[ArithmeticException] {
+      periodToMonths(Period.of(Int.MaxValue, 0, 0))
+    }.getMessage
+    assert(errMsg.contains("integer overflow"))
+  }
+
+  test("SPARK-34615: months to period") {
+    assert(monthsToPeriod(0) === Period.ZERO)
+    assert(monthsToPeriod(-11) === Period.of(0, -11, 0))
+    assert(monthsToPeriod(11) === Period.of(0, 11, 0))
+    assert(monthsToPeriod(27) === Period.of(2, 3, 0))
+    assert(monthsToPeriod(-13) === Period.of(-1, -1, 0))
+    assert(monthsToPeriod(Int.MaxValue) === Period.ofYears(178956970).withMonths(7))
+    assert(monthsToPeriod(Int.MinValue) === Period.ofYears(-178956970).withMonths(-8))
+  }
+
+  test("SPARK-34695: round trip conversion of micros -> duration -> micros") {
+    Seq(
+      0,
+      MICROS_PER_SECOND - 1,
+      -MICROS_PER_SECOND + 1,
+      MICROS_PER_SECOND,
+      -MICROS_PER_SECOND,
+      Long.MaxValue - MICROS_PER_SECOND,
+      Long.MinValue + MICROS_PER_SECOND,
+      Long.MaxValue,
+      Long.MinValue).foreach { micros =>
+      val duration = microsToDuration(micros)
+      assert(durationToMicros(duration) === micros)
+    }
+  }
+
+  test("SPARK-34715: Add round trip tests for period <-> month and duration <-> micros") {
+    // Months -> Period -> Months
+    Seq(
+      0,
+      MONTHS_PER_YEAR - 1,
+      MONTHS_PER_YEAR + 1,
+      MONTHS_PER_YEAR,
+      -MONTHS_PER_YEAR,
+      Int.MaxValue - MONTHS_PER_YEAR,
+      Int.MinValue + MONTHS_PER_YEAR,
+      Int.MaxValue,
+      Int.MinValue).foreach { months =>
+      val period = monthsToPeriod(months)
+      assert(periodToMonths(period) === months)
+    }
+    // Period -> Months -> Period
+    Seq(
+      monthsToPeriod(0),
+      monthsToPeriod(MONTHS_PER_YEAR - 1),
+      monthsToPeriod(MONTHS_PER_YEAR + 1),
+      monthsToPeriod(MONTHS_PER_YEAR),
+      monthsToPeriod(-MONTHS_PER_YEAR),
+      monthsToPeriod(Int.MaxValue - MONTHS_PER_YEAR),
+      monthsToPeriod(Int.MinValue + MONTHS_PER_YEAR),
+      monthsToPeriod(Int.MaxValue),
+      monthsToPeriod(Int.MinValue)).foreach { period =>
+      val months = periodToMonths(period)
+      assert(monthsToPeriod(months) === period)
+    }
+    // Duration -> micros -> Duration
+    Seq(
+      microsToDuration(0),
+      microsToDuration(MICROS_PER_SECOND - 1),
+      microsToDuration(-MICROS_PER_SECOND + 1),
+      microsToDuration(MICROS_PER_SECOND),
+      microsToDuration(-MICROS_PER_SECOND),
+      microsToDuration(Long.MaxValue - MICROS_PER_SECOND),
+      microsToDuration(Long.MinValue + MICROS_PER_SECOND),
+      microsToDuration(Long.MaxValue),
+      microsToDuration(Long.MinValue)).foreach { duration =>
+      val micros = durationToMicros(duration)
+      assert(microsToDuration(micros) === duration)
+    }
+  }
+
+  test("SPARK-35016: format year-month intervals") {
+    import org.apache.spark.sql.types.YearMonthIntervalType._
+    Seq(
+      0 -> ("0-0", "INTERVAL '0-0' YEAR TO MONTH"),
+      -11 -> ("-0-11", "INTERVAL '-0-11' YEAR TO MONTH"),
+      11 -> ("0-11", "INTERVAL '0-11' YEAR TO MONTH"),
+      -13 -> ("-1-1", "INTERVAL '-1-1' YEAR TO MONTH"),
+      13 -> ("1-1", "INTERVAL '1-1' YEAR TO MONTH"),
+      -24 -> ("-2-0", "INTERVAL '-2-0' YEAR TO MONTH"),
+      24 -> ("2-0", "INTERVAL '2-0' YEAR TO MONTH"),
+      Int.MinValue -> ("-178956970-8", "INTERVAL '-178956970-8' YEAR TO MONTH"),
+      Int.MaxValue -> ("178956970-7", "INTERVAL '178956970-7' YEAR TO MONTH")
+    ).foreach { case (months, (hiveIntervalStr, ansiIntervalStr)) =>
+      assert(toYearMonthIntervalString(months, ANSI_STYLE, YEAR, MONTH) === ansiIntervalStr)
+      assert(toYearMonthIntervalString(months, HIVE_STYLE, YEAR, MONTH) === hiveIntervalStr)
+    }
+  }
+
+  test("SPARK-35016: format day-time intervals") {
+    import DayTimeIntervalType._
+    Seq(
+      0L -> ("0 00:00:00.000000000", "INTERVAL '0 00:00:00' DAY TO SECOND"),
+      -1L -> ("-0 00:00:00.000001000", "INTERVAL '-0 00:00:00.000001' DAY TO SECOND"),
+      10 * MICROS_PER_MILLIS -> ("0 00:00:00.010000000", "INTERVAL '0 00:00:00.01' DAY TO SECOND"),
+      (-123 * MICROS_PER_DAY - 3 * MICROS_PER_SECOND) ->
+        ("-123 00:00:03.000000000", "INTERVAL '-123 00:00:03' DAY TO SECOND"),
+      Long.MinValue -> ("-106751991 04:00:54.775808000",
+        "INTERVAL '-106751991 04:00:54.775808' DAY TO SECOND")
+    ).foreach { case (micros, (hiveIntervalStr, ansiIntervalStr)) =>
+      assert(toDayTimeIntervalString(micros, ANSI_STYLE, DAY, SECOND) === ansiIntervalStr)
+      assert(toDayTimeIntervalString(micros, HIVE_STYLE, DAY, SECOND) === hiveIntervalStr)
+    }
+  }
+
+  test("SPARK-35734: Format day-time intervals using type fields") {
+    import DayTimeIntervalType._
+    Seq(
+      0L ->
+        ("INTERVAL '0 00:00:00' DAY TO SECOND",
+          "INTERVAL '0 00:00' DAY TO MINUTE",
+          "INTERVAL '0 00' DAY TO HOUR",
+          "INTERVAL '00:00:00' HOUR TO SECOND",
+          "INTERVAL '00:00' HOUR TO MINUTE",
+          "INTERVAL '00:00' MINUTE TO SECOND",
+          "INTERVAL '0' DAY",
+          "INTERVAL '00' HOUR",
+          "INTERVAL '00' MINUTE",
+          "INTERVAL '00' SECOND"),
+      -1L ->
+        ("INTERVAL '-0 00:00:00.000001' DAY TO SECOND",
+          "INTERVAL '-0 00:00' DAY TO MINUTE",
+          "INTERVAL '-0 00' DAY TO HOUR",
+          "INTERVAL '-00:00:00.000001' HOUR TO SECOND",
+          "INTERVAL '-00:00' HOUR TO MINUTE",
+          "INTERVAL '-00:00.000001' MINUTE TO SECOND",
+          "INTERVAL '-0' DAY",
+          "INTERVAL '-00' HOUR",
+          "INTERVAL '-00' MINUTE",
+          "INTERVAL '-00.000001' SECOND"),
+      10 * MICROS_PER_MILLIS ->
+        ("INTERVAL '0 00:00:00.01' DAY TO SECOND",
+          "INTERVAL '0 00:00' DAY TO MINUTE",
+          "INTERVAL '0 00' DAY TO HOUR",
+          "INTERVAL '00:00:00.01' HOUR TO SECOND",
+          "INTERVAL '00:00' HOUR TO MINUTE",
+          "INTERVAL '00:00.01' MINUTE TO SECOND",
+          "INTERVAL '0' DAY",
+          "INTERVAL '00' HOUR",
+          "INTERVAL '00' MINUTE",
+          "INTERVAL '00.01' SECOND"),
+      (-123 * MICROS_PER_DAY - 3 * MICROS_PER_SECOND) ->
+        ("INTERVAL '-123 00:00:03' DAY TO SECOND",
+          "INTERVAL '-123 00:00' DAY TO MINUTE",
+          "INTERVAL '-123 00' DAY TO HOUR",
+          "INTERVAL '-2952:00:03' HOUR TO SECOND",
+          "INTERVAL '-2952:00' HOUR TO MINUTE",
+          "INTERVAL '-177120:03' MINUTE TO SECOND",
+          "INTERVAL '-123' DAY",
+          "INTERVAL '-2952' HOUR",
+          "INTERVAL '-177120' MINUTE",
+          "INTERVAL '-10627203' SECOND"),
+      Long.MinValue ->
+        ("INTERVAL '-106751991 04:00:54.775808' DAY TO SECOND",
+          "INTERVAL '-106751991 04:00' DAY TO MINUTE",
+          "INTERVAL '-106751991 04' DAY TO HOUR",
+          "INTERVAL '-2562047788:00:54.775808' HOUR TO SECOND",
+          "INTERVAL '-2562047788:00' HOUR TO MINUTE",
+          "INTERVAL '-153722867280:54.775808' MINUTE TO SECOND",
+          "INTERVAL '-106751991' DAY",
+          "INTERVAL '-2562047788' HOUR",
+          "INTERVAL '-153722867280' MINUTE",
+          "INTERVAL '-9223372036854.775808' SECOND"),
+      69159782123456L ->
+        ("INTERVAL '800 11:03:02.123456' DAY TO SECOND",
+          "INTERVAL '800 11:03' DAY TO MINUTE",
+          "INTERVAL '800 11' DAY TO HOUR",
+          "INTERVAL '19211:03:02.123456' HOUR TO SECOND",
+          "INTERVAL '19211:03' HOUR TO MINUTE",
+          "INTERVAL '1152663:02.123456' MINUTE TO SECOND",
+          "INTERVAL '800' DAY",
+          "INTERVAL '19211' HOUR",
+          "INTERVAL '1152663' MINUTE",
+          "INTERVAL '69159782.123456' SECOND"),
+      -69159782123456L ->
+        ("INTERVAL '-800 11:03:02.123456' DAY TO SECOND",
+          "INTERVAL '-800 11:03' DAY TO MINUTE",
+          "INTERVAL '-800 11' DAY TO HOUR",
+          "INTERVAL '-19211:03:02.123456' HOUR TO SECOND",
+          "INTERVAL '-19211:03' HOUR TO MINUTE",
+          "INTERVAL '-1152663:02.123456' MINUTE TO SECOND",
+          "INTERVAL '-800' DAY",
+          "INTERVAL '-19211' HOUR",
+          "INTERVAL '-1152663' MINUTE",
+          "INTERVAL '-69159782.123456' SECOND")
+    ).foreach {
+      case (
+        micros, (
+          dayToSec,
+          dayToMinute,
+          dayToHour,
+          hourToSec,
+          hourToMinute,
+          minuteToSec,
+          day,
+          hour,
+          minute,
+          sec)) =>
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, DAY, SECOND) === dayToSec)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, DAY, MINUTE) === dayToMinute)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, DAY, HOUR) === dayToHour)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, HOUR, SECOND) === hourToSec)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, HOUR, MINUTE) === hourToMinute)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, MINUTE, SECOND) === minuteToSec)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, DAY, DAY) === day)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, HOUR, HOUR) === hour)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, MINUTE, MINUTE) === minute)
+        assert(toDayTimeIntervalString(micros, ANSI_STYLE, SECOND, SECOND) === sec)
+    }
+  }
+
+  test("SPARK-35771: Format year-month intervals using type fields") {
+    import org.apache.spark.sql.types.YearMonthIntervalType._
+    Seq(
+      0 ->
+        ("INTERVAL '0-0' YEAR TO MONTH", "INTERVAL '0' YEAR", "INTERVAL '0' MONTH"),
+      -11 -> ("INTERVAL '-0-11' YEAR TO MONTH", "INTERVAL '-0' YEAR", "INTERVAL '-11' MONTH"),
+      11 -> ("INTERVAL '0-11' YEAR TO MONTH", "INTERVAL '0' YEAR", "INTERVAL '11' MONTH"),
+      -13 -> ("INTERVAL '-1-1' YEAR TO MONTH", "INTERVAL '-1' YEAR", "INTERVAL '-13' MONTH"),
+      13 -> ("INTERVAL '1-1' YEAR TO MONTH", "INTERVAL '1' YEAR", "INTERVAL '13' MONTH"),
+      -24 -> ("INTERVAL '-2-0' YEAR TO MONTH", "INTERVAL '-2' YEAR", "INTERVAL '-24' MONTH"),
+      24 -> ("INTERVAL '2-0' YEAR TO MONTH", "INTERVAL '2' YEAR", "INTERVAL '24' MONTH"),
+      Int.MinValue ->
+        ("INTERVAL '-178956970-8' YEAR TO MONTH",
+          "INTERVAL '-178956970' YEAR",
+          "INTERVAL '-2147483648' MONTH"),
+      Int.MaxValue ->
+        ("INTERVAL '178956970-7' YEAR TO MONTH",
+          "INTERVAL '178956970' YEAR",
+          "INTERVAL '2147483647' MONTH")
+    ).foreach { case (months, (yearToMonth, year, month)) =>
+      assert(toYearMonthIntervalString(months, ANSI_STYLE, YEAR, MONTH) === yearToMonth)
+      assert(toYearMonthIntervalString(months, ANSI_STYLE, YEAR, YEAR) === year)
+      assert(toYearMonthIntervalString(months, ANSI_STYLE, MONTH, MONTH) === month)
+    }
+  }
+
+  test("SPARK-38324: The second range is not [0, 59] in the day time ANSI interval") {
+    import org.apache.spark.sql.types.DayTimeIntervalType._
+    Seq(
+      ("10 12:40:60", 60, DAY, SECOND),
+      ("10 12:40:60.999999999", 60, DAY, SECOND),
+      ("10 12:40:99.999999999", 99, DAY, SECOND),
+      ("12:40:60", 60, HOUR, SECOND),
+      ("12:40:60.999999999", 60, HOUR, SECOND),
+      ("12:40:99.999999999", 99, HOUR, SECOND),
+      ("40:60", 60, MINUTE, SECOND),
+      ("40:60.999999999", 60, MINUTE, SECOND),
+      ("40:99.999999999", 99, MINUTE, SECOND)
+    ).foreach { case(input, second, from, to) =>
+      failFuncWithInvalidInput(
+        input, s"second $second outside range [0, 59]", s => fromDayTimeString(s, from, to))
+    }
   }
 }

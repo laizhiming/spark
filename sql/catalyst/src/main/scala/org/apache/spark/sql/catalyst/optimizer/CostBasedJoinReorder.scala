@@ -24,6 +24,7 @@ import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet, 
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, JoinType}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern.INNER_LIKE_JOIN
 import org.apache.spark.sql.internal.SQLConf
 
 
@@ -34,13 +35,11 @@ import org.apache.spark.sql.internal.SQLConf
  */
 object CostBasedJoinReorder extends Rule[LogicalPlan] with PredicateHelper {
 
-  private def conf = SQLConf.get
-
   def apply(plan: LogicalPlan): LogicalPlan = {
     if (!conf.cboEnabled || !conf.joinReorderEnabled) {
       plan
     } else {
-      val result = plan transformDown {
+      val result = plan.transformDownWithPruning(_.containsPattern(INNER_LIKE_JOIN), ruleId) {
         // Start reordering with a joinable item, which is an InnerLike join with conditions.
         // Avoid reordering if a join hint is present.
         case j @ Join(_, _, _: InnerLike, Some(cond), JoinHint.NONE) =>
@@ -109,6 +108,9 @@ case class OrderedJoin(
     joinType: JoinType,
     condition: Option[Expression]) extends BinaryNode {
   override def output: Seq[Attribute] = left.output ++ right.output
+  override protected def withNewChildrenInternal(
+      newLeft: LogicalPlan, newRight: LogicalPlan): OrderedJoin =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -350,14 +352,29 @@ object JoinReorderDP extends PredicateHelper with Logging {
       }
     }
 
+    /**
+     * To identify the plan with smaller computational cost,
+     * we use the weighted geometric mean of ratio of rows and the ratio of sizes in bytes.
+     *
+     * There are other ways to combine these values as a cost comparison function.
+     * Some of these, that we have experimented with, but have gotten worse result,
+     * than with the current one:
+     * 1) Weighted arithmetic mean of these two ratios - adding up fractions puts
+     * less emphasis on ratios between 0 and 1. Ratios 10 and 0.1 should be considered
+     * to be just as strong evidences in opposite directions. The arithmetic mean of these
+     * would be heavily biased towards the 10.
+     * 2) Absolute cost (cost = weight * rowCount + (1 - weight) * size) - when adding up
+     * two numeric measurements that have different units we can easily end up with one
+     * overwhelming the other.
+     */
     def betterThan(other: JoinPlan, conf: SQLConf): Boolean = {
       if (other.planCost.card == 0 || other.planCost.size == 0) {
         false
       } else {
         val relativeRows = BigDecimal(this.planCost.card) / BigDecimal(other.planCost.card)
         val relativeSize = BigDecimal(this.planCost.size) / BigDecimal(other.planCost.size)
-        relativeRows * conf.joinReorderCardWeight +
-          relativeSize * (1 - conf.joinReorderCardWeight) < 1
+        Math.pow(relativeRows.doubleValue, conf.joinReorderCardWeight) *
+          Math.pow(relativeSize.doubleValue, 1 - conf.joinReorderCardWeight) < 1
       }
     }
   }
@@ -384,7 +401,7 @@ case class Cost(card: BigInt, size: BigInt) {
  *
  * Filters (2) and (3) are not implemented.
  */
-object JoinReorderDPFilters extends PredicateHelper {
+object JoinReorderDPFilters {
   /**
    * Builds join graph information to be used by the filtering strategies.
    * Currently, it builds the sets of star/non-star joins.

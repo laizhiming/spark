@@ -17,6 +17,7 @@
 
 package org.apache.spark.ml.linalg
 
+import scala.collection.immutable
 import scala.collection.mutable.ArrayBuilder
 import scala.util.Random
 
@@ -52,7 +53,8 @@ class VectorsSuite extends SparkMLFunSuite {
   }
 
   test("sparse vector construction with unordered elements") {
-    val vec = Vectors.sparse(n, indices.zip(values).reverse).asInstanceOf[SparseVector]
+    val vec = Vectors.sparse(n, immutable.ArraySeq.unsafeWrapArray(indices.zip(values).reverse))
+      .asInstanceOf[SparseVector]
     assert(vec.size === n)
     assert(vec.indices === indices)
     assert(vec.values === values)
@@ -234,11 +236,11 @@ class VectorsSuite extends SparkMLFunSuite {
       val nnz = random.nextInt(m)
 
       val indices1 = random.shuffle(0 to m - 1).slice(0, nnz).sorted.toArray
-      val values1 = Array.fill(nnz)(random.nextDouble)
+      val values1 = Array.fill(nnz)(random.nextDouble())
       val sparseVector1 = Vectors.sparse(m, indices1, values1)
 
       val indices2 = random.shuffle(0 to m - 1).slice(0, nnz).sorted.toArray
-      val values2 = Array.fill(nnz)(random.nextDouble)
+      val values2 = Array.fill(nnz)(random.nextDouble())
       val sparseVector2 = Vectors.sparse(m, indices2, values2)
 
       val denseVector1 = Vectors.dense(sparseVector1.toArray)
@@ -383,9 +385,16 @@ class VectorsSuite extends SparkMLFunSuite {
     assert(v.slice(Array(2, 0, 3, 4)) === new SparseVector(4, Array(0, 3), Array(2.2, 4.4)))
   }
 
+  test("SparseVector.slice with sorted indices") {
+    val v = new SparseVector(5, Array(1, 2, 4), Array(1.1, 2.2, 4.4))
+    assert(v.slice(Array(0, 2), true) === v.slice(Array(0, 2), false))
+    assert(v.slice(Array(0, 2, 4), true) === v.slice(Array(0, 2, 4), false))
+    assert(v.slice(Array(1, 3), true) === v.slice(Array(1, 3), false))
+  }
+
   test("sparse vector only support non-negative length") {
     val v1 = Vectors.sparse(0, Array.emptyIntArray, Array.emptyDoubleArray)
-    val v2 = Vectors.sparse(0, Array.empty[(Int, Double)])
+    val v2 = Vectors.sparse(0, immutable.ArraySeq.unsafeWrapArray(Array.empty[(Int, Double)]))
     assert(v1.size === 0)
     assert(v2.size === 0)
 
@@ -393,7 +402,7 @@ class VectorsSuite extends SparkMLFunSuite {
       Vectors.sparse(-1, Array(1), Array(2.0))
     }
     intercept[IllegalArgumentException] {
-      Vectors.sparse(-1, Array((1, 2.0)))
+      Vectors.sparse(-1, immutable.ArraySeq.unsafeWrapArray(Array((1, 2.0))))
     }
   }
 
@@ -447,8 +456,8 @@ class VectorsSuite extends SparkMLFunSuite {
         valuesBuilder += v
       }
       val (indices, values) = vec.activeIterator.toArray.unzip
-      assert(indicesBuilder.result === indices)
-      assert(valuesBuilder.result === values)
+      assert(indicesBuilder.result() === indices)
+      assert(valuesBuilder.result() === values)
     }
   }
 
@@ -468,8 +477,8 @@ class VectorsSuite extends SparkMLFunSuite {
         }
       }
       val (indices, values) = vec.nonZeroIterator.toArray.unzip
-      assert(indicesBuilder.result === indices)
-      assert(valuesBuilder.result === values)
+      assert(indicesBuilder.result() === indices)
+      assert(valuesBuilder.result() === values)
     }
   }
 }

@@ -22,13 +22,14 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.util.Properties
 import java.util.concurrent.TimeUnit._
 
+import scala.jdk.CollectionConverters._
+
 import com.codahale.metrics._
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
+import org.apache.spark.SparkFunSuite
 import org.apache.spark.metrics.sink.StatsdSink._
 
 class StatsdSinkSuite extends SparkFunSuite {
-  private val securityMgr = new SecurityManager(new SparkConf(false))
   private val defaultProps = Map(
     STATSD_KEY_PREFIX -> "spark",
     STATSD_KEY_PERIOD -> "1",
@@ -60,8 +61,9 @@ class StatsdSinkSuite extends SparkFunSuite {
     val props = new Properties
     defaultProps.foreach(e => props.put(e._1, e._2))
     props.put(STATSD_KEY_PORT, socket.getLocalPort.toString)
+    props.put(STATSD_KEY_REGEX, "counter|gauge|histogram|timer")
     val registry = new MetricRegistry
-    val sink = new StatsdSink(props, registry, securityMgr)
+    val sink = new StatsdSink(props, registry)
     try {
       testCode(socket, sink)
     } finally {
@@ -170,6 +172,33 @@ class StatsdSinkSuite extends SparkFunSuite {
         assert(expectedResults.contains(result) || result.matches(oneMoreResult),
           "Timer metric received should match data sent")
       }
+    }
+  }
+
+
+  test("metrics StatsD sink with filtered Gauge") {
+    withSocketAndSink { (socket, sink) =>
+      val gauge = new Gauge[Double] {
+        override def getValue: Double = 1.23
+      }
+
+      val filteredMetricKeys = Set(
+        "gauge",
+        "gauge-1"
+      )
+
+      filteredMetricKeys.foreach(sink.registry.register(_, gauge))
+
+      sink.registry.register("excluded-metric", gauge)
+      sink.report()
+
+      val p = new DatagramPacket(new Array[Byte](maxPayloadSize), maxPayloadSize)
+      socket.receive(p)
+
+      val metricKeys = sink.registry.getGauges(sink.filter).keySet.asScala
+
+      assert(metricKeys.equals(filteredMetricKeys),
+        "Should contain only metrics matches regex filter")
     }
   }
 }

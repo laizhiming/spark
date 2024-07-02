@@ -19,8 +19,8 @@ package org.apache.spark.scheduler
 
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
@@ -94,7 +94,7 @@ private[spark] class Pool(
     schedulableQueue.asScala.foreach(_.executorDecommission(executorId))
   }
 
-  override def checkSpeculatableTasks(minTimeToSpeculation: Int): Boolean = {
+  override def checkSpeculatableTasks(minTimeToSpeculation: Long): Boolean = {
     var shouldRevive = false
     for (schedulable <- schedulableQueue.asScala) {
       shouldRevive |= schedulable.checkSpeculatableTasks(minTimeToSpeculation)

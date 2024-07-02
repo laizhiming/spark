@@ -35,7 +35,7 @@ import org.apache.spark.util.collection.OpenHashMap
  * information on ANOVA test.
  */
 @Since("3.1.0")
-object ANOVATest {
+private[ml] object ANOVATest {
 
   /**
    * @param dataset  DataFrame of categorical labels and continuous features.
@@ -75,8 +75,7 @@ object ANOVATest {
     if (flatten) {
       resultDF
     } else {
-      resultDF.groupBy()
-        .agg(collect_list(struct("*")))
+      resultDF.agg(collect_list(struct("*")))
         .as[Seq[(Int, Double, Long, Double)]]
         .map { seq =>
           val results = seq.toArray.sortBy(_._1)
@@ -225,7 +224,7 @@ object ANOVATest {
     // mean square within
     val msw = sswn / dfwn
     val fValue = msb / msw
-    val pValue = 1 - new FDistribution(dfbn, dfwn).cumulativeProbability(fValue)
+    val pValue = 1 - new FDistribution(dfbn.toDouble, dfwn.toDouble).cumulativeProbability(fValue)
     val degreesOfFreedom = dfbn + dfwn
     (pValue, degreesOfFreedom, fValue)
   }

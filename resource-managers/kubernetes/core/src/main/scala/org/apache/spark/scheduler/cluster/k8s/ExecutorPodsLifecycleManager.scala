@@ -16,37 +16,51 @@
  */
 package org.apache.spark.scheduler.cluster.k8s
 
-import com.google.common.cache.Cache
+import java.util.concurrent.TimeUnit
+import java.util.function.UnaryOperator
+
+import scala.collection.mutable
+import scala.jdk.CollectionConverters._
+
+import com.google.common.cache.CacheBuilder
 import io.fabric8.kubernetes.api.model.{Pod, PodBuilder}
 import io.fabric8.kubernetes.client.KubernetesClient
-import scala.collection.JavaConverters._
-import scala.collection.mutable
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.KubernetesUtils._
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.EXECUTOR_ID
 import org.apache.spark.scheduler.ExecutorExited
 import org.apache.spark.util.Utils
 
 private[spark] class ExecutorPodsLifecycleManager(
     val conf: SparkConf,
     kubernetesClient: KubernetesClient,
-    snapshotsStore: ExecutorPodsSnapshotsStore,
-    // Use a best-effort to track which executors have been removed already. It's not generally
-    // job-breaking if we remove executors more than once but it's ideal if we make an attempt
-    // to avoid doing so. Expire cache entries so that this data structure doesn't grow beyond
-    // bounds.
-    removedExecutorsCache: Cache[java.lang.Long, java.lang.Long]) extends Logging {
+    snapshotsStore: ExecutorPodsSnapshotsStore) extends Logging {
 
   import ExecutorPodsLifecycleManager._
 
   private lazy val shouldDeleteExecutors = conf.get(KUBERNETES_DELETE_EXECUTORS)
+  private lazy val missingPodDetectDelta = conf.get(KUBERNETES_EXECUTOR_MISSING_POD_DETECT_DELTA)
+
+  // Use a best-effort to track which executors have been removed already. It's not generally
+  // job-breaking if we remove executors more than once but it's ideal if we make an attempt
+  // to avoid doing so. Expire cache entries so that this data structure doesn't grow beyond
+  // bounds.
+  private lazy val removedExecutorsCache =
+    CacheBuilder.newBuilder()
+      .expireAfterWrite(3, TimeUnit.MINUTES)
+      .build[java.lang.Long, java.lang.Long]()
+
+  private var lastFullSnapshotTs: Long = 0
 
   // Keep track of which pods are inactive to avoid contacting the API server multiple times.
   // This set is cleaned up when a snapshot containing the updated pod is processed.
   private val inactivatedPods = mutable.HashSet.empty[Long]
+
+  private val namespace = conf.get(KUBERNETES_NAMESPACE)
 
   def start(schedulerBackend: KubernetesClusterSchedulerBackend): Unit = {
     val eventProcessingInterval = conf.get(KUBERNETES_EXECUTOR_EVENT_PROCESSING_INTERVAL)
@@ -86,8 +100,9 @@ private[spark] class ExecutorPodsLifecycleManager(
             if (onFinalNonDeletedState(succeeded, execId, schedulerBackend, deleteFromK8s)) {
               execIdsRemovedInThisRound += execId
               if (schedulerBackend.isExecutorActive(execId.toString)) {
-                logInfo(s"Snapshot reported succeeded executor with id $execId, " +
-                  "even though the application has not requested for it to be removed.")
+                logInfo(log"Snapshot reported succeeded executor with id " +
+                  log"${MDC(EXECUTOR_ID, execId)}, even though the application has not " +
+                  log"requested for it to be removed.")
               } else {
                 logDebug(s"Snapshot reported succeeded executor with id $execId," +
                   s" pod name ${state.pod.getMetadata.getName}.")
@@ -103,38 +118,38 @@ private[spark] class ExecutorPodsLifecycleManager(
     // This makes sure that we don't keep growing that set indefinitely, in case we end up missing
     // an update for some pod.
     if (inactivatedPods.nonEmpty && snapshots.nonEmpty) {
-      inactivatedPods.retain(snapshots.last.executorPods.contains(_))
+      inactivatedPods.filterInPlace(snapshots.last.executorPods.contains(_))
     }
 
     // Reconcile the case where Spark claims to know about an executor but the corresponding pod
     // is missing from the cluster. This would occur if we miss a deletion event and the pod
     // transitions immediately from running to absent. We only need to check against the latest
-    // snapshot for this, and we don't do this for executors in the deleted executors cache or
-    // that we just removed in this round.
-    val lostExecutors = if (snapshots.nonEmpty) {
-      schedulerBackend.getExecutorIds().map(_.toLong).toSet --
+    // fresh full snapshot (coming from ExecutorPodsPollingSnapshotSource) for this, and we don't
+    // do this for executors in the deleted executors cache or that we just removed in this round.
+    if (snapshots.nonEmpty && lastFullSnapshotTs != snapshots.last.fullSnapshotTs) {
+      lastFullSnapshotTs = snapshots.last.fullSnapshotTs
+      val lostExecutorsWithRegistrationTs =
+        schedulerBackend.getExecutorsWithRegistrationTs().map(t => (t._1.toLong, t._2)) --
         snapshots.last.executorPods.keySet -- execIdsRemovedInThisRound
-    } else {
-      Nil
-    }
 
-    lostExecutors.foreach { lostId =>
-      if (removedExecutorsCache.getIfPresent(lostId) == null) {
-        val exitReasonMessage = s"The executor with ID $lostId was not found in the" +
-          s" cluster but we didn't get a reason why. Marking the executor as failed. The" +
-          s" executor may have been deleted but the driver missed the deletion event."
-        logDebug(exitReasonMessage)
-        val exitReason = ExecutorExited(
-          UNKNOWN_EXIT_CODE,
-          exitCausedByApp = false,
-          exitReasonMessage)
-        schedulerBackend.doRemoveExecutor(lostId.toString, exitReason)
+      lostExecutorsWithRegistrationTs.foreach { case (lostExecId, lostExecRegistrationTs) =>
+        if (removedExecutorsCache.getIfPresent(lostExecId) == null &&
+            lastFullSnapshotTs - lostExecRegistrationTs > missingPodDetectDelta) {
+          val exitReasonMessage = s"The executor with ID $lostExecId (registered at " +
+            s"$lostExecRegistrationTs ms) was not found in the cluster at the polling time " +
+            s"($lastFullSnapshotTs ms) which is after the accepted detect delta time " +
+            s"($missingPodDetectDelta ms) configured by " +
+            s"`${KUBERNETES_EXECUTOR_MISSING_POD_DETECT_DELTA.key}`. " +
+            "The executor may have been deleted but the driver missed the deletion event. " +
+            "Marking this executor as failed."
+          logDebug(exitReasonMessage)
+          val exitReason = ExecutorExited(
+            UNKNOWN_EXIT_CODE,
+            exitCausedByApp = false,
+            exitReasonMessage)
+          schedulerBackend.doRemoveExecutor(lostExecId.toString, exitReason)
+        }
       }
-    }
-
-    if (lostExecutors.nonEmpty) {
-      logDebug(s"Removed executors with ids ${lostExecutors.mkString(",")}" +
-        s" from Spark that were either found to be deleted or non-existent in the cluster.")
     }
   }
 
@@ -153,29 +168,29 @@ private[spark] class ExecutorPodsLifecycleManager(
   private def removeExecutorFromK8s(execId: Long, updatedPod: Pod): Unit = {
     Utils.tryLogNonFatalError {
       if (shouldDeleteExecutors) {
+        // Get pod before deleting it, we can skip deleting if pod is already deleted so that
+        // we do not send too many requests to api server.
         // If deletion failed on a previous try, we can try again if resync informs us the pod
         // is still around.
         // Delete as best attempt - duplicate deletes will throw an exception but the end state
         // of getting rid of the pod is what matters.
-        kubernetesClient
+        val podToDelete = kubernetesClient
           .pods()
+          .inNamespace(namespace)
           .withName(updatedPod.getMetadata.getName)
-          .delete()
+        if (podToDelete.get() != null) {
+          podToDelete.delete()
+        }
       } else if (!inactivatedPods.contains(execId) && !isPodInactive(updatedPod)) {
         // If the config is set to keep the executor  around, mark the pod as "inactive" so it
         // can be ignored in future updates from the API server.
         logDebug(s"Marking executor ${updatedPod.getMetadata.getName} as inactive since " +
           "deletion is disabled.")
-        val inactivatedPod = new PodBuilder(updatedPod)
-          .editMetadata()
-            .addToLabels(Map(SPARK_EXECUTOR_INACTIVE_LABEL -> "true").asJava)
-            .endMetadata()
-          .build()
-
         kubernetesClient
           .pods()
+          .inNamespace(namespace)
           .withName(updatedPod.getMetadata.getName)
-          .patch(inactivatedPod)
+          .edit(executorInactivationFn)
 
         inactivatedPods += execId
       }
@@ -212,10 +227,17 @@ private[spark] class ExecutorPodsLifecycleManager(
     val pod = podState.pod
     val reason = Option(pod.getStatus.getReason)
     val message = Option(pod.getStatus.getMessage)
+    val explained = describeExitCode(exitCode)
+    val exitMsg = s"The executor with id $execId exited with exit code $explained."
+    val reasonStr = reason.map(r => s"The API gave the following brief reason: ${r}")
+    val msgStr = message.map(m => s"The API gave the following message: ${m}")
+
+
     s"""
-       |The executor with id $execId exited with exit code $exitCode.
-       |The API gave the following brief reason: ${reason.getOrElse("N/A")}
-       |The API gave the following message: ${message.getOrElse("N/A")}
+       |${exitMsg}
+       |${reasonStr.getOrElse("")}
+       |${msgStr.getOrElse("")}
+       |
        |The API gave the following container statuses:
        |
        |${containersDescription(pod)}
@@ -237,5 +259,30 @@ private[spark] class ExecutorPodsLifecycleManager(
 
 private object ExecutorPodsLifecycleManager {
   val UNKNOWN_EXIT_CODE = -1
-}
 
+  // A utility function to try and help people figure out whats gone wrong faster.
+  def describeExitCode(code: Int): String = {
+    val humanStr = code match {
+      case 0 => "(success)"
+      case 1 => "(generic, look at logs to clarify)"
+      case 42 => "(Douglas Adams fan)"
+      // Spark specific
+      case 10 | 50 => "(Uncaught exception)"
+      case 52 => "(JVM OOM)"
+      case 53 => "(DiskStore failed to create temp dir)"
+      // K8s & JVM specific exit codes
+      case 126 => "(not executable - possibly perm or arch)"
+      case 137 => "(SIGKILL, possible container OOM)"
+      case 139 => "(SIGSEGV: that's unexpected)"
+      case 255 => "(exit-1, your guess is as good as mine)"
+      case _ => "(unexpected)"
+    }
+    s"${code}${humanStr}"
+  }
+
+  def executorInactivationFn: UnaryOperator[Pod] = (p: Pod) => new PodBuilder(p)
+    .editOrNewMetadata()
+    .addToLabels(SPARK_EXECUTOR_INACTIVE_LABEL, "true")
+    .endMetadata()
+    .build()
+}

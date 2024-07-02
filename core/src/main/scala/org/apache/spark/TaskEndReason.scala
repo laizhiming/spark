@@ -98,10 +98,11 @@ case class FetchFailed(
   /**
    * Fetch failures lead to a different failure handling path: (1) we don't abort the stage after
    * 4 task failures, instead we immediately go back to the stage which generated the map output,
-   * and regenerate the missing data.  (2) we don't count fetch failures for blacklisting, since
-   * presumably its not the fault of the executor where the task ran, but the executor which
-   * stored the data. This is especially important because we might rack up a bunch of
-   * fetch-failures in rapid succession, on all nodes of the cluster, due to one bad node.
+   * and regenerate the missing data. (2) we don't count fetch failures from executors excluded
+   * due to too many task failures, since presumably its not the fault of the executor where
+   * the task ran, but the executor which stored the data. This is especially important because
+   * we might rack up a bunch of fetch-failures in rapid succession, on all nodes of the cluster,
+   * due to one bad node.
    */
   override def countTowardsTaskFailures: Boolean = false
 }
@@ -142,12 +143,12 @@ case class ExceptionFailure(
   private[spark] def this(
       e: Throwable,
       accumUpdates: Seq[AccumulableInfo],
-      preserveCause: Boolean) {
+      preserveCause: Boolean) = {
     this(e.getClass.getName, e.getMessage, e.getStackTrace, Utils.exceptionString(e),
       if (preserveCause) Some(new ThrowableSerializationWrapper(e)) else None, accumUpdates)
   }
 
-  private[spark] def this(e: Throwable, accumUpdates: Seq[AccumulableInfo]) {
+  private[spark] def this(e: Throwable, accumUpdates: Seq[AccumulableInfo]) = {
     this(e, accumUpdates, preserveCause = true)
   }
 
@@ -241,7 +242,7 @@ case class TaskCommitDenied(
     jobID: Int,
     partitionID: Int,
     attemptNumber: Int) extends TaskFailedReason {
-  override def toErrorString: String = s"TaskCommitDenied (Driver denied task commit)" +
+  override def toErrorString: String = "TaskCommitDenied (Driver denied task commit)" +
     s" for job: $jobID, partition: $partitionID, attemptNumber: $attemptNumber"
   /**
    * If a task failed because its attempt to commit was denied, do not count this failure
