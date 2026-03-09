@@ -24,8 +24,8 @@ from typing import (
     Any,
     Generic,
     List,
+    Literal,
     Optional,
-    Union,
 )
 
 import numpy as np
@@ -33,6 +33,7 @@ import pandas as pd
 from pandas.tseries.frequencies import to_offset
 
 from pyspark.sql import Column, functions as F
+from pyspark.sql.internal import InternalFunction as SF
 from pyspark.sql.types import (
     NumericType,
     StructField,
@@ -82,8 +83,8 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         psdf: DataFrame,
         resamplekey: Optional[Series],
         rule: str,
-        closed: Optional[str] = None,
-        label: Optional[str] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         agg_columns: List[Series] = [],
     ):
         self._psdf = psdf
@@ -96,6 +97,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         if not getattr(self._offset, "n") > 0:
             raise ValueError("rule offset must be positive")
 
+        self._closed: Literal["left", "right"]
         if closed is None:
             self._closed = "right" if self._offset.rule_code in ["A-DEC", "M", "ME"] else "left"
         elif closed in ["left", "right"]:
@@ -103,6 +105,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         else:
             raise ValueError("invalid closed: '{}'".format(closed))
 
+        self._label: Literal["left", "right"]
         if label is None:
             self._label = "right" if self._offset.rule_code in ["A-DEC", "M", "ME"] else "left"
         elif label in ["left", "right"]:
@@ -129,19 +132,6 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
     @property
     def _agg_columns_scols(self) -> List[Column]:
         return [s.spark.column for s in self._agg_columns]
-
-    def get_make_interval(  # type: ignore[return]
-        self, unit: str, col: Union[Column, int, float]
-    ) -> Column:
-        col = col if not isinstance(col, (int, float)) else F.lit(col)
-        if unit == "MONTH":
-            return F.make_interval(months=col)
-        if unit == "HOUR":
-            return F.make_interval(hours=col)
-        if unit == "MINUTE":
-            return F.make_interval(mins=col)
-        if unit == "SECOND":
-            return F.make_interval(secs=col)
 
     def _bin_timestamp(self, origin: pd.Timestamp, ts_scol: Column) -> Column:
         key_type = self._resamplekey_type
@@ -203,18 +193,18 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
             truncated_ts_scol = F.date_trunc("MONTH", ts_scol)
             edge_label = truncated_ts_scol
             if left_closed and right_labeled:
-                edge_label += self.get_make_interval("MONTH", n)
+                edge_label += SF.make_interval("MONTH", n)
             elif right_closed and left_labeled:
-                edge_label -= self.get_make_interval("MONTH", n)
+                edge_label -= SF.make_interval("MONTH", n)
 
             if left_labeled:
                 non_edge_label = F.when(
                     mod == 0,
-                    truncated_ts_scol - self.get_make_interval("MONTH", n),
-                ).otherwise(truncated_ts_scol - self.get_make_interval("MONTH", mod))
+                    truncated_ts_scol - SF.make_interval("MONTH", n),
+                ).otherwise(truncated_ts_scol - SF.make_interval("MONTH", mod))
             else:
                 non_edge_label = F.when(mod == 0, truncated_ts_scol).otherwise(
-                    truncated_ts_scol - self.get_make_interval("MONTH", mod - n)
+                    truncated_ts_scol - SF.make_interval("MONTH", mod - n)
                 )
 
             ret = F.to_timestamp(
@@ -292,19 +282,19 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
 
             edge_label = truncated_ts_scol
             if left_closed and right_labeled:
-                edge_label += self.get_make_interval(unit_str, n)
+                edge_label += SF.make_interval(unit_str, n)
             elif right_closed and left_labeled:
-                edge_label -= self.get_make_interval(unit_str, n)
+                edge_label -= SF.make_interval(unit_str, n)
 
             if left_labeled:
                 non_edge_label = F.when(mod == 0, truncated_ts_scol).otherwise(
-                    truncated_ts_scol - self.get_make_interval(unit_str, mod)
+                    truncated_ts_scol - SF.make_interval(unit_str, mod)
                 )
             else:
                 non_edge_label = F.when(
                     mod == 0,
-                    truncated_ts_scol + self.get_make_interval(unit_str, n),
-                ).otherwise(truncated_ts_scol - self.get_make_interval(unit_str, mod - n))
+                    truncated_ts_scol + SF.make_interval(unit_str, n),
+                ).otherwise(truncated_ts_scol - SF.make_interval(unit_str, mod - n))
 
             ret = F.when(edge_cond, edge_label).otherwise(non_edge_label)
 
@@ -334,7 +324,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         #   ]
         #   index = pd.DatetimeIndex(dates)
         #   pdf = pd.DataFrame(np.array([1,2,3]), index=index, columns=['A'])
-        #   pdf.resample('3Y').max()
+        #   pdf.resample('3YE').max()
         #                 A
         #   2012-12-31  2.0
         #   2015-12-31  NaN
@@ -717,8 +707,8 @@ class DataFrameResampler(Resampler[DataFrame]):
         psdf: DataFrame,
         resamplekey: Optional[Series],
         rule: str,
-        closed: Optional[str] = None,
-        label: Optional[str] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         agg_columns: List[Series] = [],
     ):
         super().__init__(
@@ -748,8 +738,8 @@ class SeriesResampler(Resampler[Series]):
         psser: Series,
         resamplekey: Optional[Series],
         rule: str,
-        closed: Optional[str] = None,
-        label: Optional[str] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         agg_columns: List[Series] = [],
     ):
         super().__init__(

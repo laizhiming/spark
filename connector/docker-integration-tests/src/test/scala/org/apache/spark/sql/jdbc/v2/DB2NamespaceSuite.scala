@@ -21,17 +21,20 @@ import java.sql.Connection
 
 import scala.jdk.CollectionConverters._
 
+import org.scalatest.Ignore
+
 import org.apache.spark.sql.jdbc.{DB2DatabaseOnDocker, DockerJDBCIntegrationSuite}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.tags.DockerTest
 
 /**
- * To run this test suite for a specific version (e.g., ibmcom/db2:11.5.8.0):
+ * To run this test suite for a specific version (e.g., icr.io/db2_community/db2:11.5.9.0):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 DB2_DOCKER_IMAGE_NAME=ibmcom/db2:11.5.8.0
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1 DB2_DOCKER_IMAGE_NAME=icr.io/db2_community/db2:11.5.9.0
  *     ./build/sbt -Pdocker-integration-tests "testOnly *v2.DB2NamespaceSuite"
  * }}}
  */
+@Ignore // TODO(SPARK-55707): Re-enable DB2 JDBC Driver tests
 @DockerTest
 class DB2NamespaceSuite extends DockerJDBCIntegrationSuite with V2JDBCNamespaceTest {
   override val db = new DB2DatabaseOnDocker
@@ -39,7 +42,8 @@ class DB2NamespaceSuite extends DockerJDBCIntegrationSuite with V2JDBCNamespaceT
     Map("url" -> db.getJdbcUrl(dockerIp, externalPort),
       "driver" -> "com.ibm.db2.jcc.DB2Driver").asJava)
 
-  catalog.initialize("db2", map)
+  // TODO(SPARK-55707): Re-enable DB2 JDBC Driver tests
+  // catalog.initialize("db2", map)
 
   override def dataPreparation(conn: Connection): Unit = {}
 

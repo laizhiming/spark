@@ -24,19 +24,21 @@ import javax.security.auth.login.Configuration
 import com.github.dockerjava.api.model.{AccessMode, Bind, ContainerConfig, HostConfig, Volume}
 import org.apache.hadoop.security.{SecurityUtil, UserGroupInformation}
 import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod.KERBEROS
+import org.scalatest.Ignore
 
 import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 import org.apache.spark.sql.execution.datasources.jdbc.connection.{DB2ConnectionProvider, SecureConnectionProvider}
 import org.apache.spark.tags.DockerTest
 
 /**
- * To run this test suite for a specific version (e.g., ibmcom/db2:11.5.8.0):
+ * To run this test suite for a specific version (e.g., icr.io/db2_community/db2:11.5.9.0):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 DB2_DOCKER_IMAGE_NAME=ibmcom/db2:11.5.8.0
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1 DB2_DOCKER_IMAGE_NAME=icr.io/db2_community/db2:11.5.9.0
  *     ./build/sbt -Pdocker-integration-tests
  *     "docker-integration-tests/testOnly *DB2KrbIntegrationSuite"
  * }}}
  */
+@Ignore // TODO(SPARK-55707: Re-enable DB2 JDBC Driver tests)
 @DockerTest
 class DB2KrbIntegrationSuite extends DockerKrbJDBCIntegrationSuite {
   override protected val userName = s"db2/$dockerIp"
@@ -57,7 +59,7 @@ class DB2KrbIntegrationSuite extends DockerKrbJDBCIntegrationSuite {
     override def beforeContainerStart(
         hostConfigBuilder: HostConfig,
         containerConfigBuilder: ContainerConfig): Unit = {
-      copyExecutableResource("db2_krb_setup.sh", initDbDir, replaceIp)
+      copyExecutableResource("db2-krb-setup.sh", initDbDir, replaceIp)
 
       val newBind = new Bind(
         initDbDir.getAbsolutePath,

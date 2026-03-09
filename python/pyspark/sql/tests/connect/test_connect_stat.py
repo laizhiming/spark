@@ -15,19 +15,18 @@
 # limitations under the License.
 #
 
-import unittest
 
 from pyspark.errors import PySparkTypeError, PySparkValueError
 from pyspark.testing.connectutils import should_test_connect
-from pyspark.errors.exceptions.connect import (
-    AnalysisException,
-    SparkConnectException,
-)
 from pyspark.sql.tests.connect.test_connect_basic import SparkConnectSQLTestCase
 
 if should_test_connect:
     from pyspark.sql import functions as SF
     from pyspark.sql.connect import functions as CF
+    from pyspark.errors.exceptions.connect import (
+        AnalysisException,
+        SparkConnectException,
+    )
 
 
 class SparkConnectStatTests(SparkConnectSQLTestCase):
@@ -195,8 +194,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_STR",
-            message_parameters={
+            errorClass="NOT_STR",
+            messageParameters={
                 "arg_name": "col1",
                 "arg_type": "int",
             },
@@ -207,8 +206,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_STR",
-            message_parameters={
+            errorClass="NOT_STR",
+            messageParameters={
                 "arg_name": "col2",
                 "arg_type": "int",
             },
@@ -241,8 +240,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_LIST_OR_STR_OR_TUPLE",
-            message_parameters={
+            errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+            messageParameters={
                 "arg_name": "col",
                 "arg_type": "int",
             },
@@ -253,8 +252,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_LIST_OR_TUPLE",
-            message_parameters={
+            errorClass="NOT_LIST_OR_TUPLE",
+            messageParameters={
                 "arg_name": "probabilities",
                 "arg_type": "float",
             },
@@ -266,8 +265,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_LIST_OF_FLOAT_OR_INT",
-            message_parameters={"arg_name": "probabilities", "arg_type": "float"},
+            errorClass="NOT_LIST_OF_FLOAT_OR_INT",
+            messageParameters={"arg_name": "probabilities", "arg_type": "float"},
         )
         with self.assertRaises(PySparkTypeError) as pe:
             self.connect.read.table(self.tbl_name2).stat.approxQuantile(
@@ -276,8 +275,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_FLOAT_OR_INT",
-            message_parameters={
+            errorClass="NOT_FLOAT_OR_INT",
+            messageParameters={
                 "arg_name": "relativeError",
                 "arg_type": "str",
             },
@@ -289,8 +288,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NEGATIVE_VALUE",
-            message_parameters={
+            errorClass="NEGATIVE_VALUE",
+            messageParameters={
                 "arg_name": "relativeError",
                 "arg_value": "-0.1",
             },
@@ -316,8 +315,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_LIST_OR_TUPLE",
-            message_parameters={
+            errorClass="NOT_LIST_OR_TUPLE",
+            messageParameters={
                 "arg_name": "cols",
                 "arg_type": "str",
             },
@@ -347,8 +346,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="DISALLOWED_TYPE_FOR_CONTAINER",
-            message_parameters={
+            errorClass="DISALLOWED_TYPE_FOR_CONTAINER",
+            messageParameters={
                 "arg_name": "fractions",
                 "arg_type": "dict",
                 "allowed_types": "float, int, str",
@@ -538,8 +537,8 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_BOOL_OR_FLOAT_OR_INT_OR_STR",
-            message_parameters={
+            errorClass="NOT_BOOL_OR_FLOAT_OR_INT_OR_STR",
+            messageParameters={
                 "arg_name": "value",
                 "arg_type": "bytes",
             },
@@ -801,13 +800,6 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_stat import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -31,7 +31,6 @@ import org.apache.orc.OrcFile
 import org.apache.orc.OrcProto.ColumnEncoding.Kind.{DICTIONARY_V2, DIRECT, DIRECT_V2}
 import org.apache.orc.OrcProto.Stream.Kind
 import org.apache.orc.impl.RecordReaderImpl
-import org.scalatest.BeforeAndAfterAll
 
 import org.apache.spark.{SPARK_VERSION_SHORT, SparkConf, SparkException}
 import org.apache.spark.sql.{Row, SPARK_VERSION_METADATA_KEY}
@@ -45,7 +44,7 @@ import org.apache.spark.util.Utils
 case class OrcData(intField: Int, stringField: String)
 
 abstract class OrcSuite
-  extends OrcTest with BeforeAndAfterAll with CommonFileDataSourceSuite with SQLTestUtilsBase {
+  extends OrcTest with CommonFileDataSourceSuite with SQLTestUtilsBase {
   import testImplicits._
 
   override protected def dataSourceFormat = "orc"
@@ -235,7 +234,7 @@ abstract class OrcSuite
       exception = intercept[SparkException] {
         testMergeSchemasInParallel(false, schemaReader)
       }.getCause.getCause.asInstanceOf[SparkException],
-      errorClass = "FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER",
+      condition = "FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER",
       parameters = Map("path" -> "file:.*")
     )
   }
@@ -450,8 +449,8 @@ abstract class OrcSuite
         val ex = intercept[SparkException] {
           spark.read.orc(basePath).columns.length
         }
-        assert(ex.getErrorClass == "CANNOT_MERGE_SCHEMAS")
-        assert(ex.getCause.asInstanceOf[SparkException].getErrorClass ===
+        assert(ex.getCondition == "CANNOT_MERGE_SCHEMAS")
+        assert(ex.getCause.asInstanceOf[SparkException].getCondition ===
           "CANNOT_MERGE_INCOMPATIBLE_DATA_TYPE")
       }
 
@@ -481,7 +480,7 @@ abstract class OrcSuite
             exception = intercept[SparkException] {
               spark.read.orc(basePath).columns.length
             }.getCause.getCause.asInstanceOf[SparkException],
-            errorClass = "FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER",
+            condition = "FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER",
             parameters = Map("path" -> "file:.*")
           )
         }

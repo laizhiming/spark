@@ -25,13 +25,18 @@ import org.apache.spark.annotation.Stable
  * @since 1.3.0
  */
 @Stable
-class ShortType private() extends IntegralType {
+class ShortType private () extends IntegralType {
+
   /**
    * The default size of a value of the ShortType is 2 bytes.
    */
   override def defaultSize: Int = 2
 
   override def simpleString: String = "smallint"
+
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[ShortType]
+
+  override def hashCode(): Int = classOf[ShortType].getSimpleName.hashCode
 
   private[spark] override def asNullable: ShortType = this
 }

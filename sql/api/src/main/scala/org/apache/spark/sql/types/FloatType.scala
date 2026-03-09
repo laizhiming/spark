@@ -27,15 +27,19 @@ import org.apache.spark.annotation.Stable
  * @since 1.3.0
  */
 @Stable
-class FloatType private() extends FractionalType {
+class FloatType private () extends FractionalType {
+
   /**
    * The default size of a value of the FloatType is 4 bytes.
    */
   override def defaultSize: Int = 4
 
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[FloatType]
+
+  override def hashCode(): Int = classOf[FloatType].getSimpleName.hashCode
+
   private[spark] override def asNullable: FloatType = this
 }
-
 
 /**
  * @since 1.3.0

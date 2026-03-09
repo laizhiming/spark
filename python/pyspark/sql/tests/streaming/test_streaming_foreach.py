@@ -220,9 +220,9 @@ class StreamingTestsForeachMixin:
         try:
             tester.run_streaming_query_on_writer(ForeachWriter(), 1)
             self.fail("bad writer did not fail the query")  # this is not expected
-        except StreamingQueryException:
-            # TODO: Verify whether original error message is inside the exception
-            pass
+        except StreamingQueryException as e:
+            err_msg = str(e)
+            self.assertTrue("test error" in err_msg)
 
         self.assertEqual(len(tester.process_events()), 0)  # no row was processed
         close_events = tester.close_events()
@@ -282,13 +282,6 @@ class StreamingTestsForeach(StreamingTestsForeachMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.streaming.test_streaming_foreach import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

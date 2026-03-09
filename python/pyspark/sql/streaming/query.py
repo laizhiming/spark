@@ -22,11 +22,16 @@ from pyspark.errors import StreamingQueryException, PySparkValueError
 from pyspark.errors.exceptions.captured import (
     StreamingQueryException as CapturedStreamingQueryException,
 )
-from pyspark.sql.streaming.listener import StreamingQueryListener
+from pyspark.sql.streaming.listener import (
+    StreamingQueryListener,
+    StreamingQueryProgress,
+)
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
 
+# TODO: Add StreamingCheckpointManager to __all__ once we add streaming checkpoint manager to the
+# public API
 __all__ = ["StreamingQuery", "StreamingQueryManager"]
 
 
@@ -214,8 +219,8 @@ class StreamingQuery:
         if timeout is not None:
             if not isinstance(timeout, (int, float)) or timeout <= 0:
                 raise PySparkValueError(
-                    error_class="VALUE_NOT_POSITIVE",
-                    message_parameters={"arg_name": "timeout", "arg_value": type(timeout).__name__},
+                    errorClass="VALUE_NOT_POSITIVE",
+                    messageParameters={"arg_name": "timeout", "arg_value": type(timeout).__name__},
                 )
             return self._jsq.awaitTermination(int(timeout * 1000))
         else:
@@ -251,7 +256,7 @@ class StreamingQuery:
         return json.loads(self._jsq.status().json())
 
     @property
-    def recentProgress(self) -> List[Dict[str, Any]]:
+    def recentProgress(self) -> List[StreamingQueryProgress]:
         """
         Returns an array of the most recent [[StreamingQueryProgress]] updates for this query.
         The number of progress updates retained for each stream is configured by Spark session
@@ -280,10 +285,13 @@ class StreamingQuery:
 
         >>> sq.stop()
         """
-        return [json.loads(p.json()) for p in self._jsq.recentProgress()]
+        return [
+            StreamingQueryProgress.fromJson(json.loads(p.json()))
+            for p in self._jsq.recentProgress()
+        ]
 
     @property
-    def lastProgress(self) -> Optional[Dict[str, Any]]:
+    def lastProgress(self) -> Optional[StreamingQueryProgress]:
         """
         Returns the most recent :class:`StreamingQueryProgress` update of this streaming query or
         None if there were no progress updates
@@ -311,7 +319,7 @@ class StreamingQuery:
         """
         lastProgress = self._jsq.lastProgress()
         if lastProgress:
-            return json.loads(lastProgress.json())
+            return StreamingQueryProgress.fromJson(json.loads(lastProgress.json()))
         else:
             return None
 
@@ -488,7 +496,7 @@ class StreamingQueryManager:
         """
         return [StreamingQuery(jsq) for jsq in self._jsqm.active()]
 
-    def get(self, id: str) -> Optional[StreamingQuery]:
+    def get(self, id: str) -> Optional["StreamingQuery"]:
         """
         Returns an active query from this :class:`SparkSession`.
 
@@ -589,8 +597,8 @@ class StreamingQueryManager:
         if timeout is not None:
             if not isinstance(timeout, (int, float)) or timeout < 0:
                 raise PySparkValueError(
-                    error_class="VALUE_NOT_POSITIVE",
-                    message_parameters={"arg_name": "timeout", "arg_value": type(timeout).__name__},
+                    errorClass="VALUE_NOT_POSITIVE",
+                    messageParameters={"arg_name": "timeout", "arg_value": type(timeout).__name__},
                 )
             return self._jsqm.awaitAnyTermination(int(timeout * 1000))
         else:
@@ -715,6 +723,60 @@ class StreamingQueryManager:
         self._jsqm.removeListener(listener._jlistener)
 
 
+class StreamingCheckpointManager:
+    """
+    A class to manage operations on streaming query checkpoints.
+
+    .. versionadded:: 4.2.0
+
+    Notes
+    -----
+    This API is evolving and currently supported in Spark Classic.
+    """
+
+    def __init__(self, jmanager: "JavaObject") -> None:
+        self._jmanager = jmanager
+
+    def repartition(
+        self, checkpoint_location: str, num_partitions: int, enforce_exactly_once_sink: bool = True
+    ) -> None:
+        """
+        Repartition the stateful streaming operators state in the streaming checkpoint to have
+        `num_partitions` partitions. The streaming query MUST not be running. If `num_partitions` is
+        the same as the current number of partitions, this is a no-op, and an exception will be
+        thrown.
+
+        This produces a new microbatch in the checkpoint that contains the repartitioned state i.e.
+        if the last streaming batch was batch `N`, this will create batch `N+1` with the
+        repartitioned state. Note that this new batch doesn't read input data from sources, it only
+        represents the repartition operation. The next time the streaming query is started, it will
+        pick up from this new batch.
+
+        This will return only when the repartitioning is complete or fails.
+
+        .. versionadded:: 4.2.0
+
+        Parameters
+        ----------
+        checkpoint_location : str
+            The checkpoint location of the streaming query, should be the `checkpointLocation` option
+            on the DataStreamWriter.
+        num_partitions : int
+            The target number of state partitions.
+        enforce_exactly_once_sink : bool, optional
+            If we shouldn't allow skipping failed batches, to avoid duplicates in exactly once sinks.
+            default ``True``.
+
+        Notes
+        -----
+        This API is experimental.
+
+        This operation should only be performed after the streaming query has been stopped. If not,
+        can lead to undefined behavior or checkpoint corruption.
+        """
+        self._jmanager.repartition(checkpoint_location, num_partitions, enforce_exactly_once_sink)
+
+
 def _test() -> None:
     import doctest
     import os
@@ -728,7 +790,7 @@ def _test() -> None:
     globs = pyspark.sql.streaming.query.__dict__.copy()
     try:
         spark = SparkSession._getActiveSessionOrCreate()
-    except Py4JError:  # noqa: F821
+    except Py4JError:
         spark = SparkSession(sc)  # type: ignore[name-defined] # noqa: F821
 
     globs["spark"] = spark

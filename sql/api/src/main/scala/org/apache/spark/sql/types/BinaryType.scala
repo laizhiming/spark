@@ -20,15 +20,20 @@ package org.apache.spark.sql.types
 import org.apache.spark.annotation.Stable
 
 /**
- * The data type representing `Array[Byte]` values.
- * Please use the singleton `DataTypes.BinaryType`.
+ * The data type representing `Array[Byte]` values. Please use the singleton
+ * `DataTypes.BinaryType`.
  */
 @Stable
-class BinaryType private() extends AtomicType {
+class BinaryType private () extends AtomicType {
+
   /**
    * The default size of a value of the BinaryType is 100 bytes.
    */
   override def defaultSize: Int = 100
+
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[BinaryType]
+
+  override def hashCode(): Int = classOf[BinaryType].getSimpleName.hashCode
 
   private[spark] override def asNullable: BinaryType = this
 }

@@ -32,19 +32,20 @@ import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
 import org.apache.spark.internal.config.UI._
-import org.apache.spark.sql.{DataFrame, Dataset, SparkSession, SQLContext}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogWithListener
 import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode
 import org.apache.spark.sql.catalyst.optimizer.ConvertToLocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, OneRowRelation}
+import org.apache.spark.sql.classic.{DataFrame, Dataset, SparkSession, SQLContext}
 import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.execution.{CommandExecutionMode, QueryExecution, SQLExecution}
 import org.apache.spark.sql.hive._
 import org.apache.spark.sql.hive.client.HiveClient
-import org.apache.spark.sql.internal.{SessionState, SharedState, SQLConf, WithTestConf}
-import org.apache.spark.sql.internal.StaticSQLConf.{CATALOG_IMPLEMENTATION, WAREHOUSE_PATH}
+import org.apache.spark.sql.internal.{SessionState, SharedState, SQLConf}
+import org.apache.spark.sql.internal.StaticSQLConf.{CATALOG_IMPLEMENTATION, RESULT_QUERY_STAGE_MAX_THREAD_THRESHOLD, SHUFFLE_EXCHANGE_MAX_THREAD_THRESHOLD, WAREHOUSE_PATH}
+import org.apache.spark.sql.test.WithTestConf
 import org.apache.spark.util.{ShutdownHookManager, Utils}
 
 // SPARK-3729: Test key required to check for initialization errors with config.
@@ -70,7 +71,13 @@ object TestHive
         // LocalRelation will exercise the optimization rules better by disabling it as
         // this rule may potentially block testing of other optimization rules such as
         // ConstantPropagation etc.
-        .set(SQLConf.OPTIMIZER_EXCLUDED_RULES.key, ConvertToLocalRelation.ruleName))) {
+        .set(SQLConf.OPTIMIZER_EXCLUDED_RULES.key, ConvertToLocalRelation.ruleName)
+        .set(SHUFFLE_EXCHANGE_MAX_THREAD_THRESHOLD,
+          sys.env.getOrElse("SPARK_TEST_HIVE_SHUFFLE_EXCHANGE_MAX_THREAD_THRESHOLD",
+            SHUFFLE_EXCHANGE_MAX_THREAD_THRESHOLD.defaultValueString).toInt)
+        .set(RESULT_QUERY_STAGE_MAX_THREAD_THRESHOLD,
+          sys.env.getOrElse("SPARK_TEST_HIVE_RESULT_QUERY_STAGE_MAX_THREAD_THRESHOLD",
+            RESULT_QUERY_STAGE_MAX_THREAD_THRESHOLD.defaultValueString).toInt))) {
   override def conf: SQLConf = sparkSession.sessionState.conf
 }
 
@@ -175,7 +182,7 @@ private[hive] class TestHiveSparkSession(
     @transient private val existingSharedState: Option[TestHiveSharedState],
     @transient private val parentSessionState: Option[SessionState],
     private val loadTestTables: Boolean)
-  extends SparkSession(sc) with Logging { self =>
+  extends SparkSession(sc) with WithTestConf with Logging { self =>
 
   def this(sc: SparkContext, loadTestTables: Boolean) = {
     this(
@@ -221,6 +228,13 @@ private[hive] class TestHiveSparkSession(
     existingSharedState.getOrElse(new TestHiveSharedState(sc))
   }
 
+  override protected def testConfOverrides: Map[String, String] = TestHiveContext.overrideConfs
+
+  @transient
+  override lazy val sqlConf: SQLConf = {
+    parentSessionState.map(_.conf.clone()).getOrElse(newTestConf())
+  }
+
   @transient
   override lazy val sessionState: SessionState = {
     new TestHiveSessionStateBuilder(this, parentSessionState).build()
@@ -251,6 +265,7 @@ private[hive] class TestHiveSparkSession(
       Some(sessionState),
       loadTestTables)
     result.sessionState // force copy of SessionState
+    result.sessionState.artifactManager // force copy of ArtifactManager and its resources
     result
   }
 
@@ -545,6 +560,7 @@ private[hive] class TestHiveSparkSession(
       sharedState.cacheManager.clearCache()
       sharedState.loadedTables.clear()
       sessionState.catalog.reset()
+      sessionState.catalogManager.reset()
       metadataHive.reset()
 
       // HDFS root scratch dir requires the write all (733) permission. For each connecting user,
@@ -628,7 +644,11 @@ private[hive] object TestHiveContext {
   val overrideConfs: Map[String, String] =
     Map(
       // Fewer shuffle partitions to speed up testing.
-      SQLConf.SHUFFLE_PARTITIONS.key -> "5"
+      SQLConf.SHUFFLE_PARTITIONS.key -> "5",
+      // TODO(SPARK-50244): We now isolate artifacts added by the `ADD JAR` command. This will break
+      //  an existing Hive use case (one session adds JARs and another session uses them). We need
+      //  to decide whether/how to enable isolation for Hive.
+      SQLConf.ARTIFACTS_SESSION_ISOLATION_ENABLED.key -> "false"
     )
 
   def makeWarehouseDir(): File = {
@@ -652,10 +672,7 @@ private[hive] object TestHiveContext {
 private[sql] class TestHiveSessionStateBuilder(
     session: SparkSession,
     state: Option[SessionState])
-  extends HiveSessionStateBuilder(session, state)
-  with WithTestConf {
-
-  override def overrideConfs: Map[String, String] = TestHiveContext.overrideConfs
+  extends HiveSessionStateBuilder(session, state) {
 
   override def createQueryExecution:
     (LogicalPlan, CommandExecutionMode.Value) => QueryExecution =

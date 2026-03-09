@@ -24,7 +24,6 @@ import scala.util.Properties
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.hive.common.FileUtils
 import org.scalatest.Assertions._
-import org.scalatest.BeforeAndAfterEach
 import org.scalatest.matchers.must.Matchers
 import org.scalatest.time.Span
 import org.scalatest.time.SpanSugar._
@@ -54,7 +53,6 @@ import org.apache.spark.util.{ResetSystemProperties, Utils}
 class HiveSparkSubmitSuite
   extends SparkSubmitTestUtils
   with Matchers
-  with BeforeAndAfterEach
   with ResetSystemProperties {
 
   override protected val defaultSparkSubmitTimeout: Span = 5.minutes
@@ -168,6 +166,7 @@ class HiveSparkSubmitSuite
     }
     val jarDir = getTestResourcePath("regression-test-SPARK-8489")
     val testJar = s"$jarDir/test-$version.jar"
+    assume(new File(testJar).exists)
     val args = Seq(
       "--conf", "spark.ui.enabled=false",
       "--conf", "spark.master.rest.enabled=false",
@@ -733,7 +732,7 @@ object SPARK_9757 extends QueryTest {
 
     val hiveContext = new TestHiveContext(sparkContext)
     spark = hiveContext.sparkSession
-    import hiveContext.implicits._
+    import hiveContext.sparkSession.implicits._
 
     val dir = Utils.createTempDir()
     dir.delete()
@@ -828,7 +827,7 @@ object SPARK_18360 {
       .enableHiveSupport().getOrCreate()
 
     val defaultDbLocation = spark.catalog.getDatabase("default").locationUri
-    assert(new Path(defaultDbLocation) == new Path(spark.conf.get(WAREHOUSE_PATH)))
+    assert(new Path(defaultDbLocation) == new Path(spark.conf.get(WAREHOUSE_PATH.key)))
 
     val hiveClient =
       spark.sharedState.externalCatalog.unwrapped.asInstanceOf[HiveExternalCatalog].client

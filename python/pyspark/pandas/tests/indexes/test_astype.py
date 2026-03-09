@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 
-import unittest
 
 import numpy as np
 import pandas as pd
@@ -55,7 +54,7 @@ class IndexesAsTypeMixin:
         self.assert_eq(psidx.astype(bool), pidx.astype(bool))
         self.assert_eq(psidx.astype("bool"), pidx.astype("bool"))
         self.assert_eq(psidx.astype("?"), pidx.astype("?"))
-        self.assert_eq(psidx.astype(np.unicode_), pidx.astype(np.unicode_))
+        self.assert_eq(psidx.astype(np.str_), pidx.astype(np.str_))
         self.assert_eq(psidx.astype("str"), pidx.astype("str"))
         self.assert_eq(psidx.astype("U"), pidx.astype("U"))
 
@@ -93,12 +92,6 @@ class IndexesAsTypeTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.indexes.test_astype import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

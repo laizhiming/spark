@@ -59,7 +59,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.selectExpr("stack(1.1, 1, 2, 3)")
       },
-      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
       parameters = Map(
         "sqlExpr" -> "\"stack(1.1, 1, 2, 3)\"",
         "paramIndex" -> "first",
@@ -77,7 +77,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.selectExpr("stack(-1, 1, 2, 3)")
       },
-      errorClass = "DATATYPE_MISMATCH.VALUE_OUT_OF_RANGE",
+      condition = "DATATYPE_MISMATCH.VALUE_OUT_OF_RANGE",
       parameters = Map(
         "sqlExpr" -> "\"stack(-1, 1, 2, 3)\"",
         "exprName" -> "`n`",
@@ -95,7 +95,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.selectExpr("stack(2, 1, '2.2')")
       },
-      errorClass = "DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES",
+      condition = "DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES",
       parameters = Map(
         "sqlExpr" -> "\"stack(2, 1, 2.2)\"",
         "columnIndex" -> "0",
@@ -118,7 +118,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df2.selectExpr("stack(n, a, b, c)")
       },
-      errorClass = "DATATYPE_MISMATCH.NON_FOLDABLE_INPUT",
+      condition = "DATATYPE_MISMATCH.NON_FOLDABLE_INPUT",
       parameters = Map(
         "sqlExpr" -> "\"stack(n, a, b, c)\"",
         "inputName" -> "`n`",
@@ -136,7 +136,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df3.selectExpr("stack(2, a, b)")
       },
-      errorClass = "DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES",
+      condition = "DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES",
       parameters = Map(
         "sqlExpr" -> "\"stack(2, a, b)\"",
         "columnIndex" -> "0",
@@ -287,7 +287,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         spark.range(2).select(inline(array()))
       },
-      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
       parameters = Map(
         "sqlExpr" -> "\"inline(array())\"",
         "paramIndex" -> "first",
@@ -330,7 +330,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.select(inline(array(struct(Symbol("a")), struct(Symbol("b")))))
       },
-      errorClass = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
+      condition = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
       parameters = Map(
         "sqlExpr" -> "\"array(struct(a), struct(b))\"",
         "functionName" -> "`array`",
@@ -348,7 +348,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.select(inline(array(struct(Symbol("a")), struct(lit(2)))))
       },
-      errorClass = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
+      condition = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
       parameters = Map(
         "sqlExpr" -> "\"array(struct(a), struct(2))\"",
         "functionName" -> "`array`",
@@ -427,7 +427,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
         exception = intercept[AnalysisException] {
           sql("select 1 + explode(array(min(c2), max(c2))) from t1 group by c1")
         },
-        errorClass = "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
+        condition = "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
         parameters = Map(
           "expression" -> "\"(1 + explode(array(min(c2), max(c2))))\""))
 
@@ -440,7 +440,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
               |  posexplode(array(min(c2), max(c2)))
               |from t1 group by c1""".stripMargin)
         },
-        errorClass = "UNSUPPORTED_GENERATOR.MULTI_GENERATOR",
+        condition = "UNSUPPORTED_GENERATOR.MULTI_GENERATOR",
         parameters = Map(
           "num" -> "2",
           "generators" -> ("\"explode(array(min(c2), max(c2)))\", " +
@@ -453,7 +453,7 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         sql("SELECT array(array(1, 2), array(3)) v").select(explode(explode($"v"))).collect()
       },
-      errorClass = "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
+      condition = "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
       parameters = Map("expression" -> "\"explode(explode(v))\""))
   }
 
@@ -577,6 +577,193 @@ class GeneratorFunctionSuite extends QueryTest with SharedSparkSession {
          |)
          |""".stripMargin)
     checkAnswer(df, Seq(Row(0, "a"), Row(0, "b")))
+  }
+
+  test("generator with alias in multiple projects") {
+    val df = sql("SELECT explode(array(5, 6, 7, 8, 9)) AS a")
+    val alias = ($"a" + 1).as("a")
+    checkAnswer(
+      df.select(alias).select(alias).select(alias),
+      Seq(Row(8), Row(9), Row(10), Row(11), Row(12))
+    )
+  }
+
+  test("generator in self-join with aliased columns") {
+    val df1 = sql("SELECT explode(array(1, 2, 3)) AS col")
+    val df2 = df1.select($"col".as("col2"))
+    checkAnswer(
+      df1.join(df2, df1("col") === df2("col2")),
+      Seq(Row(1, 1), Row(2, 2), Row(3, 3))
+    )
+  }
+
+  test("generator in self-union") {
+    val df1 = sql("SELECT explode(array(1, 2, 3)) AS col")
+    checkAnswer(
+      df1.union(df1),
+      Seq(Row(1), Row(2), Row(3), Row(1), Row(2), Row(3))
+    )
+  }
+
+  test("explode with nested aliases using DataFrame API") {
+    checkAnswer(
+      spark.range(1).select(explode(array(lit(1), lit(2), lit(3))).as("first").as("second")),
+      Seq(Row(1), Row(2), Row(3))
+    )
+  }
+
+  test("posexplode with multi-alias using DataFrame API") {
+    checkAnswer(
+      spark.range(1).select(posexplode(array(lit(10), lit(20))).as(Seq("idx", "val"))),
+      Seq(Row(0, 10), Row(1, 20))
+    )
+  }
+
+  test("posexplode with chained aliases using DataFrame API should fail") {
+    val exception = intercept[AnalysisException] {
+      spark
+        .range(1)
+        .select(
+          posexplode(array(lit(1), lit(2), lit(3)))
+            .as("lolkek")
+            .as(Seq("pos", "val"))
+            .as(Seq("pos", "val", "kek"))
+            .as(Seq("pos2", "val2"))
+            .as("lolkek")
+        )
+        .collect()
+    }
+    assert(exception.getCondition == "UDTF_ALIAS_NUMBER_MISMATCH")
+  }
+
+  test("posexplode with chained aliases ending with valid multi-alias using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          posexplode(array(lit(1), lit(2), lit(3)))
+            .as("lolkek")
+            .as(Seq("pos", "val"))
+            .as(Seq("pos", "val", "kek"))
+            .as(Seq("pos2", "val2"))
+        ),
+      Seq(Row(0, 1), Row(1, 2), Row(2, 3))
+    )
+  }
+
+  test("explode with chained aliases and LCA reference using DataFrame API should fail") {
+    val exception = intercept[AnalysisException] {
+      spark
+        .range(1)
+        .select(
+          explode(array(lit(1), lit(2), lit(3)))
+            .as("first")
+            .as("second"),
+          $"first"
+        )
+        .collect()
+    }
+    assert(exception.getCondition == "UNRESOLVED_COLUMN.WITH_SUGGESTION")
+  }
+
+  test("explode with chained aliases and final alias reference using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          explode(array(lit(1), lit(2), lit(3)))
+            .as("first")
+            .as("second"),
+          $"second"
+        ),
+      Seq(Row(1, 1), Row(2, 2), Row(3, 3))
+    )
+  }
+
+  test("explode_outer with chained aliases using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          explode_outer(array(lit(1), lit(2), lit(3)))
+            .as("first")
+            .as("second")
+        ),
+      Seq(Row(1), Row(2), Row(3))
+    )
+  }
+
+  test("explode_outer with chained aliases and final alias reference using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          explode_outer(array(lit(1), lit(2), lit(3)))
+            .as("first")
+            .as("second"),
+          $"second"
+        ),
+      Seq(Row(1, 1), Row(2, 2), Row(3, 3))
+    )
+  }
+
+  test("posexplode_outer with chained aliases using DataFrame API should fail") {
+    val exception = intercept[AnalysisException] {
+      spark
+        .range(1)
+        .select(
+          posexplode_outer(array(lit(1), lit(2), lit(3)))
+            .as("lolkek")
+            .as(Seq("pos", "val"))
+            .as(Seq("pos", "val", "kek"))
+            .as(Seq("pos2", "val2"))
+            .as("lolkek")
+        )
+        .collect()
+    }
+    assert(exception.getCondition == "UDTF_ALIAS_NUMBER_MISMATCH")
+  }
+
+  test("posexplode_outer with chained aliases ending with valid multi-alias using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          posexplode_outer(array(lit(1), lit(2), lit(3)))
+            .as("lolkek")
+            .as(Seq("pos", "val"))
+            .as(Seq("pos", "val", "kek"))
+            .as(Seq("pos2", "val2"))
+        ),
+      Seq(Row(0, 1), Row(1, 2), Row(2, 3))
+    )
+  }
+
+  test("posexplode_outer with multi-alias using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          posexplode_outer(array(lit(10), lit(20)))
+            .as(Seq("idx", "val"))
+        ),
+      Seq(Row(0, 10), Row(1, 20))
+    )
+  }
+
+  test("posexplode_outer with chained multi-alias and final reference using DataFrame API") {
+    checkAnswer(
+      spark
+        .range(1)
+        .select(
+          posexplode_outer(array(lit(10), lit(20)))
+            .as(Seq("pos1", "val1"))
+            .as(Seq("pos2", "val2")),
+          $"pos2",
+          $"val2"
+        ),
+      Seq(Row(0, 10, 0, 10), Row(1, 20, 1, 20))
+    )
   }
 }
 

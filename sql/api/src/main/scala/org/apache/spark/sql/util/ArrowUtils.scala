@@ -38,33 +38,34 @@ private[sql] object ArrowUtils {
   // todo: support more types.
 
   /** Maps data type from Spark to Arrow. NOTE: timeZoneId required for TimestampTypes */
-  def toArrowType(
-      dt: DataType, timeZoneId: String, largeVarTypes: Boolean = false): ArrowType = dt match {
-    case BooleanType => ArrowType.Bool.INSTANCE
-    case ByteType => new ArrowType.Int(8, true)
-    case ShortType => new ArrowType.Int(8 * 2, true)
-    case IntegerType => new ArrowType.Int(8 * 4, true)
-    case LongType => new ArrowType.Int(8 * 8, true)
-    case FloatType => new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)
-    case DoubleType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
-    case _: StringType if !largeVarTypes => ArrowType.Utf8.INSTANCE
-    case BinaryType if !largeVarTypes => ArrowType.Binary.INSTANCE
-    case _: StringType if largeVarTypes => ArrowType.LargeUtf8.INSTANCE
-    case BinaryType if largeVarTypes => ArrowType.LargeBinary.INSTANCE
-    case DecimalType.Fixed(precision, scale) => new ArrowType.Decimal(precision, scale, 8 * 16)
-    case DateType => new ArrowType.Date(DateUnit.DAY)
-    case TimestampType if timeZoneId == null =>
-      throw SparkException.internalError("Missing timezoneId where it is mandatory.")
-    case TimestampType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, timeZoneId)
-    case TimestampNTZType =>
-      new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)
-    case NullType => ArrowType.Null.INSTANCE
-    case _: YearMonthIntervalType => new ArrowType.Interval(IntervalUnit.YEAR_MONTH)
-    case _: DayTimeIntervalType => new ArrowType.Duration(TimeUnit.MICROSECOND)
-    case CalendarIntervalType => new ArrowType.Interval(IntervalUnit.MONTH_DAY_NANO)
-    case _ =>
-      throw ExecutionErrors.unsupportedDataTypeError(dt)
-  }
+  def toArrowType(dt: DataType, timeZoneId: String, largeVarTypes: Boolean = false): ArrowType =
+    dt match {
+      case BooleanType => ArrowType.Bool.INSTANCE
+      case ByteType => new ArrowType.Int(8, true)
+      case ShortType => new ArrowType.Int(8 * 2, true)
+      case IntegerType => new ArrowType.Int(8 * 4, true)
+      case LongType => new ArrowType.Int(8 * 8, true)
+      case FloatType => new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)
+      case DoubleType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
+      case _: StringType if !largeVarTypes => ArrowType.Utf8.INSTANCE
+      case BinaryType if !largeVarTypes => ArrowType.Binary.INSTANCE
+      case _: StringType if largeVarTypes => ArrowType.LargeUtf8.INSTANCE
+      case BinaryType if largeVarTypes => ArrowType.LargeBinary.INSTANCE
+      case DecimalType.Fixed(precision, scale) => new ArrowType.Decimal(precision, scale, 8 * 16)
+      case DateType => new ArrowType.Date(DateUnit.DAY)
+      case TimestampType if timeZoneId == null =>
+        throw SparkException.internalError("Missing timezoneId where it is mandatory.")
+      case TimestampType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, timeZoneId)
+      case TimestampNTZType =>
+        new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)
+      case _: TimeType => new ArrowType.Time(TimeUnit.NANOSECOND, 8 * 8)
+      case NullType => ArrowType.Null.INSTANCE
+      case _: YearMonthIntervalType => new ArrowType.Interval(IntervalUnit.YEAR_MONTH)
+      case _: DayTimeIntervalType => new ArrowType.Duration(TimeUnit.MICROSECOND)
+      case CalendarIntervalType => new ArrowType.Interval(IntervalUnit.MONTH_DAY_NANO)
+      case _ =>
+        throw ExecutionErrors.unsupportedDataTypeError(dt)
+    }
 
   def fromArrowType(dt: ArrowType): DataType = dt match {
     case ArrowType.Bool.INSTANCE => BooleanType
@@ -73,9 +74,11 @@ private[sql] object ArrowUtils {
     case int: ArrowType.Int if int.getIsSigned && int.getBitWidth == 8 * 4 => IntegerType
     case int: ArrowType.Int if int.getIsSigned && int.getBitWidth == 8 * 8 => LongType
     case float: ArrowType.FloatingPoint
-      if float.getPrecision() == FloatingPointPrecision.SINGLE => FloatType
+        if float.getPrecision() == FloatingPointPrecision.SINGLE =>
+      FloatType
     case float: ArrowType.FloatingPoint
-      if float.getPrecision() == FloatingPointPrecision.DOUBLE => DoubleType
+        if float.getPrecision() == FloatingPointPrecision.DOUBLE =>
+      DoubleType
     case ArrowType.Utf8.INSTANCE => StringType
     case ArrowType.Binary.INSTANCE => BinaryType
     case ArrowType.LargeUtf8.INSTANCE => StringType
@@ -83,14 +86,34 @@ private[sql] object ArrowUtils {
     case d: ArrowType.Decimal => DecimalType(d.getPrecision, d.getScale)
     case date: ArrowType.Date if date.getUnit == DateUnit.DAY => DateType
     case ts: ArrowType.Timestamp
-      if ts.getUnit == TimeUnit.MICROSECOND && ts.getTimezone == null => TimestampNTZType
+        if ts.getUnit == TimeUnit.MICROSECOND && ts.getTimezone == null =>
+      TimestampNTZType
     case ts: ArrowType.Timestamp if ts.getUnit == TimeUnit.MICROSECOND => TimestampType
+    case t: ArrowType.Time if t.getUnit == TimeUnit.NANOSECOND && t.getBitWidth == 8 * 8 =>
+      TimeType(TimeType.MICROS_PRECISION)
     case ArrowType.Null.INSTANCE => NullType
-    case yi: ArrowType.Interval if yi.getUnit == IntervalUnit.YEAR_MONTH => YearMonthIntervalType()
+    case yi: ArrowType.Interval if yi.getUnit == IntervalUnit.YEAR_MONTH =>
+      YearMonthIntervalType()
     case di: ArrowType.Duration if di.getUnit == TimeUnit.MICROSECOND => DayTimeIntervalType()
-    case ci: ArrowType.Interval
-      if ci.getUnit == IntervalUnit.MONTH_DAY_NANO => CalendarIntervalType
+    case ci: ArrowType.Interval if ci.getUnit == IntervalUnit.MONTH_DAY_NANO =>
+      CalendarIntervalType
     case _ => throw ExecutionErrors.unsupportedArrowTypeError(dt)
+  }
+
+  private val metadataKey = "SPARK::metadata::json"
+  private def toArrowMetaData(metadata: Metadata) = {
+    if (metadata != null && !metadata.isEmpty) {
+      Map(metadataKey -> metadata.json).asJava
+    } else {
+      null // Arrow metadata defaults to NULL
+    }
+  }
+  private def fromArrowMetaData(map: java.util.Map[String, String]) = {
+    if (map != null && map.containsKey(metadataKey)) {
+      Metadata.fromJson(map.get(metadataKey))
+    } else {
+      Metadata.empty // Spark metadata defaults to Metadata.empty
+    }
   }
 
   /** Maps field from Spark to Arrow. NOTE: timeZoneId required for TimestampType */
@@ -99,42 +122,143 @@ private[sql] object ArrowUtils {
       dt: DataType,
       nullable: Boolean,
       timeZoneId: String,
-      largeVarTypes: Boolean = false): Field = {
+      largeVarTypes: Boolean = false,
+      metadata: Metadata = Metadata.empty): Field = {
     dt match {
       case ArrayType(elementType, containsNull) =>
-        val fieldType = new FieldType(nullable, ArrowType.List.INSTANCE, null)
-        new Field(name, fieldType,
-          Seq(toArrowField("element", elementType, containsNull, timeZoneId,
-            largeVarTypes)).asJava)
+        val fieldType =
+          new FieldType(nullable, ArrowType.List.INSTANCE, null, toArrowMetaData(metadata))
+        new Field(
+          name,
+          fieldType,
+          Seq(
+            toArrowField("element", elementType, containsNull, timeZoneId, largeVarTypes)).asJava)
       case StructType(fields) =>
-        val fieldType = new FieldType(nullable, ArrowType.Struct.INSTANCE, null)
-        new Field(name, fieldType,
-          fields.map { field =>
-            toArrowField(field.name, field.dataType, field.nullable, timeZoneId, largeVarTypes)
-          }.toImmutableArraySeq.asJava)
+        val fieldType =
+          new FieldType(nullable, ArrowType.Struct.INSTANCE, null, toArrowMetaData(metadata))
+        new Field(
+          name,
+          fieldType,
+          fields
+            .map { field =>
+              toArrowField(
+                field.name,
+                field.dataType,
+                field.nullable,
+                timeZoneId,
+                largeVarTypes,
+                field.metadata)
+            }
+            .toImmutableArraySeq
+            .asJava)
       case MapType(keyType, valueType, valueContainsNull) =>
-        val mapType = new FieldType(nullable, new ArrowType.Map(false), null)
+        val fieldType =
+          new FieldType(nullable, new ArrowType.Map(false), null, toArrowMetaData(metadata))
         // Note: Map Type struct can not be null, Struct Type key field can not be null
-        new Field(name, mapType,
-          Seq(toArrowField(MapVector.DATA_VECTOR_NAME,
-            new StructType()
-              .add(MapVector.KEY_NAME, keyType, nullable = false)
-              .add(MapVector.VALUE_NAME, valueType, nullable = valueContainsNull),
-            nullable = false,
-            timeZoneId,
-            largeVarTypes)).asJava)
+        new Field(
+          name,
+          fieldType,
+          Seq(
+            toArrowField(
+              MapVector.DATA_VECTOR_NAME,
+              new StructType()
+                .add(MapVector.KEY_NAME, keyType, nullable = false)
+                .add(MapVector.VALUE_NAME, valueType, nullable = valueContainsNull),
+              nullable = false,
+              timeZoneId,
+              largeVarTypes)).asJava)
       case udt: UserDefinedType[_] =>
-        toArrowField(name, udt.sqlType, nullable, timeZoneId, largeVarTypes)
+        toArrowField(name, udt.sqlType, nullable, timeZoneId, largeVarTypes, metadata)
+      case g: GeometryType =>
+        val fieldType =
+          new FieldType(nullable, ArrowType.Struct.INSTANCE, null, toArrowMetaData(metadata))
+
+        // WKB field is tagged with additional metadata so we can identify that the arrow
+        // struct actually represents a geometry schema.
+        val wkbFieldType = new FieldType(
+          false,
+          toArrowType(BinaryType, timeZoneId, largeVarTypes),
+          null,
+          Map("geometry" -> "true", "srid" -> g.srid.toString).asJava)
+
+        new Field(
+          name,
+          fieldType,
+          Seq(
+            toArrowField("srid", IntegerType, false, timeZoneId, largeVarTypes),
+            new Field("wkb", wkbFieldType, Seq.empty[Field].asJava)).asJava)
+
+      case g: GeographyType =>
+        val fieldType =
+          new FieldType(nullable, ArrowType.Struct.INSTANCE, null, toArrowMetaData(metadata))
+
+        // WKB field is tagged with additional metadata so we can identify that the arrow
+        // struct actually represents a geography schema.
+        val wkbFieldType = new FieldType(
+          false,
+          toArrowType(BinaryType, timeZoneId, largeVarTypes),
+          null,
+          Map("geography" -> "true", "srid" -> g.srid.toString).asJava)
+
+        new Field(
+          name,
+          fieldType,
+          Seq(
+            toArrowField("srid", IntegerType, false, timeZoneId, largeVarTypes),
+            new Field("wkb", wkbFieldType, Seq.empty[Field].asJava)).asJava)
       case _: VariantType =>
-        val fieldType = new FieldType(nullable, ArrowType.Struct.INSTANCE, null,
+        val fieldType =
+          new FieldType(nullable, ArrowType.Struct.INSTANCE, null, toArrowMetaData(metadata))
+        // The metadata field is tagged with additional metadata so we can identify that the arrow
+        // struct actually represents a variant schema.
+        val metadataFieldType = new FieldType(
+          false,
+          toArrowType(BinaryType, timeZoneId, largeVarTypes),
+          null,
           Map("variant" -> "true").asJava)
-        new Field(name, fieldType,
-          Seq(toArrowField("value", BinaryType, false, timeZoneId, largeVarTypes),
-            toArrowField("metadata", BinaryType, false, timeZoneId, largeVarTypes)).asJava)
+        new Field(
+          name,
+          fieldType,
+          Seq(
+            toArrowField("value", BinaryType, false, timeZoneId, largeVarTypes),
+            new Field("metadata", metadataFieldType, Seq.empty[Field].asJava)).asJava)
       case dataType =>
-        val fieldType = new FieldType(nullable, toArrowType(dataType, timeZoneId,
-          largeVarTypes), null)
+        val fieldType = new FieldType(
+          nullable,
+          toArrowType(dataType, timeZoneId, largeVarTypes),
+          null,
+          toArrowMetaData(metadata))
         new Field(name, fieldType, Seq.empty[Field].asJava)
+    }
+  }
+
+  def isVariantField(field: Field): Boolean = {
+    assert(field.getType.isInstanceOf[ArrowType.Struct])
+    field.getChildren.asScala
+      .map(_.getName)
+      .asJava
+      .containsAll(Seq("value", "metadata").asJava) && field.getChildren.asScala.exists { child =>
+      child.getName == "metadata" && child.getMetadata.getOrDefault("variant", "false") == "true"
+    }
+  }
+
+  def isGeometryField(field: Field): Boolean = {
+    assert(field.getType.isInstanceOf[ArrowType.Struct])
+    field.getChildren.asScala
+      .map(_.getName)
+      .asJava
+      .containsAll(Seq("wkb", "srid").asJava) && field.getChildren.asScala.exists { child =>
+      child.getName == "wkb" && child.getMetadata.getOrDefault("geometry", "false") == "true"
+    }
+  }
+
+  def isGeographyField(field: Field): Boolean = {
+    assert(field.getType.isInstanceOf[ArrowType.Struct])
+    field.getChildren.asScala
+      .map(_.getName)
+      .asJava
+      .containsAll(Seq("wkb", "srid").asJava) && field.getChildren.asScala.exists { child =>
+      child.getName == "wkb" && child.getMetadata.getOrDefault("geography", "false") == "true"
     }
   }
 
@@ -149,52 +273,124 @@ private[sql] object ArrowUtils {
         val elementField = field.getChildren().get(0)
         val elementType = fromArrowField(elementField)
         ArrayType(elementType, containsNull = elementField.isNullable)
-      case ArrowType.Struct.INSTANCE if field.getMetadata.getOrDefault("variant", "") == "true"
-        && field.getChildren.asScala.map(_.getName).asJava
-          .containsAll(Seq("value", "metadata").asJava) =>
+      case ArrowType.Struct.INSTANCE if isVariantField(field) =>
         VariantType
+      case ArrowType.Struct.INSTANCE if isGeometryField(field) =>
+        // We expect that type metadata is associated with wkb field.
+        val metadataField =
+          field.getChildren.asScala.filter { child => child.getName == "wkb" }.head
+        val srid = metadataField.getMetadata.get("srid").toInt
+        if (srid == GeometryType.MIXED_SRID) {
+          GeometryType("ANY")
+        } else {
+          GeometryType(srid)
+        }
+      case ArrowType.Struct.INSTANCE if isGeographyField(field) =>
+        // We expect that type metadata is associated with wkb field.
+        val metadataField =
+          field.getChildren.asScala.filter { child => child.getName == "wkb" }.head
+        val srid = metadataField.getMetadata.get("srid").toInt
+        if (srid == GeographyType.MIXED_SRID) {
+          GeographyType("ANY")
+        } else {
+          GeographyType(srid)
+        }
       case ArrowType.Struct.INSTANCE =>
         val fields = field.getChildren().asScala.map { child =>
           val dt = fromArrowField(child)
-          StructField(child.getName, dt, child.isNullable)
+          StructField(child.getName, dt, child.isNullable, fromArrowMetaData(child.getMetadata))
         }
         StructType(fields.toArray)
       case arrowType => fromArrowType(arrowType)
     }
   }
 
-  /** Maps schema from Spark to Arrow. NOTE: timeZoneId required for TimestampType in StructType */
+  /**
+   * Maps schema from Spark to Arrow. NOTE: timeZoneId required for TimestampType in StructType
+   */
   def toArrowSchema(
       schema: StructType,
       timeZoneId: String,
       errorOnDuplicatedFieldNames: Boolean,
-      largeVarTypes: Boolean = false): Schema = {
+      largeVarTypes: Boolean): Schema = {
     new Schema(schema.map { field =>
       toArrowField(
         field.name,
         deduplicateFieldNames(field.dataType, errorOnDuplicatedFieldNames),
         field.nullable,
         timeZoneId,
-        largeVarTypes)
+        largeVarTypes,
+        field.metadata)
     }.asJava)
+  }
+
+  /**
+   * Maps schema from Spark to Arrow. NOTE: timeZoneId required for TimestampType in StructType
+   */
+  def toArrowSchema(schema: StructType, timeZoneId: String, largeVarTypes: Boolean): Schema = {
+    new Schema(schema.map { field =>
+      toArrowField(
+        field.name,
+        field.dataType,
+        field.nullable,
+        timeZoneId,
+        largeVarTypes,
+        field.metadata)
+    }.asJava)
+  }
+
+  /**
+   * Check the schema and fail once an insider struct type contains duplicated field names. Note
+   * that the first level accepts duplicated names.
+   */
+  def failDuplicatedFieldNames(schema: StructType): Unit = {
+    schema.fields.foreach { field => failDuplicatedFieldNamesImpl(field.dataType) }
+  }
+
+  /**
+   * Check the schema and fail once a struct type contains duplicated field names.
+   */
+  private def failDuplicatedFieldNamesImpl(dt: DataType): Unit = {
+    dt match {
+      case st: StructType =>
+        if (st.names.toSet.size != st.names.length) {
+          throw ExecutionErrors.duplicatedFieldNameInArrowStructError(
+            st.names.toImmutableArraySeq)
+        }
+        st.fields.foreach { field => failDuplicatedFieldNamesImpl(field.dataType) }
+      case arr: ArrayType =>
+        failDuplicatedFieldNamesImpl(arr.elementType)
+      case map: MapType =>
+        failDuplicatedFieldNamesImpl(map.keyType)
+        failDuplicatedFieldNamesImpl(map.valueType)
+      case udt: UserDefinedType[_] =>
+        failDuplicatedFieldNamesImpl(udt.sqlType)
+      case _ =>
+    }
   }
 
   def fromArrowSchema(schema: Schema): StructType = {
     StructType(schema.getFields.asScala.map { field =>
-      val dt = fromArrowField(field)
-      StructField(field.getName, dt, field.isNullable)
+      StructField(
+        field.getName,
+        fromArrowField(field),
+        field.isNullable,
+        fromArrowMetaData(field.getMetadata))
     }.toArray)
   }
 
   private def deduplicateFieldNames(
-      dt: DataType, errorOnDuplicatedFieldNames: Boolean): DataType = dt match {
-    case udt: UserDefinedType[_] => deduplicateFieldNames(udt.sqlType, errorOnDuplicatedFieldNames)
+      dt: DataType,
+      errorOnDuplicatedFieldNames: Boolean): DataType = dt match {
+    case udt: UserDefinedType[_] =>
+      deduplicateFieldNames(udt.sqlType, errorOnDuplicatedFieldNames)
     case st @ StructType(fields) =>
       val newNames = if (st.names.toSet.size == st.names.length) {
         st.names
       } else {
         if (errorOnDuplicatedFieldNames) {
-          throw ExecutionErrors.duplicatedFieldNameInArrowStructError(st.names.toImmutableArraySeq)
+          throw ExecutionErrors.duplicatedFieldNameInArrowStructError(
+            st.names.toImmutableArraySeq)
         }
         val genNawName = st.names.groupBy(identity).map {
           case (name, names) if names.length > 1 =>
@@ -207,7 +403,10 @@ private[sql] object ArrowUtils {
       val newFields =
         fields.zip(newNames).map { case (StructField(_, dataType, nullable, metadata), name) =>
           StructField(
-            name, deduplicateFieldNames(dataType, errorOnDuplicatedFieldNames), nullable, metadata)
+            name,
+            deduplicateFieldNames(dataType, errorOnDuplicatedFieldNames),
+            nullable,
+            metadata)
         }
       StructType(newFields)
     case ArrayType(elementType, containsNull) =>

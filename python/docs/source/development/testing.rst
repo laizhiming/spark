@@ -53,6 +53,13 @@ You can run a specific test via using ``python/run-tests``, for example, as belo
 
 Please refer to `Testing PySpark <https://spark.apache.org/developer-tools.html>`_ for more details.
 
+``breakpoint()`` Support in PySpark Tests
+-----------------------------------------
+
+To debug a certain test, you can add ``breakpoint()`` in the test code, and run the test with
+``python/run-tests`` as usual. The script will stop at the ``breakpoint()`` line and open an
+interactive ``pdb`` debugging session. 
+
 
 Running Tests using GitHub Actions
 ----------------------------------
@@ -69,21 +76,16 @@ Running Tests for Python Client
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 In order to test the changes in Protobuf definitions, for example, at
-`spark/connector/connect/common/src/main/protobuf/spark/connect <https://github.com/apache/spark/tree/master/connector/connect/common/src/main/protobuf/spark/connect>`_,
+`spark/sql/connect/common/src/main/protobuf/spark/connect <https://github.com/apache/spark/tree/master/sql/connect/common/src/main/protobuf/spark/connect>`_,
 you should regenerate Python Protobuf client first by running ``dev/connect-gen-protos.sh``.
 
 
 Running PySpark Shell with Python Client
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For Apache Spark you locally built:
+The command below starts Spark Connect server automatically locally, and creates a Spark Connect client connected to the server.
 
 .. code-block:: bash
 
     bin/pyspark --remote "local[*]"
 
-For the Apache Spark release:
-
-.. code-block:: bash
-
-    bin/pyspark --remote "local[*]" --packages org.apache.spark:spark-connect_2.13:$SPARK_VERSION

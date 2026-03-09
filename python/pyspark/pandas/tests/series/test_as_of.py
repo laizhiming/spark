@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 
 import numpy as np
 import pandas as pd
@@ -32,7 +31,7 @@ class SeriesAsOfMixin:
         self.assert_eq(psser.asof(20), pser.asof(20))
         self.assert_eq(psser.asof([5, 20]).sort_index(), pser.asof([5, 20]).sort_index())
         self.assert_eq(psser.asof(100), pser.asof(100))
-        self.assert_eq(repr(psser.asof(-100)), repr(pser.asof(-100)))
+        self.assert_eq(str(psser.asof(-100)), str(pser.asof(-100)))
         self.assert_eq(psser.asof([-100, 100]).sort_index(), pser.asof([-100, 100]).sort_index())
 
         # where cannot be an Index, Series or a DataFrame
@@ -55,7 +54,7 @@ class SeriesAsOfMixin:
 
         self.assert_eq(psser.asof("2014-01-01"), pser.asof("2014-01-01"))
         self.assert_eq(psser.asof("2014-01-02"), pser.asof("2014-01-02"))
-        self.assert_eq(repr(psser.asof("1999-01-02")), repr(pser.asof("1999-01-02")))
+        self.assert_eq(str(psser.asof("1999-01-02")), str(pser.asof("1999-01-02")))
 
         # SPARK-37482: Skip check monotonic increasing for Series.asof with 'compute.eager_check'
         pser = pd.Series([1, 2, np.nan, 4], index=[10, 30, 20, 40])
@@ -122,12 +121,6 @@ class SeriesAsOfTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.series.test_as_of import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

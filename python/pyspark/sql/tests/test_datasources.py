@@ -212,6 +212,7 @@ class DataSourcesTestsMixin:
             )
             df = (
                 self.spark.read.option("header", "true")
+                .option("quote", None)
                 .schema(schema)
                 .csv(path, enforceSchema=False)
             )
@@ -296,8 +297,8 @@ class DataSourcesTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_IMPLEMENTED",
-            message_parameters={"feature": "schema"},
+            errorClass="NOT_IMPLEMENTED",
+            messageParameters={"feature": "schema"},
         )
 
         with self.assertRaises(PySparkNotImplementedError) as pe:
@@ -305,8 +306,8 @@ class DataSourcesTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_IMPLEMENTED",
-            message_parameters={"feature": "reader"},
+            errorClass="NOT_IMPLEMENTED",
+            messageParameters={"feature": "reader"},
         )
 
         with self.assertRaises(PySparkNotImplementedError) as pe:
@@ -314,8 +315,8 @@ class DataSourcesTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            error_class="NOT_IMPLEMENTED",
-            message_parameters={"feature": "writer"},
+            errorClass="NOT_IMPLEMENTED",
+            messageParameters={"feature": "writer"},
         )
 
     def test_input_partition(self):
@@ -339,13 +340,6 @@ class DataSourcesTests(DataSourcesTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.test_datasources import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -23,9 +23,10 @@ import matplotlib as mat
 import numpy as np
 from matplotlib.axes._base import _process_plot_format  # type: ignore[attr-defined]
 from matplotlib.figure import Figure
+import pandas as pd
 from pandas.core.dtypes.inference import is_list_like
-from pandas.io.formats.printing import pprint_thing
-from pandas.plotting._matplotlib import (  # type: ignore[attr-defined]
+from pandas.io.formats.printing import pprint_thing  # type: ignore[import-not-found]
+from pandas.plotting._matplotlib import (  # type: ignore[import-not-found]
     BarPlot as PandasBarPlot,
     BoxPlot as PandasBoxPlot,
     HistPlot as PandasHistPlot,
@@ -37,7 +38,7 @@ from pandas.plotting._matplotlib import (  # type: ignore[attr-defined]
     KdePlot as PandasKdePlot,
 )
 from pandas.plotting._core import PlotAccessor
-from pandas.plotting._matplotlib.core import MPLPlot as PandasMPLPlot
+from pandas.plotting._matplotlib.core import MPLPlot as PandasMPLPlot  # type: ignore[import-not-found]
 
 from pyspark.pandas.plot import (
     TopNPlotBase,
@@ -282,30 +283,26 @@ class PandasOnSparkBoxPlot(PandasBoxPlot, BoxPlotBase):
         # This one is pandas-on-Spark specific to control precision for approx_percentile
         precision = self.kwds.get("precision", 0.01)
 
-        # # Computes mean, median, Q1 and Q3 with approx_percentile and precision
-        col_stats, col_fences = BoxPlotBase.compute_stats(data, spark_column_name, whis, precision)
-
-        # # Creates a column to flag rows as outliers or not
-        outliers = BoxPlotBase.outliers(data, spark_column_name, *col_fences)
-
-        # # Computes min and max values of non-outliers - the whiskers
-        whiskers = BoxPlotBase.calc_whiskers(spark_column_name, outliers)
-
-        if showfliers:
-            fliers = BoxPlotBase.get_fliers(spark_column_name, outliers, whiskers[0])
-        else:
-            fliers = []
+        results = BoxPlotBase.compute_box(
+            data._psdf._internal.resolved_copy.spark_frame,
+            [spark_column_name],
+            whis,
+            precision,
+            showfliers,
+        )
+        assert len(results) == 1
+        result = results[0]
 
         # Builds bxpstats dict
         stats = []
         item = {
-            "mean": col_stats["mean"],
-            "med": col_stats["med"],
-            "q1": col_stats["q1"],
-            "q3": col_stats["q3"],
-            "whislo": whiskers[0],
-            "whishi": whiskers[1],
-            "fliers": fliers,
+            "mean": result["mean"],
+            "med": result["med"],
+            "q1": result["q1"],
+            "q3": result["q3"],
+            "whislo": result["lower_whisker"],
+            "whishi": result["upper_whisker"],
+            "fliers": result["fliers"] if result["fliers"] else [],
             "label": labels[0],
         }
         stats.append(item)
@@ -972,5 +969,10 @@ def _plot(data, x=None, y=None, subplots=False, ax=None, kind="line", **kwds):
 
         plot_obj = klass(data, subplots=subplots, ax=ax, kind=kind, **kwds)
     plot_obj.generate()
-    plot_obj.draw()
+    if LooseVersion(pd.__version__) < "3.0.0":
+        plot_obj.draw()
+    else:
+        import matplotlib.pyplot as plt
+
+        plt.draw_if_interactive()
     return plot_obj.result

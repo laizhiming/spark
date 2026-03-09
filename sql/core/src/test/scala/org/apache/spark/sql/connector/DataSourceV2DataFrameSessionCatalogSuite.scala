@@ -17,9 +17,11 @@
 
 package org.apache.spark.sql.connector
 
+import java.util.Locale
+
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.sql.{DataFrame, QueryTest, SaveMode}
+import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, SaveMode}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.connector.catalog._
@@ -55,8 +57,7 @@ class DataSourceV2DataFrameSessionCatalogSuite
     "and a same-name temp view exist") {
     withTable("same_name") {
       withTempView("same_name") {
-        val format = spark.sessionState.conf.defaultDataSourceName
-        sql(s"CREATE TABLE same_name(id LONG) USING $format")
+        sql(s"CREATE TABLE same_name(id LONG) USING $v2Format")
         spark.range(10).createTempView("same_name")
         spark.range(20).write.format(v2Format).mode(SaveMode.Append).saveAsTable("same_name")
         checkAnswer(spark.table("same_name"), spark.range(10).toDF())
@@ -88,6 +89,15 @@ class DataSourceV2DataFrameSessionCatalogSuite
       assert(tableInfo.properties().get("provider") === v2Format)
     }
   }
+
+  test("SPARK-49246: saveAsTable with v1 format") {
+    withTable("t") {
+      sql("CREATE TABLE t(c INT) USING csv")
+      val df = spark.range(10).toDF()
+      df.write.mode(SaveMode.Overwrite).format("csv").saveAsTable("t")
+      verifyTable("t", df)
+    }
+  }
 }
 
 class InMemoryTableSessionCatalog extends TestV2SessionCatalogBase[InMemoryTable] {
@@ -103,7 +113,25 @@ class InMemoryTableSessionCatalog extends TestV2SessionCatalogBase[InMemoryTable
     val identToUse = Option(InMemoryTableSessionCatalog.customIdentifierResolution)
       .map(_(ident))
       .getOrElse(ident)
-    super.loadTable(identToUse)
+
+    // For single-part namespaces, follow Iceberg's pattern: first try to load the table
+    // normally, fall back to metadata table resolution only on NoSuchTableException
+    try {
+      super.loadTable(identToUse)
+    } catch {
+      case _: AnalysisException if identToUse.name().toLowerCase(Locale.ROOT) == "snapshots" =>
+        loadSnapshotTable(identToUse)
+    }
+  }
+
+  private def loadSnapshotTable(ident: Identifier): InMemorySnapshotsTable = {
+    val parentTableName = ident.namespace().last
+    val parentNamespace = ident.namespace().dropRight(1)
+    val parentIdent = Identifier.of(
+      if (parentNamespace.isEmpty) Array("default") else parentNamespace,
+      parentTableName)
+    val parentTable = super.loadTable(parentIdent).asInstanceOf[InMemoryTable]
+    new InMemorySnapshotsTable(parentTable)
   }
 
   override def alterTable(ident: Identifier, changes: TableChange*): Table = {
@@ -125,13 +153,13 @@ class InMemoryTableSessionCatalog extends TestV2SessionCatalogBase[InMemoryTable
         }
 
         val newTable = new InMemoryTable(table.name, schema, table.partitioning, properties)
-          .withData(table.data)
+          .alterTableWithData(table.data, schema)
 
         tables.put(ident, newTable)
 
         newTable
       case _ =>
-        throw QueryCompilationErrors.noSuchTableError(ident)
+        throw QueryCompilationErrors.noSuchTableError(name(), ident)
     }
   }
 }
@@ -160,6 +188,10 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
     spark.sessionState.catalogManager.catalog(name)
   }
 
+  protected def sessionCatalog: Catalog = {
+    catalog(SESSION_CATALOG_NAME).asInstanceOf[Catalog]
+  }
+
   protected val v2Format: String = classOf[FakeV2ProviderWithCustomSchema].getName
 
   protected val catalogClassName: String = classOf[InMemoryTableSessionCatalog].getName
@@ -170,7 +202,9 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
 
   override def afterEach(): Unit = {
     super.afterEach()
-    catalog(SESSION_CATALOG_NAME).asInstanceOf[Catalog].clearTables()
+    sessionCatalog.checkUsage()
+    sessionCatalog.clearTables()
+    sessionCatalog.clearFunctions()
     spark.conf.unset(V2_SESSION_CATALOG_IMPLEMENTATION.key)
   }
 

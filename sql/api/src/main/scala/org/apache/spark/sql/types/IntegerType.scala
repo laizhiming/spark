@@ -25,13 +25,18 @@ import org.apache.spark.annotation.Stable
  * @since 1.3.0
  */
 @Stable
-class IntegerType private() extends IntegralType {
+class IntegerType private () extends IntegralType {
+
   /**
    * The default size of a value of the IntegerType is 4 bytes.
    */
   override def defaultSize: Int = 4
 
   override def simpleString: String = "int"
+
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[IntegerType]
+
+  override def hashCode(): Int = classOf[IntegerType].getSimpleName.hashCode
 
   private[spark] override def asNullable: IntegerType = this
 }

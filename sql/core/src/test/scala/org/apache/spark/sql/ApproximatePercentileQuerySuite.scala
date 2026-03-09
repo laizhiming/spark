@@ -349,7 +349,7 @@ class ApproximatePercentileQuerySuite extends QueryTest with SharedSparkSession 
             |FROM VALUES (0), (1), (2), (10) AS tab(col);
             |""".stripMargin).collect()
       },
-      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_NULL",
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_NULL",
       parameters = Map(
         "exprName" -> "accuracy",
         "sqlExpr" -> "\"percentile_approx(col, array(0.5, 0.4, 0.1), NULL)\""),
@@ -363,11 +363,23 @@ class ApproximatePercentileQuerySuite extends QueryTest with SharedSparkSession 
             |FROM VALUES (0), (1), (2), (10) AS tab(col);
             |""".stripMargin).collect()
       },
-      errorClass = "DATATYPE_MISMATCH.UNEXPECTED_NULL",
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_NULL",
       parameters = Map(
         "exprName" -> "percentage",
         "sqlExpr" -> "\"percentile_approx(col, NULL, 100)\""),
       context = ExpectedContext(
         "", "", 8, 40, "percentile_approx(col, NULL, 100)"))
+  }
+
+  test("SPARK-54750: percentile_approx returns NULL for certain decimal values") {
+    // Regression test: ROUND(PERCENTILE_APPROX(2150/1000.0, 0.95), 3) should return 2.15
+    checkAnswer(
+      spark.sql("SELECT ROUND(PERCENTILE_APPROX(2150 / 1000.0, 0.95), 3) as p95"),
+      Row(2.15)
+    )
+    checkAnswer(
+      spark.sql("SELECT ROUND(PERCENTILE_APPROX(2151 / 1000.0, 0.95), 3) as p95"),
+      Row(2.151)
+    )
   }
 }

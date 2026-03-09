@@ -22,8 +22,10 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.column.ParquetProperties._
-import org.apache.parquet.hadoop.{ParquetFileReader, ParquetOutputFormat}
+import org.apache.parquet.format.converter.ParquetMetadataConverter
+import org.apache.parquet.hadoop.ParquetOutputFormat
 import org.apache.parquet.hadoop.ParquetWriter.DEFAULT_BLOCK_SIZE
+import org.apache.parquet.hadoop.util.HadoopInputFile
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.QueryTest
@@ -43,7 +45,8 @@ class ParquetRowIndexSuite extends QueryTest with SharedSparkSession {
   import testImplicits._
 
   private def readRowGroupRowCounts(path: String): Seq[Long] = {
-    ParquetFileReader.readFooter(spark.sessionState.newHadoopConf(), new Path(path))
+    val inputFile = HadoopInputFile.fromPath(new Path(path), spark.sessionState.newHadoopConf())
+    ParquetFooterReader.readFooter(inputFile, ParquetMetadataConverter.NO_FILTER)
       .getBlocks.asScala.toSeq.map(_.getRowCount)
   }
 
@@ -319,7 +322,7 @@ class ParquetRowIndexSuite extends QueryTest with SharedSparkSession {
             .load(path.getAbsolutePath)
 
           val exception = intercept[SparkException](dfRead.collect())
-          assert(exception.getErrorClass.startsWith("FAILED_READ_FILE"))
+          assert(exception.getCondition.startsWith("FAILED_READ_FILE"))
           assert(exception.getCause.getMessage.contains(
             ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME))
         }

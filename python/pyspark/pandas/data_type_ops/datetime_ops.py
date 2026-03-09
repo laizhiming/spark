@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import CategoricalDtype
 
+from pyspark.loose_version import LooseVersion
 from pyspark.sql import Column, functions as F
 from pyspark.sql.types import (
     BooleanType,
@@ -34,6 +35,7 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.utils import pyspark_column_op
 from pyspark.pandas._typing import Dtype, IndexOpsLike, SeriesOrIndex
+from pyspark.sql.internal import InternalFunction as SF
 from pyspark.pandas.base import IndexOpsMixin
 from pyspark.pandas.data_type_ops.base import (
     DataTypeOps,
@@ -127,6 +129,13 @@ class DatetimeOps(DataTypeOps):
         """Prepare column when from_pandas."""
         return col
 
+    def restore(self, col: pd.Series) -> pd.Series:
+        """Restore column when to_pandas."""
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return col
+        else:
+            return col.astype(self.dtype)
+
     def astype(self, index_ops: IndexOpsLike, dtype: Union[str, type, Dtype]) -> IndexOpsLike:
         dtype, spark_type = pandas_on_spark_type(dtype)
 
@@ -150,10 +159,7 @@ class DatetimeNTZOps(DatetimeOps):
     """
 
     def _cast_spark_column_timestamp_to_long(self, scol: Column) -> Column:
-        from pyspark import SparkContext
-
-        jvm = SparkContext._active_spark_context._jvm
-        return Column(jvm.PythonSQLUtils.castTimestampNTZToLong(scol._jc))
+        return SF.timestamp_ntz_to_long(scol)
 
     def astype(self, index_ops: IndexOpsLike, dtype: Union[str, type, Dtype]) -> IndexOpsLike:
         dtype, spark_type = pandas_on_spark_type(dtype)
@@ -168,4 +174,4 @@ class DatetimeNTZOps(DatetimeOps):
             )
             return index_ops._with_new_scol(scol, field=InternalField(dtype=dtype))
         else:
-            return super(DatetimeNTZOps, self).astype(index_ops, dtype)
+            return super().astype(index_ops, dtype)

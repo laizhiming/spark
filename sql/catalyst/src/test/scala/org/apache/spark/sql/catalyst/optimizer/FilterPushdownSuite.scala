@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
+import java.util.UUID
+
 import org.apache.spark.api.python.PythonEvalType
 import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
 import org.apache.spark.sql.catalyst.dsl.expressions._
@@ -25,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.CalendarInterval
 
@@ -50,10 +53,13 @@ class FilterPushdownSuite extends PlanTest {
   val attrB = $"b".int
   val attrC = $"c".int
   val attrD = $"d".int
+  val attrE = $"e".string
 
   val testRelation = LocalRelation(attrA, attrB, attrC)
 
   val testRelation1 = LocalRelation(attrD)
+
+  val testStringRelation = LocalRelation(attrA, attrB, attrE)
 
   val simpleDisjunctivePredicate =
     ("x.a".attr > 3) && ("y.a".attr > 13) || ("x.a".attr > 1) && ("y.a".attr > 11)
@@ -150,7 +156,7 @@ class FilterPushdownSuite extends PlanTest {
   test("can't push without rewrite") {
     val originalQuery =
       testRelation
-        .select($"a" + $"b" as "e")
+        .select($"a" + $"b" as "e", $"a" - $"b" as "f")
         .where($"e" === 1)
         .analyze
 
@@ -158,8 +164,109 @@ class FilterPushdownSuite extends PlanTest {
     val correctAnswer =
       testRelation
         .where($"a" + $"b" === 1)
-        .select($"a" + $"b" as "e")
+        .select($"a" + $"b" as "e", $"a" - $"b" as "f")
         .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("SPARK-47672: Do double evaluation when configured") {
+    withSQLConf(SQLConf.AVOID_DOUBLE_FILTER_EVAL.key -> "false") {
+      val originalQuery = testStringRelation
+        .select($"a", $"e".rlike("magic") as "f", $"e".rlike("notmagic") as "j", $"b")
+        .where($"a" > 5 && $"f")
+        .analyze
+
+      val optimized = Optimize.execute(originalQuery)
+
+      val correctAnswer = testStringRelation
+        .where($"a" > 5 && $"e".rlike("magic"))
+        .select($"a", $"e".rlike("magic") as "f", $"e".rlike("notmagic") as "j", $"b")
+        .analyze
+
+      comparePlans(optimized, correctAnswer)
+    }
+  }
+
+  test("SPARK-47672: Make sure that we handle the case where everything is expensive") {
+    val originalQuery = testStringRelation
+      .select($"e".rlike("magic") as "f")
+      .where($"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Nothing changes when everything is expensive.
+    val correctAnswer = originalQuery
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  // Case 1: Multiple filters that don't reference any projection aliases - all should be pushed
+  test("SPARK-47672: Case 1 - multiple filters not referencing projection aliases") {
+    val originalQuery = testStringRelation
+      .select($"a" as "c", $"e".rlike("magic") as "f", $"b" as "d", $"a", $"b")
+      .where($"a" > 5 && $"b" < 10)
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Both filters on c and d should be pushed down since they just reference
+    // simple aliases (c->a, d->b) which are inexpensive
+    val correctAnswer = testStringRelation
+      .where($"a" > 5 && $"b" < 10)
+      .select($"a" as "c", $"e".rlike("magic") as "f", $"b" as "d", $"a", $"b")
+      .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  // Case 2: Multiple filters with inexpensive references - all should be pushed
+  test("SPARK-47672: Case 2 - multiple filters with inexpensive alias references") {
+    val originalQuery = testStringRelation
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .where($"sum" > 10 && $"diff" < 5)
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Both sum and diff are inexpensive (arithmetic), so both filters should be pushed
+    val correctAnswer = testStringRelation
+      .where($"a" + $"b" > 10 && $"a" - $"b" < 5)
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  // Case 3: Filter references expensive to compute references.
+  test("SPARK-47672: Avoid double evaluation with projections can't push past certain items") {
+    val originalQuery = testStringRelation
+      .select($"a", $"e".rlike("magic") as "f")
+      .where($"a" > 5 || $"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    comparePlans(optimized, originalQuery)
+  }
+
+  // Combined case 1, 2, and 3 filter pushdown
+  test("SPARK-47672: Case 1, 2, and 3 make sure we leave up and push down correctly.") {
+    val originalQuery = testStringRelation
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .where($"sum" > 10 && $"diff" < 5 && $"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Both sum and diff are inexpensive (arithmetic), so both pushed
+    // rlike magic is expensive so not pushed.
+    val correctAnswer = testStringRelation
+      .where($"a" + $"b" > 10 && $"a" - $"b" < 5)
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .where($"f")
+      .analyze
 
     comparePlans(optimized, correctAnswer)
   }
@@ -1229,9 +1336,10 @@ class FilterPushdownSuite extends PlanTest {
 
     // Verify that all conditions except the watermark touching condition are pushed down
     // by the optimizer and others are not.
-    val originalQuery = EventTimeWatermark($"b", interval, relation)
+    val nodeId = UUID.randomUUID()
+    val originalQuery = EventTimeWatermark(nodeId, $"b", interval, relation)
       .where($"a" === 5 && $"b" === new java.sql.Timestamp(0) && $"c" === 5)
-    val correctAnswer = EventTimeWatermark(
+    val correctAnswer = EventTimeWatermark(nodeId,
       $"b", interval, relation.where($"a" === 5 && $"c" === 5))
       .where($"b" === new java.sql.Timestamp(0))
 
@@ -1244,9 +1352,10 @@ class FilterPushdownSuite extends PlanTest {
 
     // Verify that all conditions except the watermark touching condition are pushed down
     // by the optimizer and others are not.
-    val originalQuery = EventTimeWatermark($"c", interval, relation)
+    val nodeId = UUID.randomUUID()
+    val originalQuery = EventTimeWatermark(nodeId, $"c", interval, relation)
       .where($"a" === 5 && $"b" === Rand(10) && $"c" === new java.sql.Timestamp(0))
-    val correctAnswer = EventTimeWatermark(
+    val correctAnswer = EventTimeWatermark(nodeId,
       $"c", interval, relation.where($"a" === 5))
       .where($"b" === Rand(10) && $"c" === new java.sql.Timestamp(0))
 
@@ -1260,9 +1369,10 @@ class FilterPushdownSuite extends PlanTest {
 
     // Verify that all conditions except the watermark touching condition are pushed down
     // by the optimizer and others are not.
-    val originalQuery = EventTimeWatermark($"c", interval, relation)
+    val nodeId = UUID.randomUUID()
+    val originalQuery = EventTimeWatermark(nodeId, $"c", interval, relation)
       .where($"a" === 5 && $"b" === 10)
-    val correctAnswer = EventTimeWatermark(
+    val correctAnswer = EventTimeWatermark(nodeId,
       $"c", interval, relation.where($"a" === 5 && $"b" === 10))
 
     comparePlans(Optimize.execute(originalQuery.analyze), correctAnswer.analyze,
@@ -1273,9 +1383,10 @@ class FilterPushdownSuite extends PlanTest {
     val interval = new CalendarInterval(2, 2, 2000L)
     val relation = LocalRelation(Seq($"a".timestamp, attrB, attrC), Nil, isStreaming = true)
 
-    val originalQuery = EventTimeWatermark($"a", interval, relation)
+    val nodeId = UUID.randomUUID()
+    val originalQuery = EventTimeWatermark(nodeId, $"a", interval, relation)
       .where($"a" === new java.sql.Timestamp(0) && $"b" === 10)
-    val correctAnswer = EventTimeWatermark(
+    val correctAnswer = EventTimeWatermark(nodeId,
       $"a", interval, relation.where($"b" === 10)).where($"a" === new java.sql.Timestamp(0))
 
     comparePlans(Optimize.execute(originalQuery.analyze), correctAnswer.analyze,

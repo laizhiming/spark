@@ -25,11 +25,16 @@ import org.apache.spark.annotation.Stable
  * @since 1.3.0
  */
 @Stable
-class BooleanType private() extends AtomicType {
+class BooleanType private () extends AtomicType {
+
   /**
    * The default size of a value of the BooleanType is 1 byte.
    */
   override def defaultSize: Int = 1
+
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[BooleanType]
+
+  override def hashCode(): Int = classOf[BooleanType].getSimpleName.hashCode
 
   private[spark] override def asNullable: BooleanType = this
 }

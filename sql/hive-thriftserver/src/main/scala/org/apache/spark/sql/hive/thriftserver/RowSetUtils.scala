@@ -26,7 +26,7 @@ import org.apache.hive.service.rpc.thrift._
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.HiveResult._
-import org.apache.spark.sql.types.{BinaryType, BooleanType, ByteType, DataType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType}
+import org.apache.spark.sql.types.{BinaryType, BooleanType, ByteType, DataType, DoubleType, FloatType, GeographyType, GeometryType, IntegerType, LongType, ShortType, StringType}
 
 object RowSetUtils {
 
@@ -76,11 +76,12 @@ object RowSetUtils {
     val tRowSet = new TRowSet(startRowOffSet, new java.util.ArrayList[TRow](rowSize))
     var i = 0
     val columnSize = schema.length
+    val columns = new java.util.ArrayList[TColumn](columnSize)
     while (i < columnSize) {
-      val tColumn = toTColumn(rows, i, schema(i), timeFormatters, binaryFormatter)
-      tRowSet.addToColumns(tColumn)
+      columns.add(i, toTColumn(rows, i, schema(i), timeFormatters, binaryFormatter))
       i += 1
     }
+    tRowSet.setColumns(columns)
     tRowSet
   }
 
@@ -136,13 +137,21 @@ object RowSetUtils {
         var i = 0
         val rowSize = rows.length
         val values = new java.util.ArrayList[String](rowSize)
-        while (i < rowSize) {
-          val row = rows(i)
+        rows.foreach { row =>
           nulls.set(i, row.isNullAt(ordinal))
           val value = if (row.isNullAt(ordinal)) {
             ""
           } else {
-            toHiveString((row.get(ordinal), typ), nested = true, timeFormatters, binaryFormatter)
+            // In this code path, `nested` was historically set to true for all types by default,
+            // but ideally it should be false in general. This was never a problem because other
+            // types that reach this branch do not use the `nested` flag in `toHiveString`. Now,
+            // Geospatial types use it for wrapping EWKT in quotes when nested = true, so we need
+            // to set `nested` here to false to avoid spurious quotes for standalone geo values.
+            val nested = typ match {
+              case _: GeometryType | _: GeographyType => false
+              case _ => true
+            }
+            toHiveString((row.get(ordinal), typ), nested, timeFormatters, binaryFormatter)
           }
           values.add(value)
           i += 1

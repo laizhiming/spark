@@ -20,9 +20,9 @@ package org.apache.spark.sql.types
 import org.apache.spark.annotation.Unstable
 
 /**
- * The data type representing semi-structured values with arbitrary hierarchical data structures. It
- * is intended to store parsed JSON values and most other data types in the system (e.g., it cannot
- * store a map with a non-string key type).
+ * The data type representing semi-structured values with arbitrary hierarchical data structures.
+ * It is intended to store parsed JSON values and most other data types in the system (e.g., it
+ * cannot store a map with a non-string key type).
  *
  * @since 4.0.0
  */
@@ -31,6 +31,10 @@ class VariantType private () extends AtomicType {
   // The default size is used in query planning to drive optimization decisions. 2048 is arbitrarily
   // picked and we currently don't have any data to support it. This may need revisiting later.
   override def defaultSize: Int = 2048
+
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[VariantType]
+
+  override def hashCode(): Int = classOf[VariantType].getSimpleName.hashCode
 
   /** This is a no-op because values with VARIANT type are always nullable. */
   private[spark] override def asNullable: VariantType = this

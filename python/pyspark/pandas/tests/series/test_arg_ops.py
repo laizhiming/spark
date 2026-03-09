@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 
 import numpy as np
 import pandas as pd
@@ -149,7 +148,7 @@ class SeriesArgOpsMixin:
         self.assert_eq(pser.argmax(), psser.argmax())
         self.assert_eq(pser.argmax(skipna=False), psser.argmax(skipna=False))
 
-        pser2 = pd.Series([np.NaN, 1.0, 2.0, np.NaN])
+        pser2 = pd.Series([np.nan, 1.0, 2.0, np.nan])
         psser2 = ps.from_pandas(pser2)
         self.assert_eq(pser2.argmin(), psser2.argmin())
         self.assert_eq(pser2.argmax(), psser2.argmax())
@@ -182,12 +181,6 @@ class SeriesArgOpsTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.series.test_arg_ops import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

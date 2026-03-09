@@ -43,13 +43,14 @@ from pyspark.sql.types import (  # noqa: F401
 )
 from pyspark.sql.utils import is_timestamp_ntz_preferred, is_remote
 from pyspark import pandas as ps
+from pyspark.sql.internal import InternalFunction as SF
 from pyspark.pandas._typing import Label
 from pyspark.pandas.spark.utils import as_nullable_spark_type, force_decimal_precision_scale
 from pyspark.pandas.data_type_ops.base import DataTypeOps
 from pyspark.pandas.typedef import (
     Dtype,
     as_spark_type,
-    extension_dtypes,
+    handle_dtype_as_extension_dtype,
     infer_pd_series_spark_type,
     spark_type_to_pandas_dtype,
 )
@@ -161,7 +162,7 @@ class InternalField:
     @property
     def is_extension_dtype(self) -> bool:
         """Return whether the dtype for the field is an extension type or not."""
-        return isinstance(self.dtype, extension_dtypes)
+        return handle_dtype_as_extension_dtype(self.dtype)
 
     def normalize_spark_type(self) -> "InternalField":
         """Return a new InternalField object with normalized Spark data type."""
@@ -901,24 +902,14 @@ class InternalFrame:
 
     @staticmethod
     def attach_sequence_column(sdf: PySparkDataFrame, column_name: str) -> PySparkDataFrame:
-        scols = [scol_for(sdf, column) for column in sdf.columns]
         sequential_index = (
             F.row_number().over(Window.orderBy(F.monotonically_increasing_id())).cast("long") - 1
         )
-        return sdf.select(sequential_index.alias(column_name), *scols)
+        return sdf.select(sequential_index.alias(column_name), "*")
 
     @staticmethod
     def attach_distributed_column(sdf: PySparkDataFrame, column_name: str) -> PySparkDataFrame:
-        scols = [scol_for(sdf, column) for column in sdf.columns]
-        # Does not add an alias to avoid having some changes in protobuf definition for now.
-        # The alias is more for query strings in DataFrame.explain, and they are cosmetic changes.
-        if is_remote():
-            return sdf.select(F.monotonically_increasing_id().alias(column_name), *scols)
-        jvm = sdf.sparkSession._jvm
-        tag = jvm.org.apache.spark.sql.catalyst.analysis.FunctionRegistry.FUNC_ALIAS()
-        jexpr = F.monotonically_increasing_id()._jc.expr()
-        jexpr.setTagValue(tag, "distributed_index")
-        return sdf.select(PySparkColumn(jvm.Column(jexpr)).alias(column_name), *scols)
+        return sdf.select(SF.distributed_id().alias(column_name), "*")
 
     @staticmethod
     def attach_distributed_sequence_column(
@@ -939,28 +930,7 @@ class InternalFrame:
         |       2|  c|
         +--------+---+
         """
-        if len(sdf.columns) > 0:
-            if is_remote():
-                from pyspark.sql.connect.column import Column as ConnectColumn
-                from pyspark.sql.connect.expressions import DistributedSequenceID
-
-                return sdf.select(
-                    ConnectColumn(DistributedSequenceID()).alias(column_name),
-                    "*",
-                )
-            else:
-                return PySparkDataFrame(
-                    sdf._jdf.toDF().withSequenceColumn(column_name),
-                    sdf.sparkSession,
-                )
-        else:
-            cnt = sdf.count()
-            if cnt > 0:
-                return default_session().range(cnt).toDF(column_name)
-            else:
-                return default_session().createDataFrame(
-                    [], schema=StructType().add(column_name, data_type=LongType(), nullable=False)
-                )
+        return sdf.select(SF.distributed_sequence_id().alias(column_name), "*")
 
     def spark_column_for(self, label: Label) -> PySparkColumn:
         """Return Spark Column for the given column label."""
@@ -1094,7 +1064,7 @@ class InternalFrame:
     def to_pandas_frame(self) -> pd.DataFrame:
         """Return as pandas DataFrame."""
         sdf = self.to_internal_spark_frame
-        pdf = sdf.toPandas()
+        pdf = sdf._to_pandas(pandasStructHandlingMode="row")
         if len(pdf) == 0 and len(sdf.schema) > 0:
             pdf = pdf.astype(
                 {field.name: spark_type_to_pandas_dtype(field.dataType) for field in sdf.schema}
@@ -1230,10 +1200,10 @@ class InternalFrame:
 
         :param spark_frame: the new Spark DataFrame
         :param index_fields: the new InternalFields for the index columns.
-                             If None, the original dtyeps are used.
+                             If None, the original dtypes are used.
         :param data_columns: the new column names. If None, the original one is used.
         :param data_fields: the new InternalFields for the data columns.
-                            If None, the original dtyeps are used.
+                            If None, the original dtypes are used.
         :return: the copied InternalFrame.
         """
         if index_fields is None:
@@ -1592,7 +1562,7 @@ class InternalFrame:
         pdf = pdf.copy()
 
         data_columns = [name_like_string(col) for col in pdf.columns]
-        pdf.columns = data_columns
+        pdf.columns = pd.Index(data_columns)
 
         if retain_index:
             index_nlevels = pdf.index.nlevels

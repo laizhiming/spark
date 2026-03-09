@@ -27,11 +27,16 @@ import org.apache.spark.annotation.Stable
  * @since 1.3.0
  */
 @Stable
-class DoubleType private() extends FractionalType {
+class DoubleType private () extends FractionalType {
+
   /**
    * The default size of a value of the DoubleType is 8 bytes.
    */
   override def defaultSize: Int = 8
+
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[DoubleType]
+
+  override def hashCode(): Int = classOf[DoubleType].getSimpleName.hashCode
 
   private[spark] override def asNullable: DoubleType = this
 }

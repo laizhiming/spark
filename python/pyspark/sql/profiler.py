@@ -15,10 +15,25 @@
 # limitations under the License.
 #
 from abc import ABC, abstractmethod
+from io import StringIO
+import cProfile
 import os
 import pstats
 from threading import RLock
-from typing import Dict, Optional, TYPE_CHECKING
+from types import CodeType, TracebackType
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
+    overload,
+)
+import warnings
 
 from pyspark.accumulators import (
     Accumulator,
@@ -27,7 +42,13 @@ from pyspark.accumulators import (
     _accumulatorRegistry,
 )
 from pyspark.errors import PySparkValueError
-from pyspark.profiler import CodeMapDict, MemoryProfiler, MemUsageParam, PStatsParam
+from pyspark.profiler import (
+    CodeMapDict,
+    MemoryProfiler,
+    MemUsageParam,
+    PStatsParam,
+    has_memory_profiler,
+)
 
 if TYPE_CHECKING:
     from pyspark.sql._typing import ProfileResults
@@ -67,6 +88,93 @@ class _ProfileResultsParam(AccumulatorParam[Optional["ProfileResults"]]):
 ProfileResultsParam = _ProfileResultsParam()
 
 
+class WorkerPerfProfiler:
+    """
+    PerfProfiler is a profiler for performance profiling.
+    """
+
+    def __init__(
+        self, accumulator: Accumulator[Optional["ProfileResults"]], result_key: Union[int, str]
+    ) -> None:
+        self._accumulator = accumulator
+        self._profiler = cProfile.Profile()
+        self._result_key = result_key
+
+    def start(self) -> None:
+        self._profiler.enable()
+
+    def stop(self) -> None:
+        self._profiler.disable()
+
+    def save(self) -> None:
+        st = pstats.Stats(self._profiler, stream=None)
+        # make it picklable
+        st.stream = None  # type: ignore[attr-defined]
+        st.strip_dirs()
+        self._accumulator.add({self._result_key: (st, None)})
+
+    def __enter__(self) -> "WorkerPerfProfiler":
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.stop()
+        self.save()
+
+
+class WorkerMemoryProfiler:
+    """
+    MemoryProfiler is a profiler for memory profiling.
+    """
+
+    def __init__(
+        self,
+        accumulator: Accumulator[Optional["ProfileResults"]],
+        result_key: Union[int, str],
+        func_or_code: Union[Callable, CodeType],
+    ) -> None:
+        from pyspark.profiler import UDFLineProfilerV2
+
+        self._accumulator = accumulator
+        self._profiler = UDFLineProfilerV2()
+        if isinstance(func_or_code, CodeType):
+            self._profiler.add_code(func_or_code)
+        else:
+            self._profiler.add_function(func_or_code)
+        self._result_key = result_key
+
+    def start(self) -> None:
+        self._profiler.enable_by_count()
+
+    def stop(self) -> None:
+        self._profiler.disable_by_count()
+
+    def save(self) -> None:
+        codemap_dict = {
+            filename: list(line_iterator)
+            for filename, line_iterator in self._profiler.code_map.items()
+        }
+        self._accumulator.add({self._result_key: (None, codemap_dict)})
+
+    def __enter__(self) -> "WorkerMemoryProfiler":
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.stop()
+        self.save()
+
+
 class ProfilerCollector(ABC):
     """
     A base class of profiler collectors for session based profilers.
@@ -78,7 +186,12 @@ class ProfilerCollector(ABC):
     def __init__(self) -> None:
         self._lock = RLock()
 
-    def show_perf_profiles(self, id: Optional[int] = None) -> None:
+    def _sorted_keys(self, keys: Iterable[Union[int, str]]) -> list[Union[int, str]]:
+        int_keys = sorted(x for x in keys if isinstance(x, int))
+        str_keys = sorted(x for x in keys if isinstance(x, str))
+        return str_keys + int_keys
+
+    def show_perf_profiles(self, id: Optional[Union[int, str]] = None) -> None:
         """
         Show the perf profile results.
 
@@ -92,22 +205,25 @@ class ProfilerCollector(ABC):
         with self._lock:
             stats = self._perf_profile_results
 
-        def show(id: int) -> None:
+        def show(id: Union[int, str]) -> None:
             s = stats.get(id)
             if s is not None:
                 print("=" * 60)
-                print(f"Profile of UDF<id={id}>")
+                if isinstance(id, str):
+                    print(f"Profile of {id}")
+                else:
+                    print(f"Profile of UDF<id={id}>")
                 print("=" * 60)
                 s.sort_stats("time", "cumulative").print_stats()
 
         if id is not None:
             show(id)
         else:
-            for id in sorted(stats.keys()):
+            for id in self._sorted_keys(stats.keys()):
                 show(id)
 
     @property
-    def _perf_profile_results(self) -> Dict[int, pstats.Stats]:
+    def _perf_profile_results(self) -> Dict[Union[int, str], pstats.Stats]:
         with self._lock:
             return {
                 result_id: perf
@@ -115,7 +231,7 @@ class ProfilerCollector(ABC):
                 if perf is not None
             }
 
-    def show_memory_profiles(self, id: Optional[int] = None) -> None:
+    def show_memory_profiles(self, id: Optional[Union[int, str]] = None) -> None:
         """
         Show the memory profile results.
 
@@ -129,22 +245,31 @@ class ProfilerCollector(ABC):
         with self._lock:
             code_map = self._memory_profile_results
 
-        def show(id: int) -> None:
+        if not has_memory_profiler and not code_map:
+            warnings.warn(
+                "Install the 'memory_profiler' library in the cluster to enable memory profiling",
+                UserWarning,
+            )
+
+        def show(id: Union[int, str]) -> None:
             cm = code_map.get(id)
             if cm is not None:
                 print("=" * 60)
-                print(f"Profile of UDF<id={id}>")
+                if isinstance(id, str):
+                    print(f"Profile of {id}")
+                else:
+                    print(f"Profile of UDF<id={id}>")
                 print("=" * 60)
                 MemoryProfiler._show_results(cm)
 
         if id is not None:
             show(id)
         else:
-            for id in sorted(code_map.keys()):
+            for id in self._sorted_keys(code_map.keys()):
                 show(id)
 
     @property
-    def _memory_profile_results(self) -> Dict[int, CodeMapDict]:
+    def _memory_profile_results(self) -> Dict[Union[int, str], CodeMapDict]:
         with self._lock:
             return {
                 result_id: mem
@@ -160,7 +285,7 @@ class ProfilerCollector(ABC):
         """
         ...
 
-    def dump_perf_profiles(self, path: str, id: Optional[int] = None) -> None:
+    def dump_perf_profiles(self, path: str, id: Optional[Union[int, str]] = None) -> None:
         """
         Dump the perf profile results into directory `path`.
 
@@ -170,28 +295,27 @@ class ProfilerCollector(ABC):
         ----------
         path: str
             A directory in which to dump the perf profile.
-        id : int, optional
+        id : int or str, optional
             A UDF ID to be shown. If not specified, all the results will be shown.
         """
         with self._lock:
             stats = self._perf_profile_results
 
-        def dump(id: int) -> None:
+        def dump(id: Union[int, str]) -> None:
             s = stats.get(id)
 
             if s is not None:
-                if not os.path.exists(path):
-                    os.makedirs(path)
+                os.makedirs(path, exist_ok=True)
                 p = os.path.join(path, f"udf_{id}_perf.pstats")
                 s.dump_stats(p)
 
         if id is not None:
             dump(id)
         else:
-            for id in sorted(stats.keys()):
+            for id in self._sorted_keys(stats.keys()):
                 dump(id)
 
-    def dump_memory_profiles(self, path: str, id: Optional[int] = None) -> None:
+    def dump_memory_profiles(self, path: str, id: Optional[Union[int, str]] = None) -> None:
         """
         Dump the memory profile results into directory `path`.
 
@@ -201,18 +325,23 @@ class ProfilerCollector(ABC):
         ----------
         path: str
             A directory in which to dump the memory profile.
-        id : int, optional
+        id : int or str, optional
             A UDF ID to be shown. If not specified, all the results will be shown.
         """
         with self._lock:
             code_map = self._memory_profile_results
 
-        def dump(id: int) -> None:
+        if not has_memory_profiler and not code_map:
+            warnings.warn(
+                "Install the 'memory_profiler' library in the cluster to enable memory profiling",
+                UserWarning,
+            )
+
+        def dump(id: Union[int, str]) -> None:
             cm = code_map.get(id)
 
             if cm is not None:
-                if not os.path.exists(path):
-                    os.makedirs(path)
+                os.makedirs(path, exist_ok=True)
                 p = os.path.join(path, f"udf_{id}_memory.txt")
 
                 with open(p, "w+") as f:
@@ -221,10 +350,10 @@ class ProfilerCollector(ABC):
         if id is not None:
             dump(id)
         else:
-            for id in sorted(code_map.keys()):
+            for id in self._sorted_keys(code_map.keys()):
                 dump(id)
 
-    def clear_perf_profiles(self, id: Optional[int] = None) -> None:
+    def clear_perf_profiles(self, id: Optional[Union[int, str]] = None) -> None:
         """
         Clear the perf profile results.
 
@@ -232,7 +361,7 @@ class ProfilerCollector(ABC):
 
         Parameters
         ----------
-        id : int, optional
+        id : int or str, optional
             The UDF ID whose profiling results should be cleared.
             If not specified, all the results will be cleared.
         """
@@ -249,7 +378,7 @@ class ProfilerCollector(ABC):
                     if mem is None:
                         self._profile_results.pop(id, None)
 
-    def clear_memory_profiles(self, id: Optional[int] = None) -> None:
+    def clear_memory_profiles(self, id: Optional[Union[int, str]] = None) -> None:
         """
         Clear the memory profile results.
 
@@ -257,7 +386,7 @@ class ProfilerCollector(ABC):
 
         Parameters
         ----------
-        id : int, optional
+        id : int or str, optional
             The UDF ID whose profiling results should be cleared.
             If not specified, all the results will be cleared.
         """
@@ -296,13 +425,13 @@ class Profile:
     """User-facing profile API. This instance can be accessed by
     :attr:`spark.profile`.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     def __init__(self, profiler_collector: ProfilerCollector):
         self.profiler_collector = profiler_collector
 
-    def show(self, id: Optional[int] = None, *, type: Optional[str] = None) -> None:
+    def show(self, id: Optional[Union[int, str]] = None, *, type: Optional[str] = None) -> None:
         """
         Show the profile results.
 
@@ -310,10 +439,16 @@ class Profile:
 
         Parameters
         ----------
-        id : int, optional
+        id : int or str, optional
             A UDF ID to be shown. If not specified, all the results will be shown.
         type : str, optional
             The profiler type, which can be either "perf" or "memory".
+
+        Notes
+        -----
+        The results are gathered from all Python executions. For example, if there are
+        8 tasks, each processing 1,000 rows, the total output will display the results
+        for 8,000 rows.
         """
         if type == "memory":
             self.profiler_collector.show_memory_profiles(id)
@@ -323,14 +458,16 @@ class Profile:
                 self.profiler_collector.show_memory_profiles(id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
             )
 
-    def dump(self, path: str, id: Optional[int] = None, *, type: Optional[str] = None) -> None:
+    def dump(
+        self, path: str, id: Optional[Union[int, str]] = None, *, type: Optional[str] = None
+    ) -> None:
         """
         Dump the profile results into directory `path`.
 
@@ -340,7 +477,7 @@ class Profile:
         ----------
         path: str
             A directory in which to dump the profile.
-        id : int, optional
+        id : int or str, optional
             A UDF ID to be shown. If not specified, all the results will be shown.
         type : str, optional
             The profiler type, which can be either "perf" or "memory".
@@ -353,14 +490,103 @@ class Profile:
                 self.profiler_collector.dump_memory_profiles(path, id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
             )
 
-    def clear(self, id: Optional[int] = None, *, type: Optional[str] = None) -> None:
+    @overload
+    def render(
+        self, id: Union[int, str], *, type: Optional[str] = None, renderer: Optional[str] = None
+    ) -> Any:
+        ...
+
+    @overload
+    def render(
+        self,
+        id: Union[int, str],
+        *,
+        type: Optional[Literal["perf"]],
+        renderer: Callable[[pstats.Stats], Any],
+    ) -> Any:
+        ...
+
+    @overload
+    def render(
+        self,
+        id: Union[int, str],
+        *,
+        type: Literal["memory"],
+        renderer: Callable[[CodeMapDict], Any],
+    ) -> Any:
+        ...
+
+    def render(
+        self,
+        id: Union[int, str],
+        *,
+        type: Optional[str] = None,
+        renderer: Optional[
+            Union[str, Callable[[pstats.Stats], Any], Callable[[CodeMapDict], Any]]
+        ] = None,
+    ) -> Any:
+        """
+        Render the profile results.
+
+        .. versionadded:: 4.0.0
+
+        Parameters
+        ----------
+        id : int or str
+            The UDF ID whose profiling results should be rendered.
+        type : str, optional
+            The profiler type to render results for, which can be either "perf" or "memory".
+            If not specified, defaults to "perf".
+        renderer : str or callable, optional
+            The renderer to use. If not specified, the default renderer will be "flameprof"
+            for the "perf" profiler, which returns an :class:`IPython.display.HTML` object in
+            an IPython environment to draw the figure; otherwise, it returns the SVG source string.
+            For the "memory" profiler, no default renderer is provided.
+
+            If a callable is provided, it should take a `pstats.Stats` object for "perf" profiler,
+            and `CodeMapDict` for "memory" profiler, and return the rendered result.
+        """
+        result: Optional[Union[pstats.Stats, CodeMapDict]]
+        if type is None:
+            type = "perf"
+        if type == "perf":
+            result = self.profiler_collector._perf_profile_results.get(id)
+        elif type == "memory":
+            result = self.profiler_collector._memory_profile_results.get(id)
+        else:
+            raise PySparkValueError(
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
+                    "arg_name": "type",
+                    "allowed_values": str(["perf", "memory"]),
+                },
+            )
+
+        render: Optional[Union[Callable[[pstats.Stats], Any], Callable[[CodeMapDict], Any]]] = None
+        if renderer is None or isinstance(renderer, str):
+            render = _renderers.get((type, renderer))
+        elif callable(renderer):
+            render = renderer
+        if render is None:
+            raise PySparkValueError(
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
+                    "arg_name": "(type, renderer)",
+                    "allowed_values": str(list(_renderers.keys())),
+                },
+            )
+
+        if result is not None:
+            return render(result)  # type:ignore[arg-type]
+
+    def clear(self, id: Optional[Union[int, str]] = None, *, type: Optional[str] = None) -> None:
         """
         Clear the profile results.
 
@@ -368,7 +594,7 @@ class Profile:
 
         Parameters
         ----------
-        id : int, optional
+        id : int or str, optional
             The UDF ID whose profiling results should be cleared.
             If not specified, all the results will be cleared.
         type : str, optional
@@ -382,9 +608,45 @@ class Profile:
                 self.profiler_collector.clear_memory_profiles(id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
             )
+
+
+def _render_flameprof(stats: pstats.Stats) -> Any:
+    try:
+        from flameprof import render
+    except ImportError:
+        raise PySparkValueError(
+            errorClass="PACKAGE_NOT_INSTALLED",
+            messageParameters={"package_name": "flameprof", "minimum_version": "0.4"},
+        )
+
+    buf = StringIO()
+    render(stats.stats, buf)  # type: ignore[attr-defined]
+    svg = buf.getvalue()
+
+    try:
+        import IPython
+
+        ipython = IPython.get_ipython()
+    except ImportError:
+        ipython = None
+
+    if ipython:
+        from IPython.display import HTML
+
+        return HTML(svg)
+    else:
+        return svg
+
+
+_renderers: Dict[
+    Tuple[str, Optional[str]], Union[Callable[[pstats.Stats], Any], Callable[[CodeMapDict], Any]]
+] = {
+    ("perf", None): _render_flameprof,
+    ("perf", "flameprof"): _render_flameprof,
+}

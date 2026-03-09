@@ -24,10 +24,12 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.ResolvedTable
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.{escapeSingleQuotedString, CharVarcharUtils}
 import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Table, TableCatalog}
 import org.apache.spark.sql.connector.expressions.BucketTransform
 import org.apache.spark.sql.execution.LeafExecNode
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.unsafe.types.UTF8String
 
 /**
@@ -57,14 +59,19 @@ case class ShowCreateTableExec(
     showTableOptions(builder, tableOptions)
     showTablePartitioning(table, builder)
     showTableComment(table, builder)
+    showTableCollation(table, builder)
     showTableLocation(table, builder)
     showTableProperties(table, builder, tableOptions)
   }
 
   private def showTableDataColumns(table: Table, builder: StringBuilder): Unit = {
     import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
-    val columns = CharVarcharUtils.getRawSchema(table.columns.asSchema, conf).fields.map(_.toDDL)
-    builder ++= concatByMultiLines(columns)
+    val rawSchema = CharVarcharUtils.getRawSchema(table.columns.asSchema, conf)
+    val schemaWithExplicitCollations = DataTypeUtils.replaceNonCollatedTypesWithExplicitUTF8Binary(
+        rawSchema).asInstanceOf[StructType]
+    val columns = schemaWithExplicitCollations.fields.map(_.toDDL)
+    val constraints = table.constraints().map(_.toDDL)
+    builder ++= concatByMultiLines(columns ++ constraints)
   }
 
   private def showTableUsing(table: Table, builder: StringBuilder): Unit = {
@@ -120,7 +127,7 @@ case class ShowCreateTableExec(
   private def showTableLocation(table: Table, builder: StringBuilder): Unit = {
     val isManagedOption = Option(table.properties.get(TableCatalog.PROP_IS_MANAGED_LOCATION))
     // Only generate LOCATION clause if it's not managed.
-    if (isManagedOption.forall(_.equalsIgnoreCase("false"))) {
+    if (isManagedOption.isEmpty || !isManagedOption.get.equalsIgnoreCase("true")) {
       Option(table.properties.get(TableCatalog.PROP_LOCATION))
         .map("LOCATION '" + escapeSingleQuotedString(_) + "'\n")
         .foreach(builder.append)
@@ -153,6 +160,11 @@ case class ShowCreateTableExec(
     Option(table.properties.get(TableCatalog.PROP_COMMENT))
       .map("COMMENT '" + escapeSingleQuotedString(_) + "'\n")
       .foreach(builder.append)
+  }
+
+  private def showTableCollation(table: Table, builder: StringBuilder): Unit = {
+    Option(table.properties.get(TableCatalog.PROP_COLLATION))
+      .map("DEFAULT COLLATION " + _ + "\n").foreach(builder.append)
   }
 
   private def concatByMultiLines(iter: Iterable[String]): String = {

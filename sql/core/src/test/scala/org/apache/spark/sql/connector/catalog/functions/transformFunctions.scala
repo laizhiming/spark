@@ -84,6 +84,7 @@ object UnboundBucketFunction extends UnboundFunction {
   override def name(): String = "bucket"
 }
 
+// the result should be consistent with BucketTransform defined at InMemoryBaseTable.scala
 object BucketFunction extends ScalarFunction[Int] with ReducibleFunction[Int, Int] {
   override def inputTypes(): Array[DataType] = Array(IntegerType, LongType)
   override def resultType(): DataType = IntegerType
@@ -91,7 +92,7 @@ object BucketFunction extends ScalarFunction[Int] with ReducibleFunction[Int, In
   override def canonicalName(): String = name()
   override def toString: String = name()
   override def produceResult(input: InternalRow): Int = {
-    (input.getLong(1) % input.getInt(0)).toInt
+    Math.floorMod(input.getLong(1), input.getInt(0))
   }
 
   override def reducer(
@@ -101,8 +102,8 @@ object BucketFunction extends ScalarFunction[Int] with ReducibleFunction[Int, In
 
     if (otherFunc == BucketFunction) {
       val gcd = this.gcd(thisNumBuckets, otherNumBuckets)
-      if (gcd != thisNumBuckets) {
-        return BucketReducer(thisNumBuckets, gcd)
+      if (gcd > 1 && gcd != thisNumBuckets) {
+        return BucketReducer(gcd)
       }
     }
     null
@@ -111,7 +112,7 @@ object BucketFunction extends ScalarFunction[Int] with ReducibleFunction[Int, In
   private def gcd(a: Int, b: Int): Int = BigInt(a).gcd(BigInt(b)).toInt
 }
 
-case class BucketReducer(thisNumBuckets: Int, divisor: Int) extends Reducer[Int, Int] {
+case class BucketReducer(divisor: Int) extends Reducer[Int, Int] {
   override def reduce(bucket: Int): Int = bucket % divisor
 }
 

@@ -37,7 +37,7 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.TestUtils._
 import org.apache.spark.api.plugin.{DriverPlugin, ExecutorPlugin, PluginContext, SparkPlugin}
-import org.apache.spark.internal.config.PLUGINS
+import org.apache.spark.internal.config.{EXECUTOR_MEMORY, PLUGINS}
 import org.apache.spark.resource._
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
@@ -322,6 +322,8 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
       when(executor.threadPool).thenReturn(threadPool)
       val runningTasks = new ConcurrentHashMap[Long, Executor#TaskRunner]
       when(executor.runningTasks).thenAnswer(_ => runningTasks)
+      val killMarks = spy(new ConcurrentHashMap[Long, Long])
+      when(executor.killMarks).thenAnswer(_ => killMarks)
       when(executor.conf).thenReturn(conf)
 
       def getFakeTaskRunner(taskDescription: TaskDescription): Executor#TaskRunner = {
@@ -417,6 +419,8 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
       val runningTasks = spy[ConcurrentHashMap[Long, Executor#TaskRunner]](
         new ConcurrentHashMap[Long, Executor#TaskRunner])
       when(executor.runningTasks).thenAnswer(_ => runningTasks)
+      val killMarks = spy(new ConcurrentHashMap[Long, Long])
+      when(executor.killMarks).thenAnswer(_ => killMarks)
       when(executor.conf).thenReturn(conf)
 
       // We don't really verify the data, just pass it around.
@@ -509,6 +513,8 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
       val runningTasks = spy[ConcurrentHashMap[Long, Executor#TaskRunner]](
         new ConcurrentHashMap[Long, Executor#TaskRunner])
       when(executor.runningTasks).thenAnswer(_ => runningTasks)
+      val killMarks = spy(new ConcurrentHashMap[Long, Long])
+      when(executor.killMarks).thenAnswer(_ => killMarks)
       when(executor.conf).thenReturn(conf)
 
       // We don't really verify the data, just pass it around.
@@ -581,7 +587,8 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
    */
   test("SPARK-40320 Executor should exit when initialization failed for fatal error") {
     val conf = createSparkConf()
-      .setMaster("local-cluster[1, 1, 1024]")
+      .setMaster("local-cluster[1, 1, 512]")
+      .set(EXECUTOR_MEMORY.key, "512m")
       .set(PLUGINS, Seq(classOf[TestFatalErrorPlugin].getName))
       .setAppName("test")
     sc = new SparkContext(conf)
@@ -599,7 +606,7 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
     }
     try {
       sc.addSparkListener(listener)
-      eventually(timeout(15.seconds)) {
+      eventually(timeout(30.seconds)) {
         assert(executorAddCounter.get() >= 2)
         assert(executorRemovedCounter.get() >= 2)
       }

@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.util
 
 import scala.collection.mutable
 
-import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
@@ -32,6 +32,16 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
 
   // visible for testing
   private[sql] val CHAR_VARCHAR_TYPE_STRING_METADATA_KEY = "__CHAR_VARCHAR_TYPE_STRING"
+
+  /**
+   * Creates a StringRPad expression with the pad literal inheriting the collation from the
+   * str expression's data type. This is necessary because StringRPad may be created after
+   * CollationTypeCasts has run, so the default pad with StringType companion object would
+   * not get its collation coerced to match the str expression.
+   */
+  private[sql] def createStringRPad(str: Expression, len: Expression): StringRPad = {
+    StringRPad(str, len, Literal.create(" ", str.dataType))
+  }
 
   /**
    * Replaces CharType/VarcharType with StringType recursively in the given struct type. If a
@@ -63,7 +73,7 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
       StructType(fields.map { field =>
         field.copy(dataType = replaceCharWithVarchar(field.dataType))
       })
-    case CharType(length) => VarcharType(length)
+    case c: CharType => VarcharType(c.length, c.collation)
     case _ => dt
   }
 
@@ -74,7 +84,7 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
   def replaceCharVarcharWithStringForCast(dt: DataType): DataType = {
     if (SQLConf.get.charVarcharAsString) {
       replaceCharVarcharWithString(dt)
-    } else if (hasCharVarchar(dt)) {
+    } else if (hasCharVarchar(dt) && !SQLConf.get.preserveCharVarcharTypeInfo) {
       logWarning(log"The Spark cast operator does not support char/varchar type and simply treats" +
         log" them as string type. Please use string type directly to avoid confusion. Otherwise," +
         log" you can set ${MDC(CONFIG, SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key)} " +
@@ -90,9 +100,18 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
    * the given attribute's metadata.
    */
   def cleanAttrMetadata(attr: AttributeReference): AttributeReference = {
-    val cleaned = new MetadataBuilder().withMetadata(attr.metadata)
-      .remove(CHAR_VARCHAR_TYPE_STRING_METADATA_KEY).build()
-    attr.withMetadata(cleaned)
+    attr.withMetadata(cleanMetadata(attr.metadata))
+  }
+
+  /**
+   * Removes the metadata entry that contains the original type string of CharType/VarcharType from
+   * the given metadata.
+   */
+  def cleanMetadata(metadata: Metadata): Metadata = {
+    new MetadataBuilder()
+      .withMetadata(metadata)
+      .remove(CHAR_VARCHAR_TYPE_STRING_METADATA_KEY)
+      .build()
   }
 
   def getRawTypeString(metadata: Metadata): Option[String] = {
@@ -161,20 +180,28 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
       charFuncName: Option[String],
       varcharFuncName: Option[String]): Expression = {
     dt match {
-      case CharType(length) if charFuncName.isDefined =>
+      case c: CharType if charFuncName.isDefined =>
         StaticInvoke(
           classOf[CharVarcharCodegenUtils],
-          StringType,
+          if (SQLConf.get.preserveCharVarcharTypeInfo) {
+            c
+          } else {
+            c.toStringType
+          },
           charFuncName.get,
-          expr :: Literal(length) :: Nil,
+          expr :: Literal(c.length) :: Nil,
           returnNullable = false)
 
-      case VarcharType(length) if varcharFuncName.isDefined =>
+      case v: VarcharType if varcharFuncName.isDefined =>
         StaticInvoke(
           classOf[CharVarcharCodegenUtils],
-          StringType,
+          if (SQLConf.get.preserveCharVarcharTypeInfo) {
+            v
+          } else {
+            v.toStringType
+          },
           varcharFuncName.get,
-          expr :: Literal(length) :: Nil,
+          expr :: Literal(v.length) :: Nil,
           returnNullable = false)
 
       case StructType(fields) =>
@@ -240,22 +267,22 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
    * attributes. When comparing two char type columns/fields, we need to pad the shorter one to
    * the longer length.
    */
-  def addPaddingInStringComparison(attrs: Seq[Attribute]): Seq[Expression] = {
+  def addPaddingInStringComparison(attrs: Seq[Attribute], alwaysPad: Boolean): Seq[Expression] = {
     val rawTypes = attrs.map(attr => getRawType(attr.metadata))
     if (rawTypes.exists(_.isEmpty)) {
       attrs
     } else {
       val typeWithTargetCharLength = rawTypes.map(_.get).reduce(typeWithWiderCharLength)
       attrs.zip(rawTypes.map(_.get)).map { case (attr, rawType) =>
-        padCharToTargetLength(attr, rawType, typeWithTargetCharLength).getOrElse(attr)
+        padCharToTargetLength(attr, rawType, typeWithTargetCharLength, alwaysPad).getOrElse(attr)
       }
     }
   }
 
   private def typeWithWiderCharLength(type1: DataType, type2: DataType): DataType = {
     (type1, type2) match {
-      case (CharType(len1), CharType(len2)) =>
-        CharType(math.max(len1, len2))
+      case (c1: CharType, c2: CharType) =>
+        CharType(math.max(c1.length, c2.length), c1.collation)
       case (StructType(fields1), StructType(fields2)) =>
         assert(fields1.length == fields2.length)
         StructType(fields1.zip(fields2).map { case (left, right) =>
@@ -270,10 +297,11 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
   private def padCharToTargetLength(
       expr: Expression,
       rawType: DataType,
-      typeWithTargetCharLength: DataType): Option[Expression] = {
+      typeWithTargetCharLength: DataType,
+      alwaysPad: Boolean): Option[Expression] = {
     (rawType, typeWithTargetCharLength) match {
-      case (CharType(len), CharType(target)) if target > len =>
-        Some(StringRPad(expr, Literal(target)))
+      case (c: CharType, t: CharType) if alwaysPad || t.length > c.length =>
+        Some(createStringRPad(expr, Literal(t.length)))
 
       case (StructType(fields), StructType(targets)) =>
         assert(fields.length == targets.length)
@@ -283,7 +311,8 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
         while (i < fields.length) {
           val field = fields(i)
           val fieldExpr = GetStructField(expr, i, Some(field.name))
-          val padded = padCharToTargetLength(fieldExpr, field.dataType, targets(i).dataType)
+          val padded = padCharToTargetLength(
+            fieldExpr, field.dataType, targets(i).dataType, alwaysPad)
           needPadding = padded.isDefined
           createStructExprs += Literal(field.name)
           createStructExprs += padded.getOrElse(fieldExpr)
@@ -293,7 +322,7 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
 
       case (ArrayType(et, containsNull), ArrayType(target, _)) =>
         val param = NamedLambdaVariable("x", replaceCharVarcharWithString(et), containsNull)
-        padCharToTargetLength(param, et, target).map { padded =>
+        padCharToTargetLength(param, et, target, alwaysPad).map { padded =>
           val func = LambdaFunction(padded, Seq(param))
           ArrayTransform(expr, func)
         }

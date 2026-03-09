@@ -141,18 +141,20 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
   }
 
   test("undefined function") {
-    checkError(
-      exception = intercept[AnalysisException](
-        sql("SELECT testcat.non_exist('abc')").collect()
-      ),
-      errorClass = "UNRESOLVED_ROUTINE",
-      parameters = Map(
-        "routineName" -> "`testcat`.`non_exist`",
-        "searchPath" -> "[`system`.`builtin`, `system`.`session`, `testcat`.`default`]"),
-      context = ExpectedContext(
-        fragment = "testcat.non_exist('abc')",
-        start = 7,
-        stop = 30))
+    withSQLConf(SQLConf.DEFAULT_CATALOG.key -> "testcat") {
+      checkError(
+        exception = intercept[AnalysisException](
+          sql("SELECT testcat.non_exist('abc')").collect()
+        ),
+        condition = "UNRESOLVED_ROUTINE",
+        parameters = Map(
+          "routineName" -> "`testcat`.`non_exist`",
+          "searchPath" -> "[`system`.`builtin`, `system`.`session`, `testcat`]"),
+        context = ExpectedContext(
+          fragment = "testcat.non_exist('abc')",
+          start = 7,
+          stop = 30))
+    }
   }
 
   test("non-function catalog") {
@@ -161,8 +163,8 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
         exception = intercept[AnalysisException](
           sql("SELECT testcat.strlen('abc')").collect()
         ),
-        errorClass = "_LEGACY_ERROR_TEMP_1184",
-        parameters = Map("plugin" -> "testcat", "ability" -> "functions")
+        condition = "MISSING_CATALOG_ABILITY.FUNCTIONS",
+        parameters = Map("plugin" -> "testcat")
       )
     }
   }
@@ -174,21 +176,18 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
       exception = intercept[AnalysisException] {
         sql("DESCRIBE FUNCTION testcat.abc")
       },
-      errorClass = "_LEGACY_ERROR_TEMP_1184",
-      parameters = Map(
-        "plugin" -> "testcat",
-        "ability" -> "functions"
-      )
+      condition = "MISSING_CATALOG_ABILITY.FUNCTIONS",
+      parameters = Map("plugin" -> "testcat")
     )
 
     checkError(
       exception = intercept[AnalysisException] {
         sql("DESCRIBE FUNCTION default.ns1.ns2.fun")
       },
-      errorClass = "REQUIRES_SINGLE_PART_NAMESPACE",
+      condition = "REQUIRES_SINGLE_PART_NAMESPACE",
       parameters = Map(
         "sessionCatalog" -> "spark_catalog",
-        "namespace" -> "`default`.`ns1`.`ns2`")
+        "identifier" -> "`default`.`ns1`.`ns2`.`fun`")
     )
   }
 
@@ -200,10 +199,20 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
     }
     assert(e.message.contains("Catalog testcat does not support DROP FUNCTION"))
 
-    val e1 = intercept[AnalysisException] {
-      sql("DROP FUNCTION default.ns1.ns2.fun")
-    }
-    assert(e1.message.contains("requires a single-part namespace"))
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("DROP FUNCTION default.ns1.ns2.fun")
+      },
+      condition = "REQUIRES_SINGLE_PART_NAMESPACE",
+      parameters = Map(
+        "sessionCatalog" -> "spark_catalog",
+        "identifier" -> "`default`.`ns1`.`ns2`.`fun`")
+    )
+  }
+
+  test("DROP FUNCTION IF EXISTS in non-existing namespace should not fail") {
+    // This should not throw any exception - the namespace doesn't exist but IF EXISTS is specified
+    sql("DROP FUNCTION IF EXISTS non_existing_db.non_existing_func")
   }
 
   test("CREATE FUNCTION: only support session catalog") {
@@ -226,10 +235,15 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
     }
     assert(e.message.contains("Catalog testcat does not support REFRESH FUNCTION"))
 
-    val e1 = intercept[AnalysisException] {
-      sql("REFRESH FUNCTION default.ns1.ns2.fun")
-    }
-    assert(e1.message.contains("requires a single-part namespace"))
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION default.ns1.ns2.fun")
+      },
+      condition = "REQUIRES_SINGLE_PART_NAMESPACE",
+      parameters = Map(
+        "sessionCatalog" -> "spark_catalog",
+        "identifier" -> "`default`.`ns1`.`ns2`.`fun`")
+    )
   }
 
   test("built-in with non-function catalog should still work") {
@@ -343,7 +357,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
 
     checkError(
       exception = intercept[AnalysisException](sql("SELECT testcat.ns.strlen(42)")),
-      errorClass = "_LEGACY_ERROR_TEMP_1198",
+      condition = "_LEGACY_ERROR_TEMP_1198",
       parameters = Map(
         "unbound" -> "strlen",
         "arguments" -> "int",
@@ -358,7 +372,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
 
     checkError(
       exception = intercept[AnalysisException](sql("SELECT testcat.ns.strlen('a', 'b')")),
-      errorClass = "_LEGACY_ERROR_TEMP_1198",
+      condition = "_LEGACY_ERROR_TEMP_1198",
       parameters = Map(
         "unbound" -> "strlen",
         "arguments" -> "string, string",
@@ -414,8 +428,8 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
       new JavaStrLen(new JavaStrLenNoImpl))
     checkError(
       exception = intercept[AnalysisException](sql("SELECT testcat.ns.strlen('abc')").collect()),
-      errorClass = "_LEGACY_ERROR_TEMP_3055",
-      parameters = Map("scalarFunc" -> "strlen"),
+      condition = "SCALAR_FUNCTION_NOT_FULLY_IMPLEMENTED",
+      parameters = Map("scalarFunc" -> "`strlen`"),
       context = ExpectedContext(
         fragment = "testcat.ns.strlen('abc')",
         start = 7,
@@ -429,7 +443,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
     addFunction(Identifier.of(Array("ns"), "strlen"), StrLen(StrLenBadInputTypes))
     checkError(
       exception = intercept[AnalysisException](sql("SELECT testcat.ns.strlen('abc')").collect()),
-      errorClass = "_LEGACY_ERROR_TEMP_1199",
+      condition = "_LEGACY_ERROR_TEMP_1199",
       parameters = Map(
         "bound" -> "strlen_bad_input_types",
         "argsLen" -> "1",
@@ -448,13 +462,30 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
     addFunction(Identifier.of(Array("ns"), "add"), new JavaLongAdd(new JavaLongAddMismatchMagic))
     checkError(
       exception = intercept[AnalysisException](sql("SELECT testcat.ns.add(1L, 2L)").collect()),
-      errorClass = "_LEGACY_ERROR_TEMP_3055",
-      parameters = Map("scalarFunc" -> "long_add_mismatch_magic"),
+      condition = "SCALAR_FUNCTION_NOT_FULLY_IMPLEMENTED",
+      parameters = Map("scalarFunc" -> "`long_add_mismatch_magic`"),
       context = ExpectedContext(
         fragment = "testcat.ns.add(1L, 2L)",
         start = 7,
         stop = 28
       )
+    )
+  }
+
+  test("SPARK-49549: scalar function w/ mismatch a compatible ScalarFunction#produceResult") {
+    case object CharLength extends ScalarFunction[Int] {
+      override def inputTypes(): Array[DataType] = Array(StringType)
+      override def resultType(): DataType = IntegerType
+      override def name(): String = "CHAR_LENGTH"
+    }
+
+    catalog("testcat").asInstanceOf[SupportsNamespaces].createNamespace(Array("ns"), emptyProps)
+    addFunction(Identifier.of(Array("ns"), "my_strlen"), StrLen(CharLength))
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException]
+        (sql("SELECT testcat.ns.my_strlen('abc')").collect()),
+      condition = "SCALAR_FUNCTION_NOT_COMPATIBLE",
+      parameters = Map("scalarFunc" -> "`CHAR_LENGTH`")
     )
   }
 
@@ -481,7 +512,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
         exception = intercept[AnalysisException] {
           sql(sqlText).collect()
         },
-        errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+        condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
         sqlState = None,
         parameters = Map(
           "sqlExpr" -> ".*",
@@ -539,7 +570,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
     checkError(
       exception = intercept[AnalysisException](
         sql("SELECT testcat.ns.strlen('abc')")),
-      errorClass = "INVALID_UDF_IMPLEMENTATION",
+      condition = "INVALID_UDF_IMPLEMENTATION",
       parameters = Map(
         "funcName" -> "`bad_bound_func`"),
       context = ExpectedContext(
@@ -602,7 +633,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
       Seq(1.toShort, 2.toShort).toDF("i").write.saveAsTable(t)
       checkError(
         exception = intercept[AnalysisException](sql(s"SELECT testcat.ns.avg(i) from $t")),
-        errorClass = "_LEGACY_ERROR_TEMP_1198",
+        condition = "_LEGACY_ERROR_TEMP_1198",
         parameters = Map(
           "unbound" -> "iavg",
           "arguments" -> "smallint",
@@ -637,7 +668,7 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
           sql("SELECT testcat.ns.avg(*) from values " +
             "(date '2021-06-01' - date '2011-06-01'), (date '2000-01-01' - date '1900-01-01')")
         },
-        errorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+        condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
         parameters = Map(
           "sqlExpr" -> "\"v2aggregator(col1)\"",
           "paramIndex" -> "first",
@@ -689,126 +720,145 @@ class DataSourceV2FunctionSuite extends DatasourceV2SQLBase {
     checkAnswer(df1, Row(3) :: Nil)
   }
 
-  private case object StrLenDefault extends ScalarFunction[Int] {
-    override def inputTypes(): Array[DataType] = Array(StringType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "strlen_default"
+  test("simple function") {
+    catalog("testcat").asInstanceOf[SupportsNamespaces].createNamespace(Array("ns"), emptyProps)
+    addFunction(Identifier.of(Array("ns"), "simple_strlen"), SimpleStrLen)
+    checkAnswer(sql("SELECT testcat.ns.simple_strlen('abc')"), Row(3) :: Nil)
+    checkAnswer(sql("SELECT testcat.ns.simple_strlen('hello world')"), Row(11) :: Nil)
+  }
+}
 
-    override def produceResult(input: InternalRow): Int = {
-      val s = input.getString(0)
-      s.length
+case object SimpleStrLen extends SimpleFunction with ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "simple_strlen"
+  override def description(): String = "simple string length function"
+
+  override def produceResult(input: InternalRow): Int = {
+    val s = input.getString(0)
+    s.length
+  }
+}
+
+case object StrLenDefault extends ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "strlen_default"
+
+  override def produceResult(input: InternalRow): Int = {
+    val s = input.getString(0)
+    s.length
+  }
+}
+
+case object StrLenMagic extends ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "strlen_magic"
+
+  def invoke(input: UTF8String): Int = {
+    input.toString.length
+  }
+}
+
+case object StrLenBadMagic extends ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "strlen_bad_magic"
+
+  def invoke(input: String): Int = {
+    input.length
+  }
+}
+
+case object StrLenBadMagicWithDefault extends ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "strlen_bad_magic"
+
+  def invoke(input: String): Int = {
+    input.length
+  }
+
+  override def produceResult(input: InternalRow): Int = {
+    val s = input.getString(0)
+    s.length
+  }
+}
+
+case object StrLenNoImpl extends ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "strlen_noimpl"
+}
+
+// input type doesn't match arguments accepted by `UnboundFunction.bind`
+case object StrLenBadInputTypes extends ScalarFunction[Int] {
+  override def inputTypes(): Array[DataType] = Array(StringType, IntegerType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "strlen_bad_input_types"
+}
+
+case object BadBoundFunction extends BoundFunction {
+  override def inputTypes(): Array[DataType] = Array(StringType)
+  override def resultType(): DataType = IntegerType
+  override def name(): String = "bad_bound_func"
+}
+
+object UnboundDecimalAverage extends UnboundFunction {
+  override def name(): String = "decimal_avg"
+
+  override def bind(inputType: StructType): BoundFunction = {
+    if (inputType.fields.length > 1) {
+      throw new UnsupportedOperationException("Too many arguments")
+    }
+
+    // put interval type here for testing purpose
+    inputType.fields(0).dataType match {
+      case _: NumericType | _: DayTimeIntervalType => DecimalAverage
+      case dataType =>
+        throw new UnsupportedOperationException(s"Unsupported input type: $dataType")
     }
   }
 
-  case object StrLenMagic extends ScalarFunction[Int] {
-    override def inputTypes(): Array[DataType] = Array(StringType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "strlen_magic"
+  override def description(): String =
+    "decimal_avg: produces an average using decimal division"
+}
 
-    def invoke(input: UTF8String): Int = {
-      input.toString.length
-    }
-  }
+object DecimalAverage extends AggregateFunction[(Decimal, Int), Decimal] {
+  override def name(): String = "decimal_avg"
+  override def inputTypes(): Array[DataType] = Array(DecimalType.SYSTEM_DEFAULT)
+  override def resultType(): DataType = DecimalType.SYSTEM_DEFAULT
 
-  case object StrLenBadMagic extends ScalarFunction[Int] {
-    override def inputTypes(): Array[DataType] = Array(StringType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "strlen_bad_magic"
+  override def newAggregationState(): (Decimal, Int) = (Decimal.ZERO, 0)
 
-    def invoke(input: String): Int = {
-      input.length
-    }
-  }
-
-  case object StrLenBadMagicWithDefault extends ScalarFunction[Int] {
-    override def inputTypes(): Array[DataType] = Array(StringType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "strlen_bad_magic"
-
-    def invoke(input: String): Int = {
-      input.length
-    }
-
-    override def produceResult(input: InternalRow): Int = {
-      val s = input.getString(0)
-      s.length
-    }
-  }
-
-  private case object StrLenNoImpl extends ScalarFunction[Int] {
-    override def inputTypes(): Array[DataType] = Array(StringType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "strlen_noimpl"
-  }
-
-  // input type doesn't match arguments accepted by `UnboundFunction.bind`
-  private case object StrLenBadInputTypes extends ScalarFunction[Int] {
-    override def inputTypes(): Array[DataType] = Array(StringType, IntegerType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "strlen_bad_input_types"
-  }
-
-  private case object BadBoundFunction extends BoundFunction {
-    override def inputTypes(): Array[DataType] = Array(StringType)
-    override def resultType(): DataType = IntegerType
-    override def name(): String = "bad_bound_func"
-  }
-
-  object UnboundDecimalAverage extends UnboundFunction {
-    override def name(): String = "decimal_avg"
-
-    override def bind(inputType: StructType): BoundFunction = {
-      if (inputType.fields.length > 1) {
-        throw new UnsupportedOperationException("Too many arguments")
+  override def update(state: (Decimal, Int), input: InternalRow): (Decimal, Int) = {
+    if (input.isNullAt(0)) {
+      state
+    } else {
+      val l = input.getDecimal(0, DecimalType.SYSTEM_DEFAULT.precision,
+        DecimalType.SYSTEM_DEFAULT.scale)
+      state match {
+        case (_, d) if d == 0 =>
+          (l, 1)
+        case (total, count) =>
+          (total + l, count + 1)
       }
-
-      // put interval type here for testing purpose
-      inputType.fields(0).dataType match {
-        case _: NumericType | _: DayTimeIntervalType => DecimalAverage
-        case dataType =>
-          throw new UnsupportedOperationException(s"Unsupported input type: $dataType")
-      }
     }
-
-    override def description(): String =
-      "decimal_avg: produces an average using decimal division"
   }
 
-  object DecimalAverage extends AggregateFunction[(Decimal, Int), Decimal] {
-    override def name(): String = "decimal_avg"
-    override def inputTypes(): Array[DataType] = Array(DecimalType.SYSTEM_DEFAULT)
-    override def resultType(): DataType = DecimalType.SYSTEM_DEFAULT
-
-    override def newAggregationState(): (Decimal, Int) = (Decimal.ZERO, 0)
-
-    override def update(state: (Decimal, Int), input: InternalRow): (Decimal, Int) = {
-      if (input.isNullAt(0)) {
-        state
-      } else {
-        val l = input.getDecimal(0, DecimalType.SYSTEM_DEFAULT.precision,
-          DecimalType.SYSTEM_DEFAULT.scale)
-        state match {
-          case (_, d) if d == 0 =>
-            (l, 1)
-          case (total, count) =>
-            (total + l, count + 1)
-        }
-      }
-    }
-
-    override def merge(leftState: (Decimal, Int), rightState: (Decimal, Int)): (Decimal, Int) = {
-      (leftState._1 + rightState._1, leftState._2 + rightState._2)
-    }
-
-    override def produceResult(state: (Decimal, Int)): Decimal = state._1 / Decimal(state._2)
+  override def merge(leftState: (Decimal, Int), rightState: (Decimal, Int)): (Decimal, Int) = {
+    (leftState._1 + rightState._1, leftState._2 + rightState._2)
   }
 
-  object NoImplAverage extends UnboundFunction {
-    override def name(): String = "no_impl_avg"
-    override def description(): String = name()
+  override def produceResult(state: (Decimal, Int)): Decimal = state._1 / Decimal(state._2)
+}
 
-    override def bind(inputType: StructType): BoundFunction = {
-      throw SparkUnsupportedOperationException()
-    }
+object NoImplAverage extends UnboundFunction {
+  override def name(): String = "no_impl_avg"
+  override def description(): String = name()
+
+  override def bind(inputType: StructType): BoundFunction = {
+    throw SparkUnsupportedOperationException()
   }
 }

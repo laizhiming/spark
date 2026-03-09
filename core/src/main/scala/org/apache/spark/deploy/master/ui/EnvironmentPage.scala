@@ -17,12 +17,14 @@
 
 package org.apache.spark.deploy.master.ui
 
+import scala.jdk.CollectionConverters._
 import scala.xml.Node
 
 import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.internal.config.UI.MASTER_UI_VISIBLE_ENV_VAR_PREFIXES
 import org.apache.spark.ui._
 import org.apache.spark.util.Utils
 
@@ -39,6 +41,9 @@ private[ui] class EnvironmentPage(
     val systemProperties = Utils.redact(conf, details("System Properties")).sorted
     val metricsProperties = Utils.redact(conf, details("Metrics Properties")).sorted
     val classpathEntries = details("Classpath Entries").sorted
+    val prefixes = conf.get(MASTER_UI_VISIBLE_ENV_VAR_PREFIXES)
+    val environmentVariables = System.getenv().asScala
+      .filter { case (k, _) => prefixes.exists(k.startsWith(_)) }.toSeq.sorted
 
     val runtimeInformationTable = UIUtils.listingTable(propertyHeader, propertyRow,
       jvmInformation, fixedWidth = true, headerClasses = headerClasses)
@@ -52,78 +57,99 @@ private[ui] class EnvironmentPage(
       metricsProperties, fixedWidth = true, headerClasses = headerClasses)
     val classpathEntriesTable = UIUtils.listingTable(classPathHeader, classPathRow,
       classpathEntries, fixedWidth = true, headerClasses = headerClasses)
+    val environmentVariablesTable = UIUtils.listingTable(propertyHeader, propertyRow,
+      environmentVariables, fixedWidth = true, headerClasses = headerClasses)
 
     val content =
       <div>
         <p><a href="/">Back to Master</a></p>
       </div>
       <span>
-        <span class="collapse-aggregated-runtimeInformation collapse-table"
-            onClick="collapseTable('collapse-aggregated-runtimeInformation',
-            'aggregated-runtimeInformation')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-runtimeInformation"
+            aria-expanded="true" aria-controls="aggregated-runtimeInformation"
+            data-collapse-name="collapse-aggregated-runtimeInformation">
           <h4>
             <span class="collapse-table-arrow arrow-open"></span>
             <a>Runtime Information</a>
           </h4>
         </span>
-        <div class="aggregated-runtimeInformation collapsible-table">
+        <div class="collapsible-table collapse show" id="aggregated-runtimeInformation">
           {runtimeInformationTable}
         </div>
-        <span class="collapse-aggregated-sparkProperties collapse-table"
-            onClick="collapseTable('collapse-aggregated-sparkProperties',
-            'aggregated-sparkProperties')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-sparkProperties"
+            aria-expanded="true" aria-controls="aggregated-sparkProperties"
+            data-collapse-name="collapse-aggregated-sparkProperties">
           <h4>
             <span class="collapse-table-arrow arrow-open"></span>
             <a>Spark Properties</a>
           </h4>
         </span>
-        <div class="aggregated-sparkProperties collapsible-table">
+        <div class="collapsible-table collapse show" id="aggregated-sparkProperties">
           {sparkPropertiesTable}
         </div>
-        <span class="collapse-aggregated-hadoopProperties collapse-table"
-              onClick="collapseTable('collapse-aggregated-hadoopProperties',
-            'aggregated-hadoopProperties')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-hadoopProperties"
+            aria-expanded="false" aria-controls="aggregated-hadoopProperties"
+            data-collapse-name="collapse-aggregated-hadoopProperties">
           <h4>
             <span class="collapse-table-arrow arrow-closed"></span>
             <a>Hadoop Properties</a>
           </h4>
         </span>
-        <div class="aggregated-hadoopProperties collapsible-table collapsed">
+        <div class="collapsible-table collapse" id="aggregated-hadoopProperties">
           {hadoopPropertiesTable}
         </div>
-        <span class="collapse-aggregated-systemProperties collapse-table"
-            onClick="collapseTable('collapse-aggregated-systemProperties',
-            'aggregated-systemProperties')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-systemProperties"
+            aria-expanded="false" aria-controls="aggregated-systemProperties"
+            data-collapse-name="collapse-aggregated-systemProperties">
           <h4>
             <span class="collapse-table-arrow arrow-closed"></span>
             <a>System Properties</a>
           </h4>
         </span>
-        <div class="aggregated-systemProperties collapsible-table collapsed">
+        <div class="collapsible-table collapse" id="aggregated-systemProperties">
           {systemPropertiesTable}
         </div>
-        <span class="collapse-aggregated-metricsProperties collapse-table"
-              onClick="collapseTable('collapse-aggregated-metricsProperties',
-            'aggregated-metricsProperties')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-metricsProperties"
+            aria-expanded="false" aria-controls="aggregated-metricsProperties"
+            data-collapse-name="collapse-aggregated-metricsProperties">
           <h4>
             <span class="collapse-table-arrow arrow-closed"></span>
             <a>Metrics Properties</a>
           </h4>
         </span>
-        <div class="aggregated-metricsProperties collapsible-table collapsed">
+        <div class="collapsible-table collapse" id="aggregated-metricsProperties">
           {metricsPropertiesTable}
         </div>
-        <span class="collapse-aggregated-classpathEntries collapse-table"
-            onClick="collapseTable('collapse-aggregated-classpathEntries',
-            'aggregated-classpathEntries')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-classpathEntries"
+            aria-expanded="false" aria-controls="aggregated-classpathEntries"
+            data-collapse-name="collapse-aggregated-classpathEntries">
           <h4>
             <span class="collapse-table-arrow arrow-closed"></span>
             <a>Classpath Entries</a>
           </h4>
         </span>
-        <div class="aggregated-classpathEntries collapsible-table collapsed">
+        <div class="collapsible-table collapse" id="aggregated-classpathEntries">
           {classpathEntriesTable}
         </div>
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-environmentVariables"
+            aria-expanded="false" aria-controls="aggregated-environmentVariables"
+            data-collapse-name="collapse-aggregated-environmentVariables">
+          <h4>
+            <span class="collapse-table-arrow arrow-closed"></span>
+            <a>Environment Variables</a>
+          </h4>
+        </span>
+        <div class="collapsible-table collapse" id="aggregated-environmentVariables">
+          {environmentVariablesTable}
+        </div>
+        <script src={UIUtils.prependBaseUri(request, "/static/environmentpage.js")}></script>
       </span>
     UIUtils.basicSparkPage(request, content, "Environment")
   }

@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 
 from pyspark.pandas.tests.plot.test_series_plot_matplotlib import SeriesPlotMatplotlibTestsMixin
 from pyspark.testing.connectutils import ReusedConnectTestCase
@@ -24,34 +23,10 @@ from pyspark.testing.pandasutils import PandasOnSparkTestUtils, TestUtils
 class SeriesPlotMatplotlibParityTests(
     SeriesPlotMatplotlibTestsMixin, PandasOnSparkTestUtils, TestUtils, ReusedConnectTestCase
 ):
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_empty_hist(self):
-        super().test_empty_hist()
-
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_hist(self):
-        super().test_hist()
-
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_hist_plot(self):
-        super().test_hist_plot()
-
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_kde_plot(self):
-        super().test_kde_plot()
-
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_single_value_hist(self):
-        super().test_single_value_hist()
+    pass
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.connect.plot.test_parity_series_plot_matplotlib import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

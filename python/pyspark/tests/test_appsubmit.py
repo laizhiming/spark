@@ -23,7 +23,7 @@ import tempfile
 import unittest
 import zipfile
 
-from pyspark.testing.utils import SPARK_HOME
+from pyspark.testing.sqlutils import SPARK_HOME
 
 
 class SparkSubmitTests(unittest.TestCase):
@@ -36,6 +36,8 @@ class SparkSubmitTests(unittest.TestCase):
             "spark.driver.extraJavaOptions=-Djava.io.tmpdir={0}".format(tmp_dir),
             "--conf",
             "spark.executor.extraJavaOptions=-Djava.io.tmpdir={0}".format(tmp_dir),
+            "--conf",
+            "spark.python.unix.domain.socket.enabled=false",
         ]
 
     def tearDown(self):
@@ -295,12 +297,6 @@ class SparkSubmitTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_appsubmit import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

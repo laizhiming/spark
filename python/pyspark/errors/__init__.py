@@ -18,7 +18,7 @@
 """
 PySpark exceptions.
 """
-from pyspark.errors.exceptions.base import (  # noqa: F401
+from pyspark.errors.exceptions.base import (
     PySparkException,
     AnalysisException,
     SessionNotSameException,
@@ -46,10 +46,11 @@ from pyspark.errors.exceptions.base import (  # noqa: F401
     PySparkAssertionError,
     PySparkNotImplementedError,
     PySparkPicklingError,
-    RetriesExceeded,
     PySparkKeyError,
     QueryContext,
     QueryContextType,
+    StreamingPythonRunnerInitializationException,
+    PickleException,
 )
 
 
@@ -81,8 +82,9 @@ __all__ = [
     "PySparkAssertionError",
     "PySparkNotImplementedError",
     "PySparkPicklingError",
-    "RetriesExceeded",
     "PySparkKeyError",
     "QueryContext",
     "QueryContextType",
+    "StreamingPythonRunnerInitializationException",
+    "PickleException",
 ]

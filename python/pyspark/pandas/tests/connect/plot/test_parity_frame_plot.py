@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 
 from pyspark.pandas.tests.plot.test_frame_plot import DataFramePlotTestsMixin
 from pyspark.testing.connectutils import ReusedConnectTestCase
@@ -24,22 +23,10 @@ from pyspark.testing.pandasutils import PandasOnSparkTestUtils
 class DataFramePlotParityTests(
     DataFramePlotTestsMixin, PandasOnSparkTestUtils, ReusedConnectTestCase
 ):
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_compute_hist_multi_columns(self):
-        super().test_compute_hist_multi_columns()
-
-    @unittest.skip("Test depends on Spark ML which is not supported from Spark Connect.")
-    def test_compute_hist_single_column(self):
-        super().test_compute_hist_single_column()
+    pass
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.connect.plot.test_parity_frame_plot import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

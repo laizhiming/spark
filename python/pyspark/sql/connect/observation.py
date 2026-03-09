@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from pyspark.sql.connect.utils import check_dependencies
+
+check_dependencies(__name__)
+
 from typing import Any, Dict, Optional
 import uuid
 
@@ -37,30 +41,35 @@ class Observation:
         if name is not None:
             if not isinstance(name, str):
                 raise PySparkTypeError(
-                    error_class="NOT_STR",
-                    message_parameters={"arg_name": "name", "arg_type": type(name).__name__},
+                    errorClass="NOT_STR",
+                    messageParameters={"arg_name": "name", "arg_type": type(name).__name__},
                 )
             if name == "":
                 raise PySparkValueError(
-                    error_class="VALUE_NOT_NON_EMPTY_STR",
-                    message_parameters={"arg_name": "name", "arg_value": name},
+                    errorClass="VALUE_NOT_NON_EMPTY_STR",
+                    messageParameters={"arg_name": "name", "arg_value": name},
                 )
         self._name = name
         self._result: Optional[Dict[str, Any]] = None
+        self._error: Optional[BaseException] = None
 
     __init__.__doc__ = PySparkObservation.__init__.__doc__
 
+    def _set_error(self, exc: BaseException) -> None:
+        """Set the error that occurred while collecting observed metrics (used by the client)."""
+        self._error = exc
+
     def _on(self, df: DataFrame, *exprs: Column) -> DataFrame:
         if self._result is not None:
-            raise PySparkAssertionError(error_class="REUSE_OBSERVATION", message_parameters={})
+            raise PySparkAssertionError(errorClass="REUSE_OBSERVATION", messageParameters={})
 
         if self._name is None:
             self._name = str(uuid.uuid4())
 
         if df.isStreaming:
             raise IllegalArgumentException(
-                error_class="UNSUPPORTED_OPERATION",
-                message_parameters={"operation": "Streaming DataFrame with Observation"},
+                errorClass="UNSUPPORTED_OPERATION",
+                messageParameters={"operation": "Streaming DataFrame with Observation"},
             )
 
         self._result = {}
@@ -70,8 +79,10 @@ class Observation:
 
     @property
     def get(self) -> Dict[str, Any]:
+        if self._error is not None:
+            raise self._error
         if self._result is None:
-            raise PySparkAssertionError(error_class="NO_OBSERVE_BEFORE_GET", message_parameters={})
+            raise PySparkAssertionError(errorClass="NO_OBSERVE_BEFORE_GET", messageParameters={})
 
         return self._result
 
